@@ -1,59 +1,67 @@
-# Issue 8 — why an MCP write reformats the whole file
+# Issue 8 — MCP writes no longer reformat the whole file
 
-Investigation only; no writer change was made. Measured on 2026-09-17 against
-the KiCad 10.0.6 demo schematics in
-`C:\Program Files\KiCad\10.0\share\kicad\demos` (90 files, 78 of them in the
-KiCad 10 format `(version 20250114)`).
-
-Method: parse each KiCad-written file with `sch_io.parse_file`, dump it back
-with `sch_io.dumps`, and diff against the original. Probe scripts are in the
-session scratchpad (`fmt_probe*.py`) and are not part of the repo.
+Measured against the KiCad 10.0.6 demo schematics in
+`C:\Program Files\KiCad\10.0\share\kicad\demos` — 78 of them are in the KiCad 10
+format `(version 20250114)`. Method: parse a KiCad-written file with
+`sch_io.parse_file`, dump it back with `sch_io.dumps`, compare byte for byte.
+Probe scripts live in the session scratchpad (`fmt_probe*.py`, `verify_fmt.py`)
+and are not part of the repo.
 
 ## Result
 
-One rule accounts for almost the whole diff: **KiCad packs the children of
-`(pts ...)` and `(members ...)` onto shared lines, wrapping at roughly 120
-columns; our dumper writes one child per line.**
-
 | Dumper | Byte-identical files (of 78) |
 |---|---|
-| current | 0 |
-| plus `(xy ...)` / `(members ...)` packing at 120 columns | 34 |
+| before | 0 |
+| after | 66 |
 
-Evidence for the wrap width: over 26 657 `(xy ...)` lines in the demos, the
-longest is 118 characters and none exceeds 120 (a tab counted as one
-character). Limits of 118–121 all give the same 34 files, so the exact value
-needs one more experiment against a file KiCad itself rewrites.
+One `add_wire` on the 3 519-line `tests/fixtures/kicad10_ecc83-pp_v2.kicad_sch`
+now produces a 10-line diff — the wire itself. Before, a handful of edits gave
+~6 000 changed lines.
 
-## Remaining causes, in order of frequency
+## Rules implemented in `sch_io.dumps`
 
-1. **`(members ...)` that fits on one line.** KiCad writes
-   `(members "TX+" "TX-" "RX+" "RX-")` as a single line, head included, and only
-   breaks when the list is too long. The packing prototype always broke after
-   the head.
-2. **`(color r g b a)` alpha.** KiCad prints the alpha with four decimals —
-   `(color 255 255 255 1.0000)`, `(color 0 0 0 0.0000)`. `_format_float` trims
-   to `1` and `0`. 51 lines across the KiCad 10 demos.
-3. **Embedded files `(data "…")`.** Base64 arrives as many 76-character string
-   atoms. KiCad puts the first chunk on the `(data` line and wraps the rest;
-   we put every chunk on its own line. Affects every file with an embedded
-   image (interf_u, csi, dcdc, expansion_connector, jetson-agx-thor-baseboard).
-4. **Tab characters in strings.** KiCad writes a raw TAB inside a quoted string
-   (e.g. `(property "Part Description" "<TAB>100 Position Connector …")`),
-   while `_escape` now writes `\t`. Verified safe: a file we wrote with `\t`
-   exports through `kicad-cli sch export netlist --format kicadxml` with the
-   value read back as `'A\tB'`, so KiCad decodes the escape. It is a formatting
-   difference, not a corruption. `\n` must stay escaped — KiCad escapes it too
-   (`(text "CHANGE LOG\n\n- swapped sensors' I2C …")` in CM5_MINIMA_3).
-5. **Indentation of pre-10 files.** Some demos are older and use two spaces per
-   level instead of one tab. Not relevant while we only write `20250114`.
+1. **`(pts ...)` packs its points.** The head stays alone on its line and the
+   `(xy ...)` children are packed several to a line, wrapping at `LINE_WIDTH`.
+   This was nearly the whole diff: our old dumper wrote one point per line.
+2. **`LINE_WIDTH = 118`**, a tab counted as one column. 118 is the longest line
+   KiCad 10 emits across 26 657 `(xy ...)` lines in its demos; 119 scores the
+   same, 120 loses one file.
+3. **An over-long atom list wraps** onto continuation lines indented one level,
+   with the closing `)` on its own line — how KiCad writes `(members ...)`.
+4. **`(data "…")` writes one base64 chunk per line**, including the short last
+   chunk, with the first chunk on the head line.
+5. **A sheet's background alpha gets four decimals**:
+   `(sheet … (fill (color 0 0 0 0.0000)))`. Elsewhere the alpha is plain (`0`).
+6. **Floats keep full precision** (`repr`), so a value such as
+   `59.209102362204725` survives instead of being truncated to six decimals.
+7. **A TAB inside a string stays raw**, which is what KiCad writes (see the
+   "Part Description" properties in its CM5 demo). Verified that the escape is
+   decoded either way: a file we wrote with `\t` came back as `'A\tB'` through
+   `kicad-cli sch export netlist --format kicadxml`. `\n` and `\r` stay
+   escaped — KiCad escapes those too, and a raw newline inside a quoted string
+   makes KiCad refuse to load the file (issue 1).
 
-## What this implies for the fix
+## Known remaining deviation
 
-Matching KiCad byte for byte looks like four narrow rules in `sch_io.dumps`
-(pack `pts`/`members`/`data`, single-line short lists, 4-decimal color alpha,
-raw tab), not a rewrite. Worth doing before the surgical text-edit approach,
-which is far larger.
+The 12 files that still differ all differ only in **`(members ...)` wrapping**
+inside `(bus_alias ...)`. KiCad breaks those lines earlier than a 118-column
+budget explains, and inconsistently between files: lines are kept at 92, 91 and
+93 columns in `flash`, `vme_interface` and `ddr4-ps`, yet `peripherals` wraps
+where the next item would only reach column 78. No single column or item-count
+rule fits all of them, so our writer wraps `members` at `LINE_WIDTH` like any
+other long atom list. It affects bus aliases only, and KiCad loads the result.
 
-A regression test should assert `parse → dump` is byte-identical for a set of
-KiCad-written fixtures, run per format version.
+## Regression tests
+
+`tests/test_phase3_schematic.py`:
+
+- `test_dump_of_kicad_written_file_is_byte_identical` and
+  `test_write_file_of_kicad_written_file_changes_nothing` — parse → dump of
+  `tests/fixtures/kicad10_ecc83-pp_v2.kicad_sch` (a KiCad 10 demo sheet)
+  reproduces it exactly.
+- `test_pts_points_are_packed_and_wrapped`, `test_data_chunks_are_one_per_line`,
+  `test_sheet_fill_alpha_has_four_decimals`, `test_float_keeps_full_precision`
+  cover the individual rules.
+
+Re-run the corpus measurement after any change to `dumps`; the fixture test
+alone does not cover embedded images or sheet fills.

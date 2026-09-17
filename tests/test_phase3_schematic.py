@@ -360,11 +360,14 @@ def test_voltage_divider_acceptance(tmp_path):
 
 
 def test_escape_control_characters():
-    r"""`sexpdata` decodes \n on read; a naive dump would write a raw newline."""
+    r"""`sexpdata` decodes \n on read; a naive dump would write a raw newline.
+
+    A TAB stays raw — that is what KiCAD itself writes.
+    """
     node = [sch_io.sym("text"), "TODO:\n+ USB PD\t- \"EMI\"\\filter\r"]
     out = sch_io.dumps(node)
     assert "\n" not in out[out.index('"'):]  # no raw newline inside the literal
-    assert out == r'(text "TODO:\n+ USB PD\t- \"EMI\"\\filter\r")'
+    assert out == '(text "TODO:\\n+ USB PD\t- \\"EMI\\"\\\\filter\\r")'
 
 
 def test_multiline_text_round_trip(tmp_path: Path):
@@ -683,3 +686,60 @@ def test_deletion_round_trip_still_loads(tmp_path, monkeypatch):
         capture_output=True, text=True, timeout=60, cwd=tmp_path,
     )
     assert r.returncode == 0, f"erc failed: stderr={r.stderr}"
+
+
+# ===== Issue 8 — output matches KiCAD 10's own formatting ================== #
+
+KICAD10_FIXTURE = FIXTURES / "kicad10_ecc83-pp_v2.kicad_sch"
+
+
+def test_dump_of_kicad_written_file_is_byte_identical():
+    """parse -> dump of a file KiCAD 10 wrote must reproduce it exactly."""
+    original = KICAD10_FIXTURE.read_text(encoding="utf-8")
+    tree = sch_io.parse_file(KICAD10_FIXTURE)
+    assert sch_io.dumps(tree) + "\n" == original
+
+
+def test_write_file_of_kicad_written_file_changes_nothing(tmp_path: Path):
+    """The same, through write_file — a no-op edit must leave the file alone."""
+    target = tmp_path / "copy.kicad_sch"
+    target.write_bytes(KICAD10_FIXTURE.read_bytes())
+    before = target.read_text(encoding="utf-8")
+    sch_io.write_file(target, sch_io.parse_file(target))
+    assert target.read_text(encoding="utf-8") == before
+
+
+def test_pts_points_are_packed_and_wrapped():
+    pts = [sch_io.sym("pts")] + [
+        [sch_io.sym("xy"), float(i), 0.0] for i in range(12)
+    ]
+    out = sch_io.dumps([sch_io.sym("polyline"), pts], 0)
+    point_lines = [ln for ln in out.splitlines() if ln.lstrip("\t").startswith("(xy ")]
+    assert len(point_lines) < 12          # packed, not one per line
+    assert all(len(ln) <= sch_io.LINE_WIDTH for ln in point_lines)
+
+
+def test_data_chunks_are_one_per_line():
+    node = [sch_io.sym("data"), "A" * 76, "B" * 76, "C" * 4]
+    lines = sch_io.dumps(node).splitlines()
+    assert lines[0] == '(data "' + "A" * 76 + '"'
+    assert lines[1] == "\t" + '"' + "B" * 76 + '"'
+    assert lines[2] == "\t" + '"' + "C" * 4 + '"'   # short chunk still alone
+    assert lines[3] == ")"
+
+
+def test_sheet_fill_alpha_has_four_decimals():
+    sheet = [
+        sch_io.sym("sheet"),
+        [sch_io.sym("at"), 0, 0],
+        [sch_io.sym("fill"), [sch_io.sym("color"), 0, 0, 0, 0.0]],
+    ]
+    assert "(color 0 0 0 0.0000)" in sch_io.dumps(sheet)
+    # Outside a sheet's fill, KiCAD writes the alpha plainly.
+    junction = [sch_io.sym("junction"), [sch_io.sym("color"), 0, 0, 0, 0.0]]
+    assert "(color 0 0 0 0)" in sch_io.dumps(junction)
+
+
+def test_float_keeps_full_precision():
+    node = [sch_io.sym("at"), 59.209102362204725, 270]
+    assert sch_io.dumps(node) == "(at 59.209102362204725 270)"
