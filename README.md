@@ -1,14 +1,16 @@
 # kicad-claude-mcp
 
 > Design KiCAD PCBs from natural language. An MCP server that gives Claude
-> Code (or any MCP client) **105 tools** to drive a complete PCB workflow —
+> Code (or any MCP client) **110 tools** to drive a complete PCB workflow —
 > schematic capture, library management, PCB layout, autorouting, manufacturing
 > outputs, signal-integrity calculations, RF design, and more.
 
-**105 MCP tools · 240 tests passing · 16 phases · headless from idea to gerbers**
+**110 MCP tools · 268 tests (236 fast, 28 acceptance, 3 network) · 16 phases · headless from idea to gerbers**
 
-The server edits `.kicad_sch` / `.kicad_pcb` / `.kicad_pro` files directly.
-You drive it via Claude Code; you open KiCAD only to review the result.
+The server edits `.kicad_sch` / `.kicad_pcb` / `.kicad_pro` files directly, in
+KiCAD 10's own formatting — one added wire is a ten-line git diff, not a
+reformat of the whole sheet. You drive it via Claude Code; you open KiCAD only
+to review the result.
 
 ---
 
@@ -59,6 +61,38 @@ curl -L https://github.com/freerouting/freerouting/releases/download/v2.1.0/free
   -o third_party/freerouting.jar
 ```
 
+### Install from a local clone on a branch
+
+To run a branch — your own work, a fix you are testing, `dev` instead of
+`main` — install from a local checkout of it. The server always runs from a
+working tree: `server.py` sits at the repo root and is not shipped in the
+wheel, so `uv pip install git+…` gives you the library without an entry point.
+
+```bash
+cd kicad-claude-mcp        # the clone from the previous step
+git switch dev             # or: git switch -c my-feature
+uv sync                    # re-run after every switch — dependencies may differ
+```
+
+Then point Claude Code at *that* directory (see below): `cwd` is the checkout
+and `command` is its own `.venv` interpreter.
+
+To keep several branches installed side by side, give each one its own working
+tree and its own `.venv`:
+
+```bash
+git worktree add ../kicad-claude-mcp-dev dev
+cd ../kicad-claude-mcp-dev
+uv sync
+```
+
+Register each as a separate MCP server under its own name (`kicad`,
+`kicad-dev`, …) so you can pick one per session. Two servers must not edit the
+same project at once — each holds its own active-project state.
+
+Switching a branch under a running server does not reload it: run `uv sync`,
+then restart Claude Code.
+
 ### Wire into Claude Code
 
 Add to `~/.claude/settings.json`:
@@ -70,14 +104,23 @@ Add to `~/.claude/settings.json`:
       "command": "/ABSOLUTE/PATH/TO/kicad-claude-mcp/.venv/bin/python",
       "args": ["server.py"],
       "cwd": "/ABSOLUTE/PATH/TO/kicad-claude-mcp"
+    },
+    "kicad-dev": {
+      "command": "/ABSOLUTE/PATH/TO/kicad-claude-mcp-dev/.venv/bin/python",
+      "args": ["server.py"],
+      "cwd": "/ABSOLUTE/PATH/TO/kicad-claude-mcp-dev"
     }
   }
 }
 ```
 
 > The `command` MUST be the absolute path to `.venv/bin/python` — the system
-> Python doesn't have the dependencies. Reload Claude Code, run `/mcp` to
-> confirm `kicad` is connected, then ask for `Use the kicad ping tool`.
+> Python doesn't have the dependencies. On Windows that path is
+> `.venv\Scripts\python.exe`. Reload Claude Code, run `/mcp` to confirm
+> `kicad` is connected, then ask for `Use the kicad ping tool`.
+
+The second entry is optional — it is the branch checkout from the previous
+section, exposed under its own name. Drop it if you only run one.
 
 ### First run
 
@@ -94,6 +137,8 @@ Add to `~/.claude/settings.json`:
 ### Schematic capture
 
 - **Symbol placement & connections**: `add_symbol`, `add_wire`, `add_label`, `add_power_symbol`, `add_no_connect`, `move_symbol`, `remove_symbol`, `get_pin_position`, `list_pins`
+- **Editing and deletion**: `remove_wire`, `add_junction`, `remove_junction`, `remove_no_connect`, `remove_items_in_box` (both endpoints must be inside, so a crossing wire survives), and `remove_symbol(remove_connected_wires=True)` to drop the stubs left on the removed pins
+- **Grid discipline**: every placement snaps to KiCAD's 1.27 mm grid unless you pass `snap_to_grid=False`, so endpoints actually connect
 - **Hierarchical sheets**: `add_sheet`, `set_active_sheet`, `add_hierarchical_label`, `add_sheet_pin`, `list_sheets` — proper multi-level designs
 - **Buses**: `add_bus`, `add_bus_entry`, `add_bus_alias` — visual grouping of address/data lines
 - **Annotation**: `annotate_schematic` — auto-numbers `R?` → `R1, R2, ...` across all sheets
@@ -159,10 +204,11 @@ Add to `~/.claude/settings.json`:
 
 ```
 # 1. Schematic with auto-annotation
-add_power_symbol  net="+5V"   x_mm=100  y_mm=160
-add_symbol        lib_id="Device:R" reference="R?" value="10k" x_mm=100 y_mm=130
-add_symbol        lib_id="Device:R" reference="R?" value="1k"  x_mm=100 y_mm=80
-add_power_symbol  net="GND"   x_mm=100  y_mm=40
+# Y grows downwards, like the KiCAD GUI: +5V on top, GND at the bottom.
+add_power_symbol  net="+5V"   x_mm=101.6  y_mm=50.8
+add_symbol        lib_id="Device:R" reference="R?" value="10k" x_mm=101.6 y_mm=76.2
+add_symbol        lib_id="Device:R" reference="R?" value="1k"  x_mm=101.6 y_mm=101.6
+add_power_symbol  net="GND"   x_mm=101.6  y_mm=127
 annotate_schematic                                        # R? → R1, R2
 
 # wire pins (using get_pin_position to compute exact endpoints)
@@ -197,7 +243,7 @@ enrich_bom_with_sourcing  sources="digikey,mouser"
 ```
 kicad-claude-mcp/
 ├── server.py                          # FastMCP entry point — registers all tools
-├── pyproject.toml                     # uv project + 105 tool surface
+├── pyproject.toml                     # uv project + 110 tool surface
 ├── .env.example                       # API keys + path overrides
 ├── src/kicad_claude/
 │   ├── tools/                         # MCP tools (one file per phase)
@@ -220,7 +266,7 @@ kicad-claude-mcp/
 │   │   ├── spice.py                   # ngspice batch wrapper
 │   │   └── panelization.py            # grid panelize + mouse bites
 │   ├── adapters/                      # logic detached from MCP framing
-│   │   ├── sch_io.py                  # parse + KiCAD-style pretty-print
+│   │   ├── sch_io.py                  # parse + byte-exact KiCAD 10 formatting
 │   │   ├── sch_editor.py              # schematic tree mutations
 │   │   ├── pcb_editor.py              # PCB tree mutations
 │   │   ├── kicad_cli.py               # subprocess wrapper for kicad-cli
@@ -239,14 +285,14 @@ kicad-claude-mcp/
 │   │   └── length_tuning.py           # meander geometry generator
 │   ├── indexer/                       # KiCAD library indexing (~10 MB cache)
 │   ├── templates/                     # blank project / sheet / PCB
-│   └── utils/                         # logging, geometry (mm/Y-flip), paths
-├── tests/                             # 208 fast + 32 acceptance tests
-└── docs/PROGRESS.md                   # per-phase decisions and trade-offs
+│   └── utils/                         # logging, geometry (mm, grid snap), paths
+├── tests/                             # 236 fast + 28 acceptance + 3 network tests
+└── docs/                              # investigation notes
 ```
 
-The full per-phase decision log lives in [`docs/PROGRESS.md`](./docs/PROGRESS.md) —
-~16 phases, each with a checklist, technical decisions and the cleanups that
-diverged from the original spec.
+[`docs/issue8_formatting_probe.md`](./docs/issue8_formatting_probe.md) records how
+the writer was measured against KiCAD 10's own output and which formatting rule
+each line of `sch_io.dumps` implements.
 
 ---
 
@@ -254,7 +300,9 @@ diverged from the original spec.
 
 - **Logging must go to stderr.** STDIO MCP transports use stdout for JSON-RPC; any `print()` to stdout breaks the connection. Use `from kicad_claude.utils.logging import setup_logging`.
 - **Close KiCAD before mutating files.** KiCAD locks `.kicad_*` files while open and can overwrite the changes you make. Open it to verify, close before next round of edits.
-- **Y axis is flipped.** MCP API exposes Y up; `.kicad_*` files store Y down. Conversion lives in `utils/geometry.py`. If components land in unexpected places, suspect this first.
+- **Two coordinate conventions.** Schematic tools take KiCAD-native coordinates — millimetres, Y down, origin at the page's top-left, the numbers the KiCAD GUI shows — and snap to the 1.27 mm grid. PCB tools still take Y *up*, flipped around the page height; that side is due to move to native coordinates. Both live in `utils/geometry.py`. If items land in unexpected places, suspect this first.
+- **`kicad-cli` is found automatically**, from `KICAD_CLI`, then `PATH`, then the standard install paths (`%ProgramFiles%\KiCad\<version>\bin` newest first on Windows, the app bundle on macOS, `/usr/bin` on Linux). `run_erc` / `run_drc` report which binary they used in `cli_path`.
+- **Mutating tools write a backup first** to `<project>/.backups/<timestamp>_<file>`. The directory grows with every call; clean it out or add it to `.gitignore`.
 - **Freerouting needs Java 21+.** Freerouting 2.2.x requires Java 25; we ship 2.1.0 because it works on Java 21–24.
 - **Closed-form analyses are estimators.** Impedance / current / crosstalk / thermal / return-path tools give ballpark numbers good for early design. Production hardware needs Ansys / Sonnet / Saturn PCB / Icepak for sign-off.
 - **Symbols with `extends`** (like `Device:R_Small` extending `Device:R`) currently inject only the extending symbol; the base isn't pulled. Use the canonical name (`Device:R`) for now.
@@ -265,9 +313,9 @@ diverged from the original spec.
 
 ```bash
 uv run mcp dev server.py                          # MCP Inspector (browser UI)
-uv run pytest -m "not slow and not network" -q    # 208 fast tests, ~3 s
-uv run pytest -m "slow" -q                        # acceptance tests via kicad-cli
-uv run pytest -m "network" -q                     # live DigiKey/Mouser tests
+uv run pytest -m "not slow and not network" -q    # 236 fast tests, ~13 s
+uv run pytest -m "slow" -q                        # 28 acceptance tests via kicad-cli
+uv run pytest -m "network" -q                     # 3 live DigiKey/Mouser tests
 ```
 
 The slow tests need KiCAD installed and the library index built (`index_libraries`
