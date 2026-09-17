@@ -101,16 +101,76 @@ def _dedup_existing(paths: list[Path]) -> list[Path]:
 def find_kicad_cli() -> Path | None:
     """Return path to `kicad-cli`, or None if unavailable.
 
-    Checks PATH first, then macOS-bundled location.
+    Order: `KICAD_CLI` env var, PATH, then per-OS install paths (newest KiCAD
+    version first — several versions can coexist).
     """
+    env = os.environ.get("KICAD_CLI")
+    if env:
+        p = Path(env)
+        if p.is_file():
+            return p
     found = shutil.which("kicad-cli")
     if found:
         return Path(found)
-    if platform.system() == "Darwin":
-        candidate = Path("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli")
+    for candidate in _platform_default_cli_paths():
         if candidate.is_file():
             return candidate
     return None
+
+
+def _platform_default_cli_paths() -> list[Path]:
+    """Default `kicad-cli` install locations by OS, newest version first."""
+    sys_name = platform.system()
+    if sys_name == "Darwin":
+        return [Path("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli")]
+    if sys_name == "Linux":
+        return [Path("/usr/bin/kicad-cli"), Path("/usr/local/bin/kicad-cli")]
+    if sys_name == "Windows":
+        roots = [
+            Path(r)
+            for r in (
+                os.environ.get("ProgramFiles"),
+                os.environ.get("ProgramFiles(x86)"),
+                r"C:\Program Files",
+            )
+            if r
+        ]
+        out: list[Path] = []
+        for root in roots:
+            kicad = root / "KiCad"
+            # Install dirs are named "10.0", "7.0", … — newest first.
+            for version_dir in sorted(
+                (d for d in _safe_iterdir(kicad) if d.is_dir()),
+                key=lambda d: _version_key(d.name),
+                reverse=True,
+            ):
+                p = version_dir / "bin" / "kicad-cli.exe"
+                if p not in out:
+                    out.append(p)
+            # Fall back to the bare version names when nothing was listed.
+            for v in _KICAD_VERSIONS:
+                p = kicad / v / "bin" / "kicad-cli.exe"
+                if p not in out:
+                    out.append(p)
+        return out
+    return []
+
+
+def _safe_iterdir(p: Path) -> list[Path]:
+    try:
+        return list(p.iterdir())
+    except OSError:
+        return []
+
+
+def _version_key(name: str) -> tuple:
+    """Sort key for a version directory name like "10.0"; unparsable names sort last."""
+    parts = []
+    for chunk in name.split("."):
+        if not chunk.isdigit():
+            return (-1,)
+        parts.append(int(chunk))
+    return tuple(parts) if parts else (-1,)
 
 
 def cache_dir() -> Path:

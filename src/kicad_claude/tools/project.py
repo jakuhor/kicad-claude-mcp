@@ -15,6 +15,7 @@ from pathlib import Path
 from skip import PCB, Schematic
 
 from kicad_claude import state
+from kicad_claude.adapters import sch_editor as ed
 from kicad_claude.templates.blank import write_blank_project
 
 logger = logging.getLogger("kicad-claude.tools.project")
@@ -132,11 +133,29 @@ def register(mcp) -> None:
         return _summarize(state.get_active())
 
     @mcp.tool()
-    def list_components() -> list[dict]:
-        """List schematic symbols in the active project.
+    def list_components(scope: str = "active") -> list[dict]:
+        """List schematic symbols of the active project.
 
-        Each entry: reference, value, lib_id, position_mm [x, y], rotation.
+        `scope="active"` (default) lists the active sheet — the one set by
+        `set_active_sheet`, root when unset. `scope="all"` walks the whole
+        hierarchy.
+
+        Each entry: reference, value, lib_id, position_mm [x, y], rotation,
+        sheet (filename relative to the project directory).
         """
+        if scope not in ("active", "all"):
+            raise ValueError(f"scope must be 'active' or 'all' (got {scope!r})")
         proj = state.get_active()
-        sch = Schematic(str(proj.sch_path))
-        return [_component_dict(sym) for sym in sch.symbol]
+        if scope == "active":
+            paths = [state.get_active_sheet_path()]
+        else:
+            paths = ed.hierarchy_sch_paths(proj.sch_path)
+        out: list[dict] = []
+        for path in paths:
+            sch = Schematic(str(path))
+            sheet_name = path.name
+            for symbol in sch.symbol:
+                entry = _component_dict(symbol)
+                entry["sheet"] = sheet_name
+                out.append(entry)
+        return out

@@ -287,6 +287,9 @@ def test_acceptance_full_flow_routes_real_track(tmp_path: Path):
     cached = kicad_libs.load_cache()
     if cached is None:
         pytest.skip("library index not built")
+    from kicad_claude.adapters import freerouting
+    if freerouting.find_freerouting_jar() is None:
+        pytest.skip("freerouting.jar not available")
 
     state.clear_active()
     lib_tools._index = cached

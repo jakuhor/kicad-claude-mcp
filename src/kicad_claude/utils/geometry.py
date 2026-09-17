@@ -1,16 +1,16 @@
 """Coordinate-system helpers.
 
-The MCP API exposes:
-- millimetres (float)
-- Y axis pointing UP (so "+5V at top" means high Y)
+Schematic tools use **KiCAD-native coordinates**: millimetres, Y axis pointing
+DOWN, origin at the page's top-left — the same numbers the KiCAD GUI shows.
+`sch_to_file_xy` is therefore the identity, and exists so the boundary stays
+explicit. Schematic placements snap to `SCHEMATIC_GRID_MM` by default
+(`snap_xy`), because KiCAD only connects items whose endpoints share a grid
+point.
 
-KiCAD `.kicad_sch` files use:
-- millimetres (float, sometimes nanometres internally — handled by file format)
-- Y axis pointing DOWN (origin at top-left of page)
-
-We translate at the boundary in `mcp_to_kicad_xy` / `kicad_to_mcp_xy`. The
-default page height assumes A4 landscape (the KiCAD schematic default), but
-callers may override it after reading `(paper ...)`.
+PCB tools still use the old convention: Y UP, flipped around the page height by
+`mcp_to_kicad_xy` / `kicad_to_mcp_xy`. Those two are page-size dependent and a
+grid point does not survive the flip (297 mm is not a multiple of 1.27 mm), so
+the PCB side is meant to move to native coordinates in a later pass.
 """
 
 from __future__ import annotations
@@ -20,18 +20,48 @@ import math
 # A4 landscape — KiCAD's default schematic page (x_max=297, y_max=210 mm).
 DEFAULT_PAGE_HEIGHT_MM = 210.0
 
+# KiCAD's default schematic grid: 50 mil.
+SCHEMATIC_GRID_MM = 1.27
+
+
+def sch_to_file_xy(x_mm: float, y_mm: float) -> tuple[float, float]:
+    """Schematic MCP coords → file coords. Identity: both are KiCAD-native."""
+    return float(x_mm), float(y_mm)
+
+
+def file_to_sch_xy(x_mm: float, y_mm: float) -> tuple[float, float]:
+    """File coords → schematic MCP coords. Identity; inverse of `sch_to_file_xy`."""
+    return float(x_mm), float(y_mm)
+
+
+def snap_mm(value: float, grid_mm: float = SCHEMATIC_GRID_MM) -> float:
+    """Round `value` to the nearest multiple of `grid_mm`."""
+    if grid_mm <= 0:
+        raise ValueError(f"grid_mm must be > 0 (got {grid_mm})")
+    return round_mm(round(float(value) / grid_mm) * grid_mm)
+
+
+def snap_xy(
+    x_mm: float, y_mm: float, grid_mm: float = SCHEMATIC_GRID_MM
+) -> tuple[float, float]:
+    """Snap both coordinates to `grid_mm`."""
+    return snap_mm(x_mm, grid_mm), snap_mm(y_mm, grid_mm)
+
 
 def mcp_to_kicad_xy(
     x_mm: float, y_mm: float, page_height_mm: float = DEFAULT_PAGE_HEIGHT_MM
 ) -> tuple[float, float]:
-    """Translate a point from MCP coords (Y up) to KiCAD file coords (Y down)."""
+    """Translate a point from PCB MCP coords (Y up) to KiCAD file coords (Y down).
+
+    PCB only — schematic code uses `sch_to_file_xy`.
+    """
     return float(x_mm), float(page_height_mm) - float(y_mm)
 
 
 def kicad_to_mcp_xy(
     x_mm: float, y_mm: float, page_height_mm: float = DEFAULT_PAGE_HEIGHT_MM
 ) -> tuple[float, float]:
-    """Inverse of mcp_to_kicad_xy. The transform is its own inverse."""
+    """Inverse of mcp_to_kicad_xy. The transform is its own inverse. PCB only."""
     return float(x_mm), float(page_height_mm) - float(y_mm)
 
 

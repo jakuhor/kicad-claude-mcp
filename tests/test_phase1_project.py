@@ -129,3 +129,63 @@ def test_set_project_missing_pro_raises(tmp_path: Path):
     mcp = _make_mcp()
     with pytest.raises(FileNotFoundError):
         _call(mcp, "set_project", project_path=str(tmp_path))
+
+
+# ===== list_components sheet scope ========================================= #
+
+
+def test_list_components_uses_the_active_sheet(tmp_path: Path):
+    from kicad_claude.templates.blank import write_blank_schematic
+
+    mcp = _make_mcp()
+    _call(mcp, "create_project", path=str(tmp_path / "h"), name="h")
+    child = tmp_path / "h" / "child.kicad_sch"
+    write_blank_schematic(child)
+    state.set_active_sheet("child.kicad_sch")
+    assert _call(mcp, "list_components") == []
+    assert _call(mcp, "list_components", scope="all") == []
+    state.set_active_sheet(None)
+
+
+def test_list_components_rejects_unknown_scope(tmp_path: Path):
+    mcp = _make_mcp()
+    _call(mcp, "create_project", path=str(tmp_path / "s"), name="s")
+    with pytest.raises(ValueError, match="scope"):
+        _call(mcp, "list_components", scope="everything")
+
+
+# ===== kicad-cli discovery ================================================= #
+
+
+def test_find_kicad_cli_honours_env_var(tmp_path: Path, monkeypatch):
+    from kicad_claude.utils import kicad_paths
+
+    fake = tmp_path / "kicad-cli.exe"
+    fake.write_text("")
+    monkeypatch.setenv("KICAD_CLI", str(fake))
+    assert kicad_paths.find_kicad_cli() == fake
+
+
+def test_find_kicad_cli_ignores_env_var_pointing_nowhere(tmp_path: Path, monkeypatch):
+    from kicad_claude.utils import kicad_paths
+
+    monkeypatch.setenv("KICAD_CLI", str(tmp_path / "missing.exe"))
+    monkeypatch.setattr(kicad_paths.shutil, "which", lambda _: None)
+    monkeypatch.setattr(kicad_paths, "_platform_default_cli_paths", list)
+    assert kicad_paths.find_kicad_cli() is None
+
+
+def test_platform_default_cli_paths_are_versioned(monkeypatch):
+    from kicad_claude.utils import kicad_paths
+
+    monkeypatch.setattr(kicad_paths.platform, "system", lambda: "Windows")
+    monkeypatch.setenv("ProgramFiles", r"C:\Program Files")
+    paths = kicad_paths._platform_default_cli_paths()
+    names = [str(p) for p in paths]
+    assert any(n.endswith(r"bin\kicad-cli.exe") for n in names)
+    # Installed dirs ("10.0") come first, then the bare fallbacks, newest first.
+    versions = [n.split("KiCad\\")[1].split("\\")[0] for n in names]
+    assert versions[-4:] == ["10", "9", "8", "7"]
+
+    monkeypatch.setattr(kicad_paths.platform, "system", lambda: "Linux")
+    assert Path("/usr/bin/kicad-cli") in kicad_paths._platform_default_cli_paths()

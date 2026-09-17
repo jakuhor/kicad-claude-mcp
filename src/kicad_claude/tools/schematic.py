@@ -2,11 +2,15 @@
 
 Tools (all operate on the active project's `.kicad_sch`):
     add_symbol, remove_symbol, move_symbol
-    add_wire, add_label, add_no_connect, add_power_symbol
+    add_wire, remove_wire, add_label, add_no_connect, add_power_symbol
+    add_junction, remove_junction, remove_no_connect, remove_items_in_box
     list_pins, get_pin_position
     list_components_detailed (richer than Phase 1's list_components)
 
-Coordinates: millimetres, Y axis pointing UP (see utils/geometry).
+Coordinates: millimetres, KiCAD-native — Y axis points DOWN, origin at the
+page's top-left, exactly like the numbers in the KiCAD GUI (see utils/geometry).
+Every placement snaps to the 1.27 mm grid unless `snap_to_grid=False`; KiCAD
+only connects items whose endpoints share a grid point.
 Rotations: 0 / 90 / 180 / 270 only.
 """
 
@@ -21,8 +25,16 @@ from kicad_claude.adapters import sch_editor as ed
 from kicad_claude.adapters import sch_io
 from kicad_claude.templates.blank import write_blank_schematic
 from kicad_claude.tools import library as lib_tools
+from kicad_claude.utils.geometry import round_mm, snap_xy
 
 logger = logging.getLogger("kicad-claude.tools.schematic")
+
+
+def _snap(x_mm: float, y_mm: float, snap_to_grid: bool) -> tuple[float, float]:
+    """Snap a point to the 1.27 mm schematic grid unless the caller opts out."""
+    if not snap_to_grid:
+        return round_mm(x_mm), round_mm(y_mm)
+    return snap_xy(x_mm, y_mm)
 
 
 # --------------------------------------------------------------------------- #
@@ -91,9 +103,17 @@ def _resolve_lib_symbol(lib_id: str) -> tuple[Path, str, dict]:
 
 
 def _next_power_reference(tree: list) -> str:
-    """Auto-increment a `#PWR####` reference, picking the smallest unused number."""
+    """Auto-increment a `#PWR####` reference, picking the smallest unused number.
+
+    Scans the whole hierarchy, not just the active sheet: `#PWR` references
+    must be unique across all sheets or KiCAD reports annotation errors.
+    """
+    refs = list(ed.all_references(tree))
+    proj = state.get_active_or_none()
+    if proj is not None:
+        refs.extend(ed.all_references_in_hierarchy(proj.sch_path))
     used = set()
-    for ref in ed.all_references(tree):
+    for ref in refs:
         if not ref:
             continue
         m = re.fullmatch(r"#PWR0*(\d+)", ref)
@@ -121,6 +141,7 @@ def register(mcp) -> None:
         x_mm: float,
         y_mm: float,
         rotation: float = 0,
+        snap_to_grid: bool = True,
     ) -> dict:
         """Add a symbol from the indexed KiCAD libraries to the active schematic.
 
@@ -128,11 +149,14 @@ def register(mcp) -> None:
             lib_id: e.g. "Device:R" or "RF_Module:ESP32-S3-WROOM-1"
             reference: schematic-unique reference designator (e.g. "R1", "U2")
             value: human-visible value ("10k", "100uF", ...)
-            x_mm, y_mm: position, MCP coords (Y up)
+            x_mm, y_mm: position in KiCAD coords (Y down, origin top-left)
             rotation: 0/90/180/270 degrees CCW
+            snap_to_grid: snap the position to the 1.27 mm grid (default True)
 
-        Returns the placed symbol's identity. Refuses if `reference` already exists.
+        Returns the placed symbol's identity, with the snapped position.
+        Refuses if `reference` already exists.
         """
+        x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
         tree, path = _load_active_schematic()
         lib_path, sym_name, meta = _resolve_lib_symbol(lib_id)
         sym_def = ed.fetch_symbol_def(lib_path, sym_name)
@@ -170,13 +194,142 @@ def register(mcp) -> None:
         }
 
     @mcp.tool()
-    def remove_symbol(reference: str) -> dict:
-        """Remove the symbol with the given reference from the active schematic."""
+    def remove_symbol(reference: str, remove_connected_wires: bool = False) -> dict:
+        """Remove the symbol with the given reference from the active schematic.
+
+        With `remove_connected_wires=True`, also removes the no-connect markers
+        and junctions that sat on the symbol's pins, plus wire stubs that ended
+        on those pins and connect to nothing else. Wires that still reach
+        another pin, label or junction stay.
+        """
         tree, path = _load_active_schematic()
-        if not ed.remove_symbol(tree, reference):
+        result = ed.remove_symbol_with_wires(
+            tree, reference, remove_connected_wires=remove_connected_wires
+        )
+        if not result["removed"]:
             raise KeyError(f"no symbol with reference {reference!r}")
         backup = _save_with_backup(tree, path)
-        return {"removed": reference, "backup": str(backup) if backup else None}
+        return {
+            "removed": reference,
+            "removed_wires": result["wires"],
+            "removed_junctions": result["junctions"],
+            "removed_no_connects": result["no_connects"],
+            "sheet": state.get_active_sheet_filename() or "root",
+            "backup": str(backup) if backup else None,
+        }
+
+    @mcp.tool()
+    def remove_wire(
+        x1_mm: float,
+        y1_mm: float,
+        x2_mm: float,
+        y2_mm: float,
+        kind: str = "wire",
+        snap_to_grid: bool = True,
+    ) -> dict:
+        """Remove the wire (or bus) segment running between two points.
+
+        Endpoint order does not matter. `kind` is "wire" or "bus". Points are
+        matched with a 0.01 mm tolerance; pass the same coordinates used to
+        create the segment, or read them back with `list_pins`.
+        """
+        if kind not in ("wire", "bus"):
+            raise ValueError(f"kind must be 'wire' or 'bus' (got {kind!r})")
+        x1_mm, y1_mm = _snap(x1_mm, y1_mm, snap_to_grid)
+        x2_mm, y2_mm = _snap(x2_mm, y2_mm, snap_to_grid)
+        tree, path = _load_active_schematic()
+        if not ed.remove_wire(tree, x1_mm, y1_mm, x2_mm, y2_mm, kind=kind):
+            raise KeyError(
+                f"no {kind} between ({x1_mm}, {y1_mm}) and ({x2_mm}, {y2_mm})"
+            )
+        backup = _save_with_backup(tree, path)
+        return {
+            "removed": kind,
+            "from_mm": [x1_mm, y1_mm],
+            "to_mm": [x2_mm, y2_mm],
+            "sheet": state.get_active_sheet_filename() or "root",
+            "backup": str(backup) if backup else None,
+        }
+
+    @mcp.tool()
+    def add_junction(x_mm: float, y_mm: float, snap_to_grid: bool = True) -> dict:
+        """Add a junction dot at a point — the T-joint marker KiCAD needs.
+
+        Idempotent: a junction already at that point is reused.
+        """
+        x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
+        tree, path = _load_active_schematic()
+        existed = ed.find_point_item(tree, "junction", x_mm, y_mm) is not None
+        ed.add_junction(tree, x_mm, y_mm)
+        backup = _save_with_backup(tree, path)
+        return {
+            "position_mm": [x_mm, y_mm],
+            "created": not existed,
+            "sheet": state.get_active_sheet_filename() or "root",
+            "backup": str(backup) if backup else None,
+        }
+
+    @mcp.tool()
+    def remove_junction(x_mm: float, y_mm: float, snap_to_grid: bool = True) -> dict:
+        """Remove the junction dot at a point."""
+        x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
+        tree, path = _load_active_schematic()
+        if not ed.remove_junction(tree, x_mm, y_mm):
+            raise KeyError(f"no junction at ({x_mm}, {y_mm})")
+        backup = _save_with_backup(tree, path)
+        return {
+            "removed": "junction",
+            "position_mm": [x_mm, y_mm],
+            "sheet": state.get_active_sheet_filename() or "root",
+            "backup": str(backup) if backup else None,
+        }
+
+    @mcp.tool()
+    def remove_no_connect(x_mm: float, y_mm: float, snap_to_grid: bool = True) -> dict:
+        """Remove the no-connect marker at a point.
+
+        Use `get_pin_position` to find the point of a pin's marker.
+        """
+        x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
+        tree, path = _load_active_schematic()
+        if not ed.remove_no_connect(tree, x_mm, y_mm):
+            raise KeyError(f"no no-connect marker at ({x_mm}, {y_mm})")
+        backup = _save_with_backup(tree, path)
+        return {
+            "removed": "no_connect",
+            "position_mm": [x_mm, y_mm],
+            "sheet": state.get_active_sheet_filename() or "root",
+            "backup": str(backup) if backup else None,
+        }
+
+    @mcp.tool()
+    def remove_items_in_box(
+        x1_mm: float,
+        y1_mm: float,
+        x2_mm: float,
+        y2_mm: float,
+        kinds: list[str] | None = None,
+    ) -> dict:
+        """Remove every item fully inside a rectangle of the active sheet.
+
+        `x1,y1` and `x2,y2` are opposite corners in KiCAD coords. A wire or bus
+        is removed only when BOTH endpoints are inside, so a segment crossing
+        the box survives.
+
+        `kinds` defaults to everything but symbols: wire, bus, junction,
+        no_connect, label, global_label, hierarchical_label, bus_entry, text.
+        Pass ["symbol"] explicitly to delete symbols by area.
+        """
+        tree, path = _load_active_schematic()
+        removed = ed.remove_items_in_box(tree, x1_mm, y1_mm, x2_mm, y2_mm, kinds=kinds)
+        backup = _save_with_backup(tree, path)
+        return {
+            "removed": removed,
+            "removed_total": sum(removed.values()),
+            "box_mm": [[x1_mm, y1_mm], [x2_mm, y2_mm]],
+            "sheet": state.get_active_sheet_filename() or "root",
+            "backup": str(backup) if backup else None,
+        }
 
     @mcp.tool()
     def move_symbol(
@@ -184,8 +337,10 @@ def register(mcp) -> None:
         x_mm: float,
         y_mm: float,
         rotation: float | None = None,
+        snap_to_grid: bool = True,
     ) -> dict:
         """Move (and optionally rotate) an existing symbol. Absolute positioning."""
+        x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
         tree, path = _load_active_schematic()
         ed.move_symbol(tree, reference, x_mm, y_mm, rotation)
         backup = _save_with_backup(tree, path)
@@ -197,8 +352,20 @@ def register(mcp) -> None:
         }
 
     @mcp.tool()
-    def add_wire(x1_mm: float, y1_mm: float, x2_mm: float, y2_mm: float) -> dict:
-        """Add a straight wire segment between two points (MCP coords)."""
+    def add_wire(
+        x1_mm: float,
+        y1_mm: float,
+        x2_mm: float,
+        y2_mm: float,
+        snap_to_grid: bool = True,
+    ) -> dict:
+        """Add a straight wire segment between two points.
+
+        Both endpoints snap to the 1.27 mm grid by default — an off-grid
+        endpoint does not connect to anything in KiCAD.
+        """
+        x1_mm, y1_mm = _snap(x1_mm, y1_mm, snap_to_grid)
+        x2_mm, y2_mm = _snap(x2_mm, y2_mm, snap_to_grid)
         tree, path = _load_active_schematic()
         ed.add_wire(tree, x1_mm, y1_mm, x2_mm, y2_mm)
         backup = _save_with_backup(tree, path)
@@ -214,8 +381,10 @@ def register(mcp) -> None:
         x_mm: float,
         y_mm: float,
         orientation: str = "right",
+        snap_to_grid: bool = True,
     ) -> dict:
         """Add a net label at a point. orientation ∈ {right, up, left, down}."""
+        x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
         tree, path = _load_active_schematic()
         ed.add_label(tree, net_name, x_mm, y_mm, orientation)
         backup = _save_with_backup(tree, path)
@@ -227,13 +396,16 @@ def register(mcp) -> None:
         }
 
     @mcp.tool()
-    def add_power_symbol(net: str, x_mm: float, y_mm: float) -> dict:
+    def add_power_symbol(
+        net: str, x_mm: float, y_mm: float, snap_to_grid: bool = True
+    ) -> dict:
         """Place a power symbol (e.g. +5V, +3V3, GND) from the `power` library.
 
         Auto-assigns a `#PWR####` reference. The library symbol id is
         `power:{net}`; if that doesn't exist in the index, the call fails with
         a hint listing valid power nets.
         """
+        x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
         candidate = f"power:{net}"
         idx = lib_tools._ensure_index()
         if candidate not in idx["symbols"]:
@@ -289,13 +461,13 @@ def register(mcp) -> None:
 
     @mcp.tool()
     def list_pins(reference: str) -> list[dict]:
-        """List pins of a placed symbol with their absolute positions (MCP coords)."""
+        """List pins of a placed symbol with their absolute positions (KiCAD coords)."""
         tree, _ = _load_active_schematic()
         return ed.list_pins_for_symbol(tree, reference)
 
     @mcp.tool()
     def get_pin_position(reference: str, pin: str) -> dict:
-        """Return absolute (x, y) of one pin in MCP coordinates."""
+        """Return absolute (x, y) of one pin in KiCAD coordinates (Y down)."""
         tree, _ = _load_active_schematic()
         x, y = ed.get_pin_position(tree, reference, pin)
         return {"reference": reference, "pin": pin, "position_mm": [x, y]}
@@ -308,6 +480,7 @@ def register(mcp) -> None:
         y1_mm: float,
         x2_mm: float,
         y2_mm: float,
+        snap_to_grid: bool = True,
     ) -> dict:
         """Add a bus line to the active sheet.
 
@@ -319,6 +492,8 @@ def register(mcp) -> None:
           - Bracket form: `DATA[0..7]` for 8 wires
           - Alias form: declare with `add_bus_alias("DATA", ["D0", "D1", ...])`
         """
+        x1_mm, y1_mm = _snap(x1_mm, y1_mm, snap_to_grid)
+        x2_mm, y2_mm = _snap(x2_mm, y2_mm, snap_to_grid)
         tree, path = _load_active_schematic()
         ed.add_bus_segment(tree, x1_mm, y1_mm, x2_mm, y2_mm)
         backup = _save_with_backup(tree, path)
@@ -334,6 +509,7 @@ def register(mcp) -> None:
         x_mm: float,
         y_mm: float,
         direction: str = "right_down",
+        snap_to_grid: bool = True,
     ) -> dict:
         """Add a `(bus_entry ...)` — the diagonal connector from a bus to a wire.
 
@@ -341,6 +517,7 @@ def register(mcp) -> None:
         Place at the point where the bus meets the entry; KiCAD draws a
         diagonal line from there to the wire side.
         """
+        x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
         tree, path = _load_active_schematic()
         ed.add_bus_entry(tree, x_mm, y_mm, direction=direction)
         backup = _save_with_backup(tree, path)
@@ -379,8 +556,11 @@ def register(mcp) -> None:
         y_mm: float = 50,
         width_mm: float = 30,
         height_mm: float = 20,
+        snap_to_grid: bool = True,
     ) -> dict:
         """Create a child sub-sheet on the ROOT schematic.
+
+        (`x_mm`, `y_mm`) is the sheet block's TOP-LEFT corner.
 
         Adds a `(sheet ...)` placeholder to the root and creates a fresh
         blank child `.kicad_sch` file. The active context stays on root —
@@ -389,6 +569,7 @@ def register(mcp) -> None:
         If `sheet_filename` is omitted, it defaults to a slugified
         `{sheet_name}.kicad_sch`.
         """
+        x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
         proj = state.get_active()
         if sheet_filename is None:
             slug = "".join(c if c.isalnum() or c in "_-" else "_" for c in sheet_name).strip("_")
@@ -421,6 +602,7 @@ def register(mcp) -> None:
         return {
             "sheet_name": sheet_name,
             "sheet_filename": sheet_filename,
+            "position_mm": [x_mm, y_mm],
             "child_path": str(child_path),
             "backup": str(backup) if backup else None,
         }
@@ -483,6 +665,7 @@ def register(mcp) -> None:
         y_mm: float,
         shape: str = "input",
         orientation: str = "right",
+        snap_to_grid: bool = True,
     ) -> dict:
         """Add a hierarchical label on the active SUB-sheet.
 
@@ -498,6 +681,7 @@ def register(mcp) -> None:
                 "hierarchical labels belong on a sub-sheet; call set_active_sheet "
                 "first or use add_label for the root."
             )
+        x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
         tree, path = _load_active_schematic()
         ed.add_hierarchical_label(
             tree, net_name=net_name, x_mm=x_mm, y_mm=y_mm,
@@ -521,6 +705,7 @@ def register(mcp) -> None:
         x_mm: float,
         y_mm: float,
         orientation: str = "right",
+        snap_to_grid: bool = True,
     ) -> dict:
         """Add a sheet pin to a child sheet's placeholder on the ROOT.
 
@@ -530,7 +715,7 @@ def register(mcp) -> None:
         `pin_name` is the net name to expose (e.g., "+5V").
         `shape`: input | output | bidirectional | tri_state | passive
         """
-        proj = state.get_active()
+        x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
         previous = state.get_active_sheet_filename()
         state.set_active_sheet(None)
         try:
@@ -544,7 +729,6 @@ def register(mcp) -> None:
                 shape=shape,
                 x_mm=x_mm,
                 y_mm=y_mm,
-                page_h=ed.page_height_mm(tree),
                 orientation=orientation,
             )
             backup = _save_with_backup(tree, root_path)

@@ -4,9 +4,10 @@ Operates on raw sexpdata trees — `parse_file` from `sch_io.py` returns the
 top-level list, and these helpers mutate it in place. Use `write_file` to
 serialize back.
 
-Coordinate convention: all `x_mm`/`y_mm` parameters are in **MCP coordinates**
-(Y up). Internal storage is in KiCAD coordinates (Y down). The `_mcp_to_at`
-helper does the conversion at the boundary.
+Coordinate convention: all `x_mm`/`y_mm` parameters are **KiCAD-native**
+(millimetres, Y down, origin at the page's top-left) — the same numbers the
+KiCAD GUI shows. `sch_to_file_xy` marks that boundary; it is the identity.
+Callers snap to the 1.27 mm grid before calling (see `tools/schematic.py`).
 """
 
 from __future__ import annotations
@@ -29,7 +30,8 @@ from kicad_claude.adapters.sch_io import (
 )
 from kicad_claude.utils.geometry import (
     DEFAULT_PAGE_HEIGHT_MM,
-    mcp_to_kicad_xy,
+    file_to_sch_xy,
+    sch_to_file_xy,
     normalize_rotation,
     rotate_xy,
     round_mm,
@@ -208,13 +210,12 @@ def build_symbol_instance(
     pin_numbers: list[str],
     project_name: str,
     instance_path: str,
-    page_h: float,
     footprint: str = "",
     datasheet: str = "~",
     description: str = "",
 ) -> list:
     """Construct a new (symbol ...) instance node ready to inject into the schematic."""
-    x_k, y_k = mcp_to_kicad_xy(x_mcp, y_mcp, page_h)
+    x_k, y_k = sch_to_file_xy(x_mcp, y_mcp)
     x_k, y_k = round_mm(x_k), round_mm(y_k)
 
     inst_uuid = str(uuid.uuid4())
@@ -307,7 +308,6 @@ def add_symbol(
         raise ValueError(f"reference {reference!r} already exists")
 
     rot = normalize_rotation(rotation)
-    page_h = page_height_mm(tree)
     if instance_path is None:
         instance_path = f"/{_schematic_uuid(tree)}"
 
@@ -326,7 +326,6 @@ def add_symbol(
         pin_numbers=pins,
         project_name=project_name,
         instance_path=instance_path,
-        page_h=page_h,
         footprint=footprint,
         datasheet=datasheet,
         description=description,
@@ -359,8 +358,7 @@ def move_symbol(
     s_node = find_symbol_by_reference(tree, reference)
     if s_node is None:
         raise KeyError(f"no symbol with reference {reference!r}")
-    page_h = page_height_mm(tree)
-    x_k, y_k = mcp_to_kicad_xy(x_mm, y_mm, page_h)
+    x_k, y_k = sch_to_file_xy(x_mm, y_mm)
     at = find_child(s_node, "at")
     if at is None or len(at) < 4:
         raise ValueError("symbol has malformed (at ...) node")
@@ -378,9 +376,8 @@ def add_wire(
     y2_mm: float,
 ) -> list:
     """Append a (wire ...) segment between two MCP-coord points. Returns the new node."""
-    page_h = page_height_mm(tree)
-    x1k, y1k = mcp_to_kicad_xy(x1_mm, y1_mm, page_h)
-    x2k, y2k = mcp_to_kicad_xy(x2_mm, y2_mm, page_h)
+    x1k, y1k = sch_to_file_xy(x1_mm, y1_mm)
+    x2k, y2k = sch_to_file_xy(x2_mm, y2_mm)
     node = [
         sym("wire"),
         [
@@ -403,8 +400,7 @@ def add_label(
     orientation: str = "right",
 ) -> list:
     """Append a (label ...) at a point. orientation ∈ {right, up, left, down}."""
-    page_h = page_height_mm(tree)
-    xk, yk = mcp_to_kicad_xy(x_mm, y_mm, page_h)
+    xk, yk = sch_to_file_xy(x_mm, y_mm)
     angle_map = {"right": 0, "up": 90, "left": 180, "down": 270}
     if orientation not in angle_map:
         raise ValueError(f"orientation must be one of {list(angle_map)}")
@@ -425,8 +421,7 @@ def add_label(
 
 def add_no_connect(tree: list, x_mm: float, y_mm: float) -> list:
     """Append a (no_connect ...) marker at a point."""
-    page_h = page_height_mm(tree)
-    xk, yk = mcp_to_kicad_xy(x_mm, y_mm, page_h)
+    xk, yk = sch_to_file_xy(x_mm, y_mm)
     node = [
         sym("no_connect"),
         [sym("at"), round_mm(xk), round_mm(yk)],
@@ -449,9 +444,8 @@ def add_bus_segment(
     y2_mm: float,
 ) -> list:
     """Append a `(bus ...)` line — visually identical to a wire but thicker."""
-    page_h = page_height_mm(tree)
-    x1k, y1k = mcp_to_kicad_xy(x1_mm, y1_mm, page_h)
-    x2k, y2k = mcp_to_kicad_xy(x2_mm, y2_mm, page_h)
+    x1k, y1k = sch_to_file_xy(x1_mm, y1_mm)
+    x2k, y2k = sch_to_file_xy(x2_mm, y2_mm)
     node = [
         sym("bus"),
         [
@@ -491,8 +485,7 @@ def add_bus_entry(
             f"direction must be one of {list(deltas)} (got {direction!r})"
         )
     dx, dy = deltas[direction]
-    page_h = page_height_mm(tree)
-    xk, yk = mcp_to_kicad_xy(x_mm, y_mm, page_h)
+    xk, yk = sch_to_file_xy(x_mm, y_mm)
     node = [
         sym("bus_entry"),
         [sym("at"), round_mm(xk), round_mm(yk)],
@@ -547,18 +540,16 @@ def add_sheet_node(
     The placeholder references `sheet_filename` (relative path) and is sized
     `width_mm × height_mm`. Returns the new node.
 
-    The bottom-left corner of the sheet sits at MCP (`x_mm`, `y_mm`).
+    The top-left corner of the sheet sits at (`x_mm`, `y_mm`).
     """
     if find_sheet_by_filename(parent_tree, sheet_filename) is not None:
         raise ValueError(f"sheet {sheet_filename!r} already registered")
     if find_sheet_by_name(parent_tree, sheet_name) is not None:
         raise ValueError(f"sheet name {sheet_name!r} already in use")
 
-    page_h = page_height_mm(parent_tree)
-    # KiCAD's sheet block uses the TOP-LEFT corner as its (at ...) origin.
-    # Convert MCP bottom-left + size → KiCAD top-left.
-    bl_k = mcp_to_kicad_xy(x_mm, y_mm, page_h)
-    top_left_kicad = (bl_k[0], bl_k[1] - height_mm)
+    # KiCAD's sheet block uses the TOP-LEFT corner as its (at ...) origin,
+    # and so does this call.
+    top_left_kicad = sch_to_file_xy(x_mm, y_mm)
     root_uuid = _schematic_uuid(parent_tree)
     sheet_uuid = str(uuid.uuid4())
 
@@ -643,6 +634,46 @@ def get_sheet_filename(sheet_node: list) -> str | None:
     return None
 
 
+def hierarchy_sch_paths(root_sch: Path) -> list[Path]:
+    """Root schematic plus every sub-sheet file it reaches, depth-first, deduped.
+
+    Missing or unreadable sub-sheet files are skipped; a sheet loop terminates
+    because each resolved path is visited once.
+    """
+    root_sch = Path(root_sch).resolve()
+    out: list[Path] = []
+    seen: set[Path] = set()
+    stack = [root_sch]
+    while stack:
+        current = stack.pop(0)
+        if current in seen or not current.is_file():
+            continue
+        seen.add(current)
+        out.append(current)
+        try:
+            tree = sch_io.parse_file(current)
+        except Exception:
+            continue
+        children = [
+            current.parent / entry["filename"]
+            for entry in list_sheets(tree)
+            if entry.get("filename")
+        ]
+        stack.extend(p.resolve() for p in children)
+    return out
+
+
+def all_references_in_hierarchy(root_sch: Path) -> list[str]:
+    """Every symbol reference across the root schematic and all its sub-sheets."""
+    refs: list[str] = []
+    for path in hierarchy_sch_paths(root_sch):
+        try:
+            refs.extend(all_references(sch_io.parse_file(path)))
+        except Exception:
+            continue
+    return refs
+
+
 def list_sheets(tree: list) -> list[dict]:
     """Return summaries of every (sheet ...) node in `tree`."""
     out = []
@@ -679,8 +710,7 @@ def add_hierarchical_label(
         raise ValueError(
             f"orientation must be one of {list(_LABEL_ORIENTATIONS)}"
         )
-    page_h = page_height_mm(tree)
-    xk, yk = mcp_to_kicad_xy(x_mm, y_mm, page_h)
+    xk, yk = sch_to_file_xy(x_mm, y_mm)
     node = [
         sym("hierarchical_label"),
         net_name,
@@ -704,7 +734,6 @@ def add_sheet_pin(
     shape: str,
     x_mm: float,
     y_mm: float,
-    page_h: float,
     orientation: str = "right",
 ) -> list:
     """Append a `(pin ...)` to a parent's `(sheet ...)` block.
@@ -719,7 +748,7 @@ def add_sheet_pin(
         raise ValueError(
             f"orientation must be one of {list(_LABEL_ORIENTATIONS)}"
         )
-    xk, yk = mcp_to_kicad_xy(x_mm, y_mm, page_h)
+    xk, yk = sch_to_file_xy(x_mm, y_mm)
     pin_node = [
         sym("pin"),
         pin_name,
@@ -803,7 +832,6 @@ def list_pins_for_symbol(tree: list, reference: str) -> list[dict]:
     if not at or len(at) < 4:
         raise ValueError(f"symbol {reference!r} has malformed (at ...)")
     sx, sy, srot = float(at[1]), float(at[2]), float(at[3])
-    page_h = page_height_mm(tree)
 
     out = []
     for pin_node, _unit in _iter_pins(sym_def):
@@ -816,7 +844,7 @@ def list_pins_for_symbol(tree: list, reference: str) -> list[dict]:
         # systems are consistent, rotate_xy + add gives the right result.
         wx_kicad = sx + rx
         wy_kicad = sy - ry  # flip because KiCAD Y is down vs math Y up
-        mcp_x, mcp_y = wx_kicad, page_h - wy_kicad
+        mcp_x, mcp_y = file_to_sch_xy(wx_kicad, wy_kicad)
         number, name = _pin_id(pin_node)
         out.append(
             {
@@ -852,3 +880,294 @@ def _schematic_uuid(tree: list) -> str:
     new = str(uuid.uuid4())
     tree.insert(1, [sym("uuid"), new])
     return new
+
+
+# --------------------------------------------------------------------------- #
+# Deletion primitives (issue 6)
+# --------------------------------------------------------------------------- #
+
+POINT_TOLERANCE_MM = 0.01
+
+# Node kinds addressable by `remove_items_in_box`, mapped to how they carry
+# their coordinates: "at" for a single point, "pts" for a two-point segment.
+_BOX_KINDS = {
+    "wire": "pts",
+    "bus": "pts",
+    "junction": "at",
+    "no_connect": "at",
+    "label": "at",
+    "global_label": "at",
+    "hierarchical_label": "at",
+    "bus_entry": "at",
+    "text": "at",
+    "symbol": "at",
+}
+
+
+def _same_point(a: tuple[float, float], b: tuple[float, float], tol: float) -> bool:
+    return abs(a[0] - b[0]) <= tol and abs(a[1] - b[1]) <= tol
+
+
+def node_points(node: list) -> list[tuple[float, float]]:
+    """Coordinates a node occupies, in file coords: 2 for a segment, 1 otherwise."""
+    pts = find_child(node, "pts")
+    if pts is not None:
+        out = []
+        for xy in find_children(pts, "xy"):
+            if len(xy) >= 3:
+                out.append((float(xy[1]), float(xy[2])))
+        return out
+    at = find_child(node, "at")
+    if at is not None and len(at) >= 3:
+        return [(float(at[1]), float(at[2]))]
+    return []
+
+
+def find_wire(
+    tree: list,
+    x1_mm: float,
+    y1_mm: float,
+    x2_mm: float,
+    y2_mm: float,
+    *,
+    kind: str = "wire",
+    tolerance_mm: float = POINT_TOLERANCE_MM,
+) -> list | None:
+    """Return the `(wire ...)`/`(bus ...)` between two points, either direction."""
+    a = sch_to_file_xy(x1_mm, y1_mm)
+    b = sch_to_file_xy(x2_mm, y2_mm)
+    for node in tree[1:]:
+        if not is_call(node, kind):
+            continue
+        pts = node_points(node)
+        if len(pts) != 2:
+            continue
+        if (
+            _same_point(pts[0], a, tolerance_mm) and _same_point(pts[1], b, tolerance_mm)
+        ) or (
+            _same_point(pts[0], b, tolerance_mm) and _same_point(pts[1], a, tolerance_mm)
+        ):
+            return node
+    return None
+
+
+def remove_wire(
+    tree: list,
+    x1_mm: float,
+    y1_mm: float,
+    x2_mm: float,
+    y2_mm: float,
+    *,
+    kind: str = "wire",
+    tolerance_mm: float = POINT_TOLERANCE_MM,
+) -> bool:
+    """Remove one wire (or bus) segment between two points. True if removed."""
+    node = find_wire(
+        tree, x1_mm, y1_mm, x2_mm, y2_mm, kind=kind, tolerance_mm=tolerance_mm
+    )
+    if node is None:
+        return False
+    tree.remove(node)
+    return True
+
+
+def find_point_item(
+    tree: list,
+    kind: str,
+    x_mm: float,
+    y_mm: float,
+    *,
+    tolerance_mm: float = POINT_TOLERANCE_MM,
+) -> list | None:
+    """Return the first `(kind ...)` node sitting at a point, or None."""
+    target = sch_to_file_xy(x_mm, y_mm)
+    for node in tree[1:]:
+        if not is_call(node, kind):
+            continue
+        pts = node_points(node)
+        if len(pts) == 1 and _same_point(pts[0], target, tolerance_mm):
+            return node
+    return None
+
+
+def add_junction(tree: list, x_mm: float, y_mm: float) -> list:
+    """Append a `(junction ...)` at a point. Idempotent: returns the existing one."""
+    existing = find_point_item(tree, "junction", x_mm, y_mm)
+    if existing is not None:
+        return existing
+    xk, yk = sch_to_file_xy(x_mm, y_mm)
+    node = [
+        sym("junction"),
+        [sym("at"), round_mm(xk), round_mm(yk)],
+        [sym("diameter"), 0],
+        [sym("color"), 0, 0, 0, 0],
+        [sym("uuid"), str(uuid.uuid4())],
+    ]
+    tree.append(node)
+    return node
+
+
+def remove_junction(
+    tree: list, x_mm: float, y_mm: float, *, tolerance_mm: float = POINT_TOLERANCE_MM
+) -> bool:
+    """Remove the junction at a point. True if one was removed."""
+    node = find_point_item(tree, "junction", x_mm, y_mm, tolerance_mm=tolerance_mm)
+    if node is None:
+        return False
+    tree.remove(node)
+    return True
+
+
+def remove_no_connect(
+    tree: list, x_mm: float, y_mm: float, *, tolerance_mm: float = POINT_TOLERANCE_MM
+) -> bool:
+    """Remove the no-connect marker at a point. True if one was removed."""
+    node = find_point_item(tree, "no_connect", x_mm, y_mm, tolerance_mm=tolerance_mm)
+    if node is None:
+        return False
+    tree.remove(node)
+    return True
+
+
+def remove_items_in_box(
+    tree: list,
+    x1_mm: float,
+    y1_mm: float,
+    x2_mm: float,
+    y2_mm: float,
+    kinds: list[str] | None = None,
+) -> dict[str, int]:
+    """Remove every item of `kinds` fully inside the box. Returns counts per kind.
+
+    The box is given by two opposite corners in KiCAD coords. A segment is
+    removed only when BOTH endpoints are inside, so a wire crossing the box
+    survives. `kinds` defaults to every kind but `symbol` — removing symbols
+    by area is easy to do by accident.
+    """
+    if kinds is None:
+        kinds = [k for k in _BOX_KINDS if k != "symbol"]
+    unknown = [k for k in kinds if k not in _BOX_KINDS]
+    if unknown:
+        raise ValueError(f"unknown kinds {unknown}; valid: {sorted(_BOX_KINDS)}")
+
+    ax, ay = sch_to_file_xy(x1_mm, y1_mm)
+    bx, by = sch_to_file_xy(x2_mm, y2_mm)
+    x_lo, x_hi = min(ax, bx), max(ax, bx)
+    y_lo, y_hi = min(ay, by), max(ay, by)
+
+    def inside(p: tuple[float, float]) -> bool:
+        return x_lo <= p[0] <= x_hi and y_lo <= p[1] <= y_hi
+
+    removed: dict[str, int] = {}
+    for node in list(tree[1:]):
+        head = head_of(node)
+        if head not in kinds:
+            continue
+        if head == "symbol" and find_child(node, "lib_id") is None:
+            continue  # lib_symbols container, never an instance
+        pts = node_points(node)
+        if not pts or not all(inside(p) for p in pts):
+            continue
+        tree.remove(node)
+        removed[head] = removed.get(head, 0) + 1
+    return removed
+
+
+def _connection_points(tree: list, *, skip: list | None = None) -> list[tuple[float, float]]:
+    """Every point at which some item other than `skip` can make a connection."""
+    out: list[tuple[float, float]] = []
+    for node in tree[1:]:
+        if skip is not None and node is skip:
+            continue
+        head = head_of(node)
+        if head in ("wire", "bus", "junction", "label", "global_label",
+                    "hierarchical_label", "bus_entry", "no_connect"):
+            out.extend(node_points(node))
+        elif head == "symbol" and find_child(node, "lib_id") is not None:
+            reference = get_symbol_property(node, "Reference")
+            if not reference:
+                continue
+            try:
+                pins = list_pins_for_symbol(tree, reference)
+            except (KeyError, ValueError):
+                continue
+            out.extend((p["position_mm"][0], p["position_mm"][1]) for p in pins)
+    return out
+
+
+def remove_dangling_wires_at(
+    tree: list,
+    points: list[tuple[float, float]],
+    *,
+    tolerance_mm: float = POINT_TOLERANCE_MM,
+) -> int:
+    """Remove wires that touch `points` and whose other end connects to nothing.
+
+    Used by `remove_symbol(remove_connected_wires=True)` to clean up the stubs
+    that used to end on the removed symbol's pins.
+    """
+    removed = 0
+    for node in list(tree[1:]):
+        if not is_call(node, "wire"):
+            continue
+        pts = node_points(node)
+        if len(pts) != 2:
+            continue
+        touching = [p for p in points if any(_same_point(p, q, tolerance_mm) for q in pts)]
+        if not touching:
+            continue
+        far_ends = [
+            q for q in pts
+            if not any(_same_point(p, q, tolerance_mm) for p in touching)
+        ]
+        others = _connection_points(tree, skip=node)
+        if any(
+            any(_same_point(far, o, tolerance_mm) for o in others) for far in far_ends
+        ):
+            continue  # still wired to something else — keep it
+        tree.remove(node)
+        removed += 1
+    return removed
+
+
+def remove_symbol_with_wires(
+    tree: list,
+    reference: str,
+    *,
+    remove_connected_wires: bool = False,
+    tolerance_mm: float = POINT_TOLERANCE_MM,
+) -> dict:
+    """Remove a symbol, optionally cleaning up what was attached to its pins.
+
+    With `remove_connected_wires=True`, no-connect markers and junctions on the
+    symbol's pins go too, plus wire stubs that end on those pins and connect to
+    nothing else.
+
+    Returns {"removed": bool, "wires": int, "junctions": int, "no_connects": int}.
+    """
+    pin_points: list[tuple[float, float]] = []
+    if remove_connected_wires:
+        try:
+            pin_points = [
+                (p["position_mm"][0], p["position_mm"][1])
+                for p in list_pins_for_symbol(tree, reference)
+            ]
+        except (KeyError, ValueError):
+            pin_points = []
+
+    if not remove_symbol(tree, reference):
+        return {"removed": False, "wires": 0, "junctions": 0, "no_connects": 0}
+
+    counts = {"removed": True, "wires": 0, "junctions": 0, "no_connects": 0}
+    if not remove_connected_wires:
+        return counts
+
+    for x, y in pin_points:
+        if remove_no_connect(tree, x, y, tolerance_mm=tolerance_mm):
+            counts["no_connects"] += 1
+        if remove_junction(tree, x, y, tolerance_mm=tolerance_mm):
+            counts["junctions"] += 1
+    counts["wires"] = remove_dangling_wires_at(
+        tree, pin_points, tolerance_mm=tolerance_mm
+    )
+    return counts

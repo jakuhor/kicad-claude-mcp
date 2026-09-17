@@ -97,8 +97,19 @@ def _atom(x: Any) -> str:
 
 
 def _escape(s: str) -> str:
-    """Backslash-escape `\\` and `"` for KiCAD string literals."""
-    return s.replace("\\", "\\\\").replace('"', '\\"')
+    """Backslash-escape a KiCAD string literal.
+
+    `sexpdata` decodes `\\n`, `\\r` and `\\t` into real control characters on
+    read, so they must be re-escaped on write. A raw newline inside a quoted
+    string makes KiCAD refuse to load the file ("Failed to load schematic").
+    """
+    return (
+        s.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
 
 
 def _format_float(x: float) -> str:

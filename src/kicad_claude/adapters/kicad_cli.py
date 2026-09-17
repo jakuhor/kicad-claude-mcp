@@ -26,9 +26,10 @@ def _ensure_cli() -> Path:
     cli = find_kicad_cli()
     if cli is None:
         raise KicadCliError(
-            "`kicad-cli` not found on PATH and not in the standard install path. "
-            "Add it to PATH (macOS: /Applications/KiCad/KiCad.app/Contents/MacOS) "
-            "or set KICAD_CLI in the environment."
+            "`kicad-cli` not found. Searched $KICAD_CLI, PATH and the standard "
+            r"install paths (Windows: %ProgramFiles%\KiCad\<version>\bin\kicad-cli.exe"
+            ", macOS: /Applications/KiCad/KiCad.app/Contents/MacOS, "
+            "Linux: /usr/bin). Set KICAD_CLI to the binary or add it to PATH."
         )
     return cli
 
@@ -133,7 +134,9 @@ def run_erc(
         )
 
     data = json.loads(output_json.read_text())
-    return _shape_erc(data, output_json)
+    out = _shape_erc(data, output_json)
+    out["cli_path"] = str(cli)
+    return out
 
 
 def _shape_erc(data: dict, raw_path: Path) -> dict:
@@ -207,7 +210,9 @@ def run_drc(
         )
 
     data = json.loads(output_json.read_text())
-    return _shape_drc(data, output_json)
+    out = _shape_drc(data, output_json)
+    out["cli_path"] = str(cli)
+    return out
 
 
 # --------------------------------------------------------------------------- #

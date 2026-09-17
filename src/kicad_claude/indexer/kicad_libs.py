@@ -299,7 +299,7 @@ def build_index(
 
 def save_cache(index: dict[str, Any]) -> Path:
     p = cache_path()
-    p.write_text(json.dumps(index, indent=2, ensure_ascii=False))
+    p.write_text(json.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8")
     return p
 
 
@@ -309,7 +309,7 @@ def load_cache() -> dict[str, Any] | None:
     if not p.is_file():
         return None
     try:
-        data = json.loads(p.read_text())
+        data = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
         logger.warning("failed to load index cache %s: %s", p, e)
         return None
