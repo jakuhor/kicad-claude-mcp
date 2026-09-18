@@ -7,10 +7,10 @@ explicit. Schematic placements snap to `SCHEMATIC_GRID_MM` by default
 (`snap_xy`), because KiCAD only connects items whose endpoints share a grid
 point.
 
-PCB tools still use the old convention: Y UP, flipped around the page height by
-`mcp_to_kicad_xy` / `kicad_to_mcp_xy`. Those two are page-size dependent and a
-grid point does not survive the flip (297 mm is not a multiple of 1.27 mm), so
-the PCB side is meant to move to native coordinates in a later pass.
+PCB tools use KiCAD-native coordinates too, so `pcb_to_file_xy` is likewise the
+identity. They used to flip Y around the page height, which made every
+coordinate page-size dependent and knocked grid points off the grid (297 mm is
+not a multiple of 1.27 mm) — issue 2 in `kicad_mcp_issues.md`.
 """
 
 from __future__ import annotations
@@ -48,21 +48,18 @@ def snap_xy(
     return snap_mm(x_mm, grid_mm), snap_mm(y_mm, grid_mm)
 
 
-def mcp_to_kicad_xy(
-    x_mm: float, y_mm: float, page_height_mm: float = DEFAULT_PAGE_HEIGHT_MM
-) -> tuple[float, float]:
-    """Translate a point from PCB MCP coords (Y up) to KiCAD file coords (Y down).
+def pcb_to_file_xy(x_mm: float, y_mm: float) -> tuple[float, float]:
+    """PCB MCP coords → file coords. Identity: both are KiCAD-native (Y down).
 
-    PCB only — schematic code uses `sch_to_file_xy`.
+    The numbers are the ones the KiCAD PCB editor shows, and a grid point maps
+    to a grid point.
     """
-    return float(x_mm), float(page_height_mm) - float(y_mm)
+    return float(x_mm), float(y_mm)
 
 
-def kicad_to_mcp_xy(
-    x_mm: float, y_mm: float, page_height_mm: float = DEFAULT_PAGE_HEIGHT_MM
-) -> tuple[float, float]:
-    """Inverse of mcp_to_kicad_xy. The transform is its own inverse. PCB only."""
-    return float(x_mm), float(page_height_mm) - float(y_mm)
+def file_to_pcb_xy(x_mm: float, y_mm: float) -> tuple[float, float]:
+    """File coords → PCB MCP coords. Identity; inverse of `pcb_to_file_xy`."""
+    return float(x_mm), float(y_mm)
 
 
 def normalize_rotation(deg: float) -> int:

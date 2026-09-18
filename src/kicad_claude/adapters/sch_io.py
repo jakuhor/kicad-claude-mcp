@@ -9,6 +9,7 @@ and debugging easier.
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -149,9 +150,42 @@ def _pack(first: str, items: list[str], pad: str, width: int) -> list[str]:
     return lines
 
 
+def detect_newline(path: Path) -> str:
+    """The line ending `path` already uses: `\\r\\n` or `\\n`.
+
+    KiCAD writes CRLF on Windows and LF elsewhere, and a file may travel
+    between the two. A file that does not exist yet, or holds no newline at
+    all, gets the platform default — what KiCAD itself would write here.
+    """
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return os.linesep
+    crlf = raw.count(b"\r\n")
+    lf = raw.count(b"\n") - crlf
+    if crlf and not lf:
+        return "\r\n"
+    if lf and not crlf:
+        return "\n"
+    if crlf or lf:
+        # Mixed: keep whichever dominates, so the diff stays small.
+        return "\r\n" if crlf >= lf else "\n"
+    return os.linesep
+
+
 def write_file(path: Path, tree: list) -> None:
-    """Write `tree` to `path` (KiCAD-style formatting + trailing newline)."""
-    Path(path).write_text(dumps(tree) + "\n", encoding="utf-8")
+    """Write `tree` to `path` (KiCAD-style formatting + trailing newline).
+
+    The file's existing line ending is preserved. `Path.write_text` would
+    translate every `\\n` to `os.linesep`, which rewrites an LF file to CRLF
+    on Windows — a whole-file diff for a one-line edit (issue 8).
+    """
+    p = Path(path)
+    newline = detect_newline(p)
+    text = dumps(tree) + "\n"
+    if newline != "\n":
+        text = text.replace("\n", newline)
+    p.write_bytes(text.encode("utf-8"))
 
 
 # --------------------------------------------------------------------------- #

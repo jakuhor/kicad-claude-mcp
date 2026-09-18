@@ -105,7 +105,8 @@ def register(mcp) -> None:
     ) -> dict:
         """Replace the Edge.Cuts outline with a width × height rectangle.
 
-        The board's bottom-left corner sits at MCP (origin_x_mm, origin_y_mm).
+        Coordinates are KiCAD-native (Y down): the board's TOP-left corner
+        sits at (origin_x_mm, origin_y_mm) and it extends right and down.
         Shape currently supports 'rect' only; rounded corners come later.
         """
         tree, path = _load_active_pcb()
@@ -241,7 +242,7 @@ def register(mcp) -> None:
     ) -> dict:
         """Add a copper zone (pour) to `net_name` on `layer`.
 
-        `polygon_mm` is a list of `[x_mm, y_mm]` points in MCP coords (Y up).
+        `polygon_mm` is a list of `[x_mm, y_mm]` points in KiCAD coords (Y down).
         At least 3 points required. Layer can be a single copper layer
         ("F.Cu", "B.Cu", "In1.Cu", …) or "*.Cu" for all signal layers.
 

@@ -94,9 +94,9 @@ def test_add_footprint_via_editor(blank_project):
     layer = sch_io.find_child(fp, "layer")
     assert layer[1] == "F.Cu"
     at = sch_io.find_child(fp, "at")
-    # MCP (20, 15) -> KiCAD (20, 210-15=195) for A4 landscape (210mm)
+    # Issue 2: coordinates are KiCAD-native, no Y flip.
     assert at[1] == 20.0
-    assert at[2] == 195.0
+    assert at[2] == 15.0
 
 
 def test_add_footprint_rejects_bad_layer(blank_project):
@@ -145,7 +145,7 @@ def test_move_footprint(blank_project):
     at = sch_io.find_child(fp, "at")
     layer = sch_io.find_child(fp, "layer")
     assert at[1] == 30.0
-    assert at[2] == 185.0  # 210 - 25
+    assert at[2] == 25.0
     assert at[3] == 90
     assert layer[1] == "B.Cu"
 

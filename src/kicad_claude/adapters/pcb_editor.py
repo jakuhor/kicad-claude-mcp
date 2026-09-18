@@ -1,17 +1,16 @@
 """High-level mutations on a parsed `.kicad_pcb` tree.
 
 Mirrors `sch_editor` but for PCBs. Same s-expression machinery (`sch_io`),
-same MCP coordinate convention (Y up; the boundary helper flips).
+same coordinate convention: KiCAD-native millimetres, Y DOWN, the numbers the
+PCB editor itself shows. `pcb_to_file_xy` is therefore the identity.
 
-Coordinate convention recap:
-- MCP API: millimetres, Y up.
-- KiCAD file: millimetres, Y down.
-- For PCBs, the page height (from `(paper "A4")`) governs the Y flip;
-  defaults to A4 landscape (210mm) if absent.
+Until issue 2 was fixed, the API used Y up and flipped around the page height.
+That made every coordinate depend on `(paper ...)` and knocked grid points off
+the grid, because 297 mm (A3) is not a multiple of 1.27 mm.
 
-Board origin: `set_board_outline` places the board with its bottom-left
-corner at MCP (`origin_x_mcp`, `origin_y_mcp`) — defaults (10, 10) — so
-the board occupies MCP (10..10+w, 10..10+h).
+Board origin: `set_board_outline` places the board with its TOP-left corner at
+(`origin_x_mcp`, `origin_y_mcp`) — defaults (10, 10) — so the board occupies
+(10..10+w, 10..10+h), extending right and down.
 """
 
 from __future__ import annotations
@@ -38,37 +37,14 @@ from kicad_claude.adapters.sch_io import (
     sym,
 )
 from kicad_claude.utils.geometry import (
-    DEFAULT_PAGE_HEIGHT_MM,
-    mcp_to_kicad_xy,
+    file_to_pcb_xy,
+    pcb_to_file_xy,
     normalize_rotation,
     round_mm,
 )
 from kicad_claude.utils.kicad_strings import normalize_name
 
 logger = logging.getLogger("kicad-claude.adapters.pcb_editor")
-
-
-# --------------------------------------------------------------------------- #
-# Page-height detection (same as sch_editor — duplicated to keep them decoupled)
-# --------------------------------------------------------------------------- #
-
-
-def page_height_mm(tree: list) -> float:
-    paper = find_child(tree, "paper")
-    if paper and len(paper) >= 2 and isinstance(paper[1], str):
-        sizes = {
-            "A0": 841.0,
-            "A1": 594.0,
-            "A2": 420.0,
-            "A3": 297.0,
-            "A4": 210.0,
-            "A5": 148.0,
-            "USLetter": 215.9,
-            "USLegal": 215.9,
-            "USLedger": 279.4,
-        }
-        return sizes.get(paper[1], DEFAULT_PAGE_HEIGHT_MM)
-    return DEFAULT_PAGE_HEIGHT_MM
 
 
 # --------------------------------------------------------------------------- #
@@ -227,8 +203,9 @@ def set_board_outline(
 ) -> dict:
     """Replace the Edge.Cuts outline with a `width × height` rectangle.
 
-    The board's bottom-left corner is placed at MCP (`origin_x_mcp`,
-    `origin_y_mcp`). Returns a summary including the four corner coordinates.
+    Coordinates are KiCAD-native (Y down), so the origin is the board's
+    TOP-left corner and the rectangle extends right and down from it.
+    Returns a summary including both diagonal corners.
     """
     if shape not in ("rect", "rounded_rect"):
         raise ValueError(f"shape must be 'rect' or 'rounded_rect' (got {shape!r})")
@@ -237,20 +214,19 @@ def set_board_outline(
         raise NotImplementedError("rounded_rect outline not yet implemented")
 
     remove_board_outline(tree)
-    page_h = page_height_mm(tree)
 
-    # MCP corners (Y up): bottom-left and top-right.
-    bl_mcp = (origin_x_mcp, origin_y_mcp)
-    tr_mcp = (origin_x_mcp + width_mm, origin_y_mcp + height_mm)
+    # Y is down, so the origin is the top-left corner.
+    tl_mcp = (origin_x_mcp, origin_y_mcp)
+    br_mcp = (origin_x_mcp + width_mm, origin_y_mcp + height_mm)
 
-    bl_k = mcp_to_kicad_xy(*bl_mcp, page_h)  # bottom-left in KiCAD coords (Y down)
-    tr_k = mcp_to_kicad_xy(*tr_mcp, page_h)  # top-right in KiCAD coords
+    tl_k = pcb_to_file_xy(*tl_mcp)
+    br_k = pcb_to_file_xy(*br_mcp)
 
     # gr_rect's start/end are diagonal corners; KiCAD doesn't care about the order.
     node = [
         sym("gr_rect"),
-        [sym("start"), round_mm(bl_k[0]), round_mm(bl_k[1])],
-        [sym("end"), round_mm(tr_k[0]), round_mm(tr_k[1])],
+        [sym("start"), round_mm(tl_k[0]), round_mm(tl_k[1])],
+        [sym("end"), round_mm(br_k[0]), round_mm(br_k[1])],
         [sym("stroke"), [sym("width"), 0.15], [sym("type"), sym("solid")]],
         [sym("fill"), sym("no")],
         [sym("layer"), "Edge.Cuts"],
@@ -261,8 +237,8 @@ def set_board_outline(
         "shape": shape,
         "width_mm": width_mm,
         "height_mm": height_mm,
-        "bottom_left_mcp": list(bl_mcp),
-        "top_right_mcp": list(tr_mcp),
+        "top_left_mm": list(tl_mcp),
+        "bottom_right_mm": list(br_mcp),
     }
 
 
@@ -342,8 +318,7 @@ def add_footprint(
     if layer not in ("F.Cu", "B.Cu"):
         raise ValueError(f"layer must be 'F.Cu' or 'B.Cu' (got {layer!r})")
 
-    page_h = page_height_mm(tree)
-    xk, yk = mcp_to_kicad_xy(x_mm, y_mm, page_h)
+    xk, yk = pcb_to_file_xy(x_mm, y_mm)
     rot = normalize_rotation(rotation)
 
     placed = _build_placed_footprint(
@@ -382,8 +357,7 @@ def move_footprint(
     if layer is not None and layer not in ("F.Cu", "B.Cu"):
         raise ValueError(f"layer must be 'F.Cu' or 'B.Cu' (got {layer!r})")
 
-    page_h = page_height_mm(tree)
-    xk, yk = mcp_to_kicad_xy(x_mm, y_mm, page_h)
+    xk, yk = pcb_to_file_xy(x_mm, y_mm)
     at = find_child(fp, "at")
     if at is None:
         # Insert one at the right position (after layer/uuid). Fallback: just append.
@@ -416,7 +390,6 @@ def place_footprints_grid(
 
     Sorted by reference (R1, R2, …, C1, C2, …) so prefix groups stay contiguous.
     """
-    page_h = page_height_mm(tree)
 
     unplaced: list[list] = []
     for fp in iter_footprints(tree):
@@ -437,7 +410,7 @@ def place_footprints_grid(
         row = i // columns
         x_mcp = origin_mcp[0] + col * spacing_mm
         y_mcp = origin_mcp[1] + row * spacing_mm
-        xk, yk = mcp_to_kicad_xy(x_mcp, y_mcp, page_h)
+        xk, yk = pcb_to_file_xy(x_mcp, y_mcp)
         at = find_child(fp, "at")
         if at is None:
             fp.insert(2, [sym("at"), round_mm(xk), round_mm(yk), 0])
@@ -464,9 +437,8 @@ def add_track(
     layer: str = "F.Cu",
     net: int = 0,
 ) -> list:
-    page_h = page_height_mm(tree)
-    x1k, y1k = mcp_to_kicad_xy(x1_mm, y1_mm, page_h)
-    x2k, y2k = mcp_to_kicad_xy(x2_mm, y2_mm, page_h)
+    x1k, y1k = pcb_to_file_xy(x1_mm, y1_mm)
+    x2k, y2k = pcb_to_file_xy(x2_mm, y2_mm)
     node = [
         sym("segment"),
         [sym("start"), round_mm(x1k), round_mm(y1k)],
@@ -501,7 +473,6 @@ def add_via_array_along_line(
     """
     if spacing_mm <= 0:
         raise ValueError("spacing_mm must be positive")
-    page_h = page_height_mm(tree)
 
     sx, sy = start_mm
     ex, ey = end_mm
@@ -528,7 +499,7 @@ def add_via_array_along_line(
         t = (i / max(1, n - 1)) * length if n > 1 else 0.0
         cx = sx + ux * t + px * perpendicular_offset_mm
         cy = sy + uy * t + py * perpendicular_offset_mm
-        xk, yk = mcp_to_kicad_xy(cx, cy, page_h)
+        xk, yk = pcb_to_file_xy(cx, cy)
         node = [
             sym("via"),
             [sym("at"), round_mm(xk), round_mm(yk)],
@@ -552,8 +523,7 @@ def add_via(
     net: int = 0,
     layers: tuple[str, str] = ("F.Cu", "B.Cu"),
 ) -> list:
-    page_h = page_height_mm(tree)
-    xk, yk = mcp_to_kicad_xy(x_mm, y_mm, page_h)
+    xk, yk = pcb_to_file_xy(x_mm, y_mm)
     node = [
         sym("via"),
         [sym("at"), round_mm(xk), round_mm(yk)],
@@ -710,13 +680,12 @@ def add_meander_segments(
             raise KeyError(f"net {net_name!r} not found; declare it first or omit net_name")
         net_idx = idx
 
-    page_h = page_height_mm(tree)
     new_segments: list[list] = []
     for i in range(len(waypoints) - 1):
         x1m, y1m = waypoints[i]
         x2m, y2m = waypoints[i + 1]
-        x1k, y1k = mcp_to_kicad_xy(x1m, y1m, page_h)
-        x2k, y2k = mcp_to_kicad_xy(x2m, y2m, page_h)
+        x1k, y1k = pcb_to_file_xy(x1m, y1m)
+        x2k, y2k = pcb_to_file_xy(x2m, y2m)
         node = [
             sym("segment"),
             [sym("start"), round_mm(x1k), round_mm(y1k)],
@@ -758,8 +727,7 @@ def get_board_outline_polygon_kicad(tree: list) -> list[tuple[float, float]] | N
             continue
         x1, y1 = float(start[1]), float(start[2])
         x2, y2 = float(end[1]), float(end[2])
-        # Counter-clockwise from bottom-left in KiCAD's Y-down system, which is
-        # actually clockwise visually. KiCAD doesn't care about winding order.
+        # KiCAD doesn't care about winding order.
         return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
     return None
 
@@ -779,7 +747,7 @@ def add_zone(
 ) -> list:
     """Add a filled copper zone for `net_name` on `layer` covering `polygon_mcp`.
 
-    Polygon points are in MCP coordinates (Y up). The zone is declared as
+    Polygon points are in KiCAD coordinates (Y down). The zone is declared as
     `(fill yes)` so KiCAD's DRC will compute the filled regions on demand
     (refill via `kicad-cli pcb drc --refill-zones` or in the GUI).
 
@@ -811,8 +779,7 @@ def add_zone(
                         [sym("net"), next_idx, net_name])
             net_idx = next_idx
 
-    page_h = page_height_mm(tree)
-    pts_kicad = [mcp_to_kicad_xy(x, y, page_h) for (x, y) in polygon_mcp]
+    pts_kicad = [pcb_to_file_xy(x, y) for (x, y) in polygon_mcp]
     pts_block: list[Any] = [sym("pts")]
     for x, y in pts_kicad:
         pts_block.append([sym("xy"), round_mm(x), round_mm(y)])
@@ -865,8 +832,7 @@ def add_ground_plane(
             "no board outline found; call set_board_outline first so the zone "
             "knows what area to fill."
         )
-    page_h = page_height_mm(tree)
-    poly_mcp = [(x, page_h - y) for (x, y) in poly_kicad]
+    poly_mcp = [file_to_pcb_xy(x, y) for (x, y) in poly_kicad]
     return add_zone(
         tree,
         net_name=net_name,
@@ -907,8 +873,7 @@ def add_silk_text(
     if thickness_mm is None:
         thickness_mm = round_mm(size_mm * 0.15)
     rot = normalize_rotation(rotation)
-    page_h = page_height_mm(tree)
-    xk, yk = mcp_to_kicad_xy(x_mm, y_mm, page_h)
+    xk, yk = pcb_to_file_xy(x_mm, y_mm)
     node = [
         sym("gr_text"),
         text,
@@ -934,7 +899,6 @@ def add_silk_text(
 
 
 def list_footprints_summary(tree: list) -> list[dict]:
-    page_h = page_height_mm(tree)
     out = []
     for fp in iter_footprints(tree):
         ref = get_footprint_reference(fp)
@@ -945,8 +909,7 @@ def list_footprints_summary(tree: list) -> list[dict]:
         x_k = float(at[1]) if at and len(at) > 1 else 0.0
         y_k = float(at[2]) if at and len(at) > 2 else 0.0
         rot = float(at[3]) if at and len(at) > 3 else 0.0
-        # KiCAD -> MCP for display
-        x_mcp, y_mcp = x_k, page_h - y_k
+        x_mcp, y_mcp = file_to_pcb_xy(x_k, y_k)
         out.append(
             {
                 "reference": ref or "?",

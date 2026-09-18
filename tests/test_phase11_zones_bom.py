@@ -47,12 +47,12 @@ def test_get_board_outline_polygon_after_set_outline(blank_project):
     poly = pcb_ed.get_board_outline_polygon_kicad(tree)
     assert poly is not None
     assert len(poly) == 4
-    # MCP corners (Y up): bottom-left (10,10), top-right (60,40).
-    # Convert to KiCAD (Y down, page_h=210): (10, 200) and (60, 170).
+    # Issue 2: native Y-down coords. Origin (10,10) is the top-left corner,
+    # so a 50x30 board reaches (60, 40). No page height involved.
     xs = sorted({p[0] for p in poly})
     ys = sorted({p[1] for p in poly})
     assert xs == [10.0, 60.0]
-    assert ys == [170.0, 200.0]
+    assert ys == [10.0, 40.0]
 
 
 def test_get_board_outline_polygon_returns_none_when_no_outline(blank_project):

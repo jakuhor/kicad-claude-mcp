@@ -9,6 +9,7 @@ Strategy:
 from __future__ import annotations
 
 import math
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -24,9 +25,11 @@ from kicad_claude.templates.blank import write_blank_project, write_blank_schema
 from kicad_claude.tools import library as lib_tools
 from kicad_claude.tools import schematic as sch_tools
 from kicad_claude.utils.geometry import (
-    mcp_to_kicad_xy,
+    file_to_pcb_xy,
     normalize_rotation,
+    pcb_to_file_xy,
     rotate_xy,
+    snap_xy,
 )
 from kicad_claude.utils.kicad_paths import find_kicad_cli, find_symbol_lib_dirs
 
@@ -36,13 +39,17 @@ FIXTURES = Path(__file__).parent / "fixtures"
 # ===== Geometry ============================================================ #
 
 
-def test_mcp_to_kicad_y_flip_round_trip():
-    x_mcp, y_mcp = 100.0, 30.0
-    x_k, y_k = mcp_to_kicad_xy(x_mcp, y_mcp, page_height_mm=210.0)
-    assert (x_k, y_k) == (100.0, 180.0)  # 210 - 30
-    # Inverse: same function, since y -> H - (H - y) = y
-    from kicad_claude.utils.geometry import kicad_to_mcp_xy
-    assert kicad_to_mcp_xy(*mcp_to_kicad_xy(50, 70)) == (50.0, 70.0)
+def test_pcb_coords_are_kicad_native():
+    """Issue 2: the PCB Y flip is gone — MCP coords are the file's own."""
+    assert pcb_to_file_xy(100.0, 30.0) == (100.0, 30.0)
+    assert file_to_pcb_xy(*pcb_to_file_xy(50, 70)) == (50.0, 70.0)
+
+
+def test_pcb_grid_point_survives_the_transform():
+    """The old flip around 297 mm (A3) knocked every grid point off-grid."""
+    for y in (1.27, 25.4, 147.32):
+        gx, gy = pcb_to_file_xy(0.0, y)
+        assert snap_xy(gx, gy) == (0.0, y)
 
 
 def test_normalize_rotation_accepts_right_angles():
@@ -902,3 +909,35 @@ class TestParseFileErrors:
         p = tmp_path / "ok.kicad_sch"
         p.write_text("(kicad_sch (version 20250114))", encoding="utf-8")
         assert sch_io.head_of(sch_io.parse_file(p)) == "kicad_sch"
+
+
+class TestLineEndingsPreserved:
+    """Issue 8: a write must not flip the whole file's line endings."""
+
+    FIXTURE = FIXTURES / "kicad10_ecc83-pp_v2.kicad_sch"
+
+    def _rewrite(self, tmp_path, raw: bytes) -> bytes:
+        target = tmp_path / "sheet.kicad_sch"
+        target.write_bytes(raw)
+        sch_io.write_file(target, sch_io.parse_file(target))
+        return target.read_bytes()
+
+    def test_lf_file_stays_lf(self, tmp_path):
+        raw = self.FIXTURE.read_bytes().replace(b"\r\n", b"\n")
+        out = self._rewrite(tmp_path, raw)
+        assert out == raw
+        assert b"\r\n" not in out
+
+    def test_crlf_file_stays_crlf(self, tmp_path):
+        raw = self.FIXTURE.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        out = self._rewrite(tmp_path, raw)
+        assert out == raw
+        assert out.count(b"\r\n") == out.count(b"\n")
+
+    def test_detect_newline_on_a_missing_file_is_the_platform_default(self, tmp_path):
+        assert sch_io.detect_newline(tmp_path / "nope.kicad_sch") == os.linesep
+
+    def test_mixed_endings_take_the_majority(self, tmp_path):
+        p = tmp_path / "mixed.kicad_sch"
+        p.write_bytes(b"(a\r\n(b 1)\r\n(c 2)\n)\r\n")
+        assert sch_io.detect_newline(p) == "\r\n"

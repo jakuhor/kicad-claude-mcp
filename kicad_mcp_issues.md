@@ -46,7 +46,7 @@ a fixture with multi-line text, multi-line property values and quotes.
 
 ---
 
-## 2. Y-axis flip puts every placed item 0.18 mm off-grid on A3 sheets (Major)
+## 2. Y-axis flip puts every placed item 0.18 mm off-grid on A3 sheets (Major) — FIXED
 
 **Observed.** On an A3 sheet, every item placed through the MCP landed 0.18 mm
 off the 1.27 mm (50 mil) grid, even when the MCP coordinates were grid multiples.
@@ -191,7 +191,7 @@ for simple 2-pin parts. Set `(fields_autoplaced yes)` only when that is true.
 
 ---
 
-## 8. Whole-file reformat on every write (Minor)
+## 8. Whole-file reformat on every write (Minor) — FIXED
 
 **Observed.** A handful of symbol and wire additions to
 `400_symetric_analog.kicad_sch` gave a git diff of about 6000 lines
