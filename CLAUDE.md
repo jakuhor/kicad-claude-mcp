@@ -18,10 +18,12 @@ asked.
 - Do not push, tag, or open PRs.
 
 ## Current backlog
-`kicad_mcp_issues.md` (untracked) is the live bug queue — a field report from
-real use on the Firbox base board. Work it top-down: issue 1 (unescaped control
-characters in `adapters/sch_io.py::_escape`, which makes schematics unloadable)
-is a blocker.
+`docs/open_points.md` is the live queue, numbered P1-P7. No blockers are open;
+P1 (`replace_symbol`) is the only Major.
+
+`docs/kicad_mcp_issues.md` is the original field report from the Firbox base
+board, kept for context — every heading carries its state. Do not work it
+directly; it is not the queue.
 
 ## Layout
 - `server.py` — entry point; creates `FastMCP("kicad-claude")` and calls each

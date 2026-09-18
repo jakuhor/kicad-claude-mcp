@@ -1,11 +1,12 @@
 # Plan — connectivity model and the missing edit primitives
 
 **Status: all four points implemented, 2026-09-18.** See "What was built" at
-the end for what changed against this plan.
+the end for what changed against this plan. Nothing from this plan is
+outstanding; the live queue is `docs/open_points.md`.
 
 Four pieces of work that close the gaps found in the capability survey of
 2026-09-18. They are numbered 2–5 to match that survey; item 1 (issues 2 and 8
-in `kicad_mcp_issues.md`) is already done.
+in `docs/kicad_mcp_issues.md`) is already done.
 
 Build order and rationale are at the end. Points 3 and 5 are wrappers over
 adapters that already work. Points 2 and 4 are new subsystems that share one
@@ -167,7 +168,7 @@ Around two days, most of it in the pad transform and its tests.
 ## Point 5 — Text and label editing
 
 The last routine operations that still force hand edits of the `.kicad_sch`
-(issue 6 in `kicad_mcp_issues.md`, the remaining rows of its table).
+(issue 6 in `docs/kicad_mcp_issues.md`, the remaining rows of its table).
 
 ### Adapter (`src/kicad_claude/adapters/sch_editor.py`)
 

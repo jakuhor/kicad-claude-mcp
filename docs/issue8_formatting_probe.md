@@ -41,7 +41,7 @@ now produces a 10-line diff — the wire itself. Before, a handful of edits gave
    escaped — KiCad escapes those too, and a raw newline inside a quoted string
    makes KiCad refuse to load the file (issue 1).
 
-## Known remaining deviation
+## Known remaining deviation — tracked as P6
 
 The 12 files that still differ all differ only in **`(members ...)` wrapping**
 inside `(bus_alias ...)`. KiCad breaks those lines earlier than a 118-column

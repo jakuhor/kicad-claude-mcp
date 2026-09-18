@@ -12,9 +12,13 @@ traced in the source, and a suggested fix. Severity:
 - **Major** — produces ERC problems or forces manual GUI work.
 - **Minor** — cosmetic or ergonomic.
 
+**Status.** Every heading carries its state. What is still open lives in
+`docs/open_points.md` under P-numbers; this document is kept as the original
+field report and is not the working queue any more.
+
 ---
 
-## 1. Newlines in string literals are written unescaped — schematic no longer loads (Blocker)
+## 1. Newlines in string literals are written unescaped — schematic no longer loads (Blocker) — FIXED
 
 **Observed.** After any MCP write to a sheet, text items that contained `\n`
 (e.g. `(text "TODO:\n+ USB PD\n- EMI filter design ...")`) were re-serialised
@@ -80,7 +84,7 @@ positions returned by `list_pins` of an already on-grid symbol as anchors.
 
 ---
 
-## 3. `run_erc` cannot find `kicad-cli` on Windows (Major)
+## 3. `run_erc` cannot find `kicad-cli` on Windows (Major) — FIXED
 
 **Observed.**
 
@@ -107,7 +111,7 @@ and it has no Windows or Linux default install paths.
 
 ---
 
-## 4. `list_components` ignores the active sheet (Major)
+## 4. `list_components` ignores the active sheet (Major) — FIXED
 
 **Observed.** After `set_active_sheet("400_symetric_analog.kicad_sch")`,
 `list_components` still returned the root sheet's symbols. `add_symbol`,
@@ -127,7 +131,7 @@ each entry with its sheet path.
 
 ---
 
-## 5. `#PWR` references duplicate across sheets (Major)
+## 5. `#PWR` references duplicate across sheets (Major) — FIXED
 
 **Observed.** `add_power_symbol` on the root sheet produced `#PWR0001…#PWR0009`,
 which were already used on sub-sheet `400_symetric_analog`. `kicad-cli` then
@@ -147,7 +151,7 @@ references.
 
 ---
 
-## 6. Missing edit primitives force hand edits of `.kicad_sch` (Major) — MOSTLY FIXED
+## 6. Missing edit primitives force hand edits of `.kicad_sch` (Major) — MOSTLY FIXED, rest is P1
 
 The tool set can add wires, labels and symbols, but cannot modify or delete most
 of them. During one session, these operations had no tool:
@@ -184,12 +188,12 @@ no-connect markers orphaned. That produced about 50 dangling items and 2
 `remove_symbol(remove_connected_wires=True)`.
 
 Still open, both from the suggestion list rather than the table:
-- `replace_symbol` — not implemented.
-- Autoplacing a symbol's fields — that is issue 7, still open.
+- `replace_symbol` — not implemented. Tracked as **P1**.
+- Autoplacing a symbol's fields — that is issue 7, still open. Tracked as **P2**.
 
 ---
 
-## 7. Symbols placed without autoplaced fields (Minor)
+## 7. Symbols placed without autoplaced fields (Minor) — OPEN, see P2
 
 **Observed.** Reference and value text of `add_symbol` / `add_power_symbol`
 results sat on top of the symbol origin (for example `#PWR0001` overlapping `GND`
@@ -201,7 +205,7 @@ for simple 2-pin parts. Set `(fields_autoplaced yes)` only when that is true.
 
 ---
 
-## 8. Whole-file reformat on every write (Minor) — FIXED
+## 8. Whole-file reformat on every write (Minor) — FIXED, residue is P6
 
 **Observed.** A handful of symbol and wire additions to
 `400_symetric_analog.kicad_sch` gave a git diff of about 6000 lines
@@ -218,7 +222,7 @@ byte-identical.
 
 ---
 
-## 9. `.backups/` directory grows unbounded and is not ignored (Minor)
+## 9. `.backups/` directory grows unbounded and is not ignored (Minor) — PARTLY FIXED, see P4
 
 **Observed.** Every mutating call writes a full copy of the sheet to
 `<project>/.backups/`. One session produced 88 files there, all showing up as
@@ -231,7 +235,7 @@ untracked in git.
 
 ---
 
-## 10. Tool results don't surface post-write validity (Minor)
+## 10. Tool results don't surface post-write validity (Minor) — OPEN, see P3
 
 Given issue 1, a cheap guard would have caught the corruption immediately.
 
@@ -251,3 +255,4 @@ stderr if it fails. Offer to restore from the backup that was just written.
   already documents this. Whether the server checks for the lock file
   (`~<project>.kicad_pro.lck`) was not verified. If it doesn't, a check in every
   mutating tool that returns a clear error would enforce this.
+  Verified 2026-09-18: there is no such check. Tracked as **P5**.

@@ -10,7 +10,7 @@ point.
 PCB tools use KiCAD-native coordinates too, so `pcb_to_file_xy` is likewise the
 identity. They used to flip Y around the page height, which made every
 coordinate page-size dependent and knocked grid points off the grid (297 mm is
-not a multiple of 1.27 mm) — issue 2 in `kicad_mcp_issues.md`.
+not a multiple of 1.27 mm) — issue 2 in `docs/kicad_mcp_issues.md`.
 """
 
 from __future__ import annotations
