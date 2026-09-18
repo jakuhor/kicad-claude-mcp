@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import sexpdata
 
 from kicad_claude import state
 from kicad_claude.adapters import sch_editor as ed
@@ -743,3 +744,161 @@ def test_sheet_fill_alpha_has_four_decimals():
 def test_float_keeps_full_precision():
     node = [sch_io.sym("at"), 59.209102362204725, 270]
     assert sch_io.dumps(node) == "(at 59.209102362204725 270)"
+
+
+# --------------------------------------------------------------------------- #
+# KiCAD `{brace}` escapes and `(property private ...)`
+# --------------------------------------------------------------------------- #
+
+
+class TestBraceEscapes:
+    """`utils/kicad_strings.py` — KiCAD's own name codec."""
+
+    def test_unescape_known_sequences(self):
+        from kicad_claude.utils.kicad_strings import unescape_braces
+
+        assert unescape_braces("VBUS{slash}5V") == "VBUS/5V"
+        assert unescape_braces("A{dblquote}B") == 'A"B'
+        assert unescape_braces("{lt}x{gt}") == "<x>"
+        assert unescape_braces("a{space}b") == "a b"
+
+    def test_unescape_leaves_unknown_sequence_alone(self):
+        from kicad_claude.utils.kicad_strings import unescape_braces
+
+        assert unescape_braces("NET{foo}1") == "NET{foo}1"
+
+    def test_unescape_is_a_noop_without_braces(self):
+        from kicad_claude.utils.kicad_strings import unescape_braces
+
+        assert unescape_braces("VBUS_5V") == "VBUS_5V"
+
+    def test_escape_round_trips(self):
+        from kicad_claude.utils.kicad_strings import escape_braces, unescape_braces
+
+        for raw in ["VBUS/5V", 'A"B', "<x>", "a b", "p{q}", "a|b:c", "tab\there"]:
+            assert unescape_braces(escape_braces(raw)) == raw
+
+    def test_escape_handles_literal_brace_first(self):
+        from kicad_claude.utils.kicad_strings import escape_braces
+
+        # A literal `{` must not be left to look like the start of a sequence.
+        assert escape_braces("{slash}") == "{brace}slash}"
+
+    def test_normalize_matches_both_spellings(self):
+        from kicad_claude.utils.kicad_strings import normalize_name
+
+        assert normalize_name("VBUS{slash}5V") == normalize_name("VBUS/5V")
+
+
+class TestPropertyPrivateOffset:
+    """KiCAD 9+ may write `(property private "Name" "Value" ...)`."""
+
+    @staticmethod
+    def _symbol(private: bool) -> list:
+        head = [sexpdata.Symbol("property")]
+        if private:
+            head.append(sexpdata.Symbol("private"))
+        return [
+            sexpdata.Symbol("symbol"),
+            [sexpdata.Symbol("lib_id"), "Device:R"],
+            head + ["Reference", "R1", [sexpdata.Symbol("at"), 0, 0, 0]],
+            [sexpdata.Symbol("property"), "Value", "10k"],
+        ]
+
+    def test_property_name_index(self):
+        plain = [sexpdata.Symbol("property"), "Reference", "R1"]
+        private = [sexpdata.Symbol("property"), sexpdata.Symbol("private"), "Reference", "R1"]
+        assert sch_io.property_name_index(plain) == 1
+        assert sch_io.property_name_index(private) == 2
+
+    @pytest.mark.parametrize("private", [False, True])
+    def test_get_property(self, private):
+        node = self._symbol(private)
+        assert sch_io.get_property(node, "Reference") == "R1"
+        assert sch_io.get_property(node, "Value") == "10k"
+        assert sch_io.get_property(node, "Nope") is None
+
+    @pytest.mark.parametrize("private", [False, True])
+    def test_get_properties_lowercases_keys(self, private):
+        props = sch_io.get_properties(self._symbol(private))
+        assert props["reference"] == "R1"
+        assert props["value"] == "10k"
+
+    @pytest.mark.parametrize("private", [False, True])
+    def test_set_symbol_property_writes_the_value_slot(self, private):
+        node = self._symbol(private)
+        ed.set_symbol_property(node, "Reference", "R7")
+        assert sch_io.get_property(node, "Reference") == "R7"
+        # The `private` token itself must survive.
+        prop = sch_io.find_children(node, "property")[0]
+        assert sch_io.is_symbol(prop[1], "private") is private
+
+    @pytest.mark.parametrize("private", [False, True])
+    def test_find_symbol_by_reference(self, private):
+        tree = [sexpdata.Symbol("kicad_sch"), self._symbol(private)]
+        assert ed.find_symbol_by_reference(tree, "R1") is not None
+        assert ed.find_symbol_by_reference(tree, "R9") is None
+
+    def test_find_symbol_by_reference_matches_escaped_form(self):
+        node = [
+            sexpdata.Symbol("symbol"),
+            [sexpdata.Symbol("lib_id"), "Device:R"],
+            [sexpdata.Symbol("property"), "Reference", "R{slash}1"],
+        ]
+        tree = [sexpdata.Symbol("kicad_sch"), node]
+        assert ed.find_symbol_by_reference(tree, "R/1") is node
+        assert ed.find_symbol_by_reference(tree, "R{slash}1") is node
+
+
+class TestHasFlag:
+    """Three spellings of a boolean flag across KiCAD versions."""
+
+    def test_bare_token(self):
+        node = [sexpdata.Symbol("pin"), sexpdata.Symbol("hide")]
+        assert sch_io.has_flag(node, "hide") is True
+
+    def test_boolean_yes(self):
+        node = [sexpdata.Symbol("pin"), [sexpdata.Symbol("hide"), sexpdata.Symbol("yes")]]
+        assert sch_io.has_flag(node, "hide") is True
+
+    def test_boolean_no(self):
+        node = [sexpdata.Symbol("pin"), [sexpdata.Symbol("hide"), sexpdata.Symbol("no")]]
+        assert sch_io.has_flag(node, "hide") is False
+
+    def test_absent(self):
+        node = [sexpdata.Symbol("pin"), [sexpdata.Symbol("at"), 0, 0]]
+        assert sch_io.has_flag(node, "hide") is False
+
+
+class TestFindDeep:
+    def test_finds_nested_nodes_outermost_first(self):
+        tree = sexpdata.loads("(a (b 1) (c (b 2) (d (b 3))))")
+        found = sch_io.find_deep(tree, "b")
+        assert [n[1] for n in found] == [1, 2, 3]
+
+    def test_returns_empty_for_missing_head(self):
+        assert sch_io.find_deep(sexpdata.loads("(a (b 1))"), "zz") == []
+
+    def test_tolerates_an_atom(self):
+        assert sch_io.find_deep(sexpdata.Symbol("a"), "b") == []
+
+
+class TestParseFileErrors:
+    """`parse_file` must name the file it could not read."""
+
+    def test_empty_file(self, tmp_path):
+        p = tmp_path / "empty.kicad_sch"
+        p.write_text("", encoding="utf-8")
+        with pytest.raises(ValueError, match="empty"):
+            sch_io.parse_file(p)
+
+    def test_truncated_file(self, tmp_path):
+        p = tmp_path / "trunc.kicad_sch"
+        p.write_text("(kicad_sch (version 20250114) (symbol", encoding="utf-8")
+        with pytest.raises(ValueError, match="well-formed"):
+            sch_io.parse_file(p)
+
+    def test_good_file_still_parses(self, tmp_path):
+        p = tmp_path / "ok.kicad_sch"
+        p.write_text("(kicad_sch (version 20250114))", encoding="utf-8")
+        assert sch_io.head_of(sch_io.parse_file(p)) == "kicad_sch"

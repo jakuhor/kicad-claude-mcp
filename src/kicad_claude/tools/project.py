@@ -17,6 +17,7 @@ from skip import PCB, Schematic
 from kicad_claude import state
 from kicad_claude.adapters import sch_editor as ed
 from kicad_claude.templates.blank import write_blank_project
+from kicad_claude.utils.kicad_strings import normalize_name
 
 logger = logging.getLogger("kicad-claude.tools.project")
 
@@ -81,8 +82,9 @@ def _component_dict(sym) -> dict:
     y = at[1] if len(at) > 1 else 0.0
     rotation = at[2] if len(at) > 2 else 0.0
     return {
-        "reference": reference,
-        "value": value,
+        # Shown to the caller, so decode KiCAD's `{brace}` escapes.
+        "reference": normalize_name(reference) if isinstance(reference, str) else reference,
+        "value": normalize_name(value) if isinstance(value, str) else value,
         "lib_id": lib_id,
         "position_mm": [x, y],
         "rotation": rotation,

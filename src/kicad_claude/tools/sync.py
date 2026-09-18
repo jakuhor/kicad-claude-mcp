@@ -27,12 +27,11 @@ def _all_schematic_paths() -> list[Path]:
     for entry in root[1:]:
         if not sch_io.is_call(entry, "sheet"):
             continue
-        for prop in sch_io.find_children(entry, "property"):
-            if len(prop) >= 3 and prop[1] == "Sheetfile" and isinstance(prop[2], str):
-                child = proj.path / prop[2]
-                if child.is_file():
-                    paths.append(child)
-                break
+        sheetfile = sch_io.get_property(entry, "Sheetfile")
+        if sheetfile:
+            child = proj.path / sheetfile
+            if child.is_file():
+                paths.append(child)
     return paths
 
 

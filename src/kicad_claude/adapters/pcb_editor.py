@@ -31,8 +31,10 @@ from kicad_claude.adapters import length_tuning, pcb_layers, sch_io
 from kicad_claude.adapters.sch_io import (
     find_child,
     find_children,
+    get_property,
     head_of,
     is_call,
+    property_name_index,
     sym,
 )
 from kicad_claude.utils.geometry import (
@@ -41,6 +43,7 @@ from kicad_claude.utils.geometry import (
     normalize_rotation,
     round_mm,
 )
+from kicad_claude.utils.kicad_strings import normalize_name
 
 logger = logging.getLogger("kicad-claude.adapters.pcb_editor")
 
@@ -167,10 +170,7 @@ def iter_footprints(tree: list):
 
 
 def _footprint_property(fp: list, name: str) -> str | None:
-    for prop in find_children(fp, "property"):
-        if len(prop) >= 3 and prop[1] == name and isinstance(prop[2], str):
-            return prop[2]
-    return None
+    return get_property(fp, name)
 
 
 def get_footprint_reference(fp: list) -> str | None:
@@ -307,11 +307,14 @@ def _build_placed_footprint(
 
     # Set Reference / Value properties (preserve their (at), (layer), (effects)).
     for c in core:
-        if is_call(c, "property") and len(c) >= 3:
-            if c[1] == "Reference":
-                c[2] = reference
-            elif c[1] == "Value":
-                c[2] = value
+        if is_call(c, "property"):
+            i = property_name_index(c)
+            if len(c) <= i + 1:
+                continue
+            if c[i] == "Reference":
+                c[i + 1] = reference
+            elif c[i] == "Value":
+                c[i + 1] = value
 
     header: list[Any] = [
         [sym("layer"), layer],
@@ -570,17 +573,23 @@ def add_via(
 
 
 def list_nets(tree: list) -> list[dict]:
-    """Return [{index, name}] for every (net N "name") declaration in the PCB."""
+    """Return [{index, name}] for every (net N "name") declaration in the PCB.
+
+    Names are decoded for display: a net stored `VBUS{slash}5V` is reported
+    as `VBUS/5V`. The tree keeps the stored form.
+    """
     out: list[dict] = []
     for n in find_children(tree, "net"):
         if len(n) >= 3 and isinstance(n[1], int):
-            out.append({"index": int(n[1]), "name": str(n[2])})
+            out.append({"index": int(n[1]), "name": normalize_name(str(n[2]))})
     return out
 
 
 def find_net_index(tree: list, net_name: str) -> int | None:
+    """Index of a net by name. Matches the decoded or the stored spelling."""
+    wanted = normalize_name(net_name)
     for n in find_children(tree, "net"):
-        if len(n) >= 3 and n[2] == net_name:
+        if len(n) >= 3 and isinstance(n[2], str) and normalize_name(n[2]) == wanted:
             return int(n[1])
     return None
 

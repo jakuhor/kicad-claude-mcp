@@ -24,10 +24,13 @@ from kicad_claude.adapters import sch_io
 from kicad_claude.adapters.sch_io import (
     find_child,
     find_children,
+    get_property,
     head_of,
     is_call,
+    property_name_index,
     sym,
 )
+from kicad_claude.utils.kicad_strings import normalize_name
 from kicad_claude.utils.geometry import (
     DEFAULT_PAGE_HEIGHT_MM,
     file_to_sch_xy,
@@ -93,23 +96,23 @@ def iter_instance_symbols(tree: list):
 
 
 def get_symbol_property(symbol_node: list, name: str) -> str | None:
-    for prop in find_children(symbol_node, "property"):
-        if len(prop) >= 3 and prop[1] == name and isinstance(prop[2], str):
-            return prop[2]
-    return None
+    return get_property(symbol_node, name)
 
 
 def set_symbol_property(symbol_node: list, name: str, value: str) -> None:
     for prop in find_children(symbol_node, "property"):
-        if len(prop) >= 3 and prop[1] == name:
-            prop[2] = value
+        i = property_name_index(prop)
+        if len(prop) > i + 1 and prop[i] == name:
+            prop[i + 1] = value
             return
     raise KeyError(f"property {name!r} not found on symbol")
 
 
 def find_symbol_by_reference(tree: list, reference: str) -> list | None:
+    wanted = normalize_name(reference)
     for s_node in iter_instance_symbols(tree):
-        if get_symbol_property(s_node, "Reference") == reference:
+        stored = get_symbol_property(s_node, "Reference")
+        if stored is not None and normalize_name(stored) == wanted:
             return s_node
     return None
 
@@ -592,31 +595,25 @@ def add_sheet_node(
 
 def find_sheet_by_filename(tree: list, filename: str) -> list | None:
     """Find a `(sheet ...)` node by its Sheetfile property."""
+    wanted = normalize_name(filename)
     for node in tree[1:]:
         if not is_call(node, "sheet"):
             continue
-        for prop in find_children(node, "property"):
-            if (
-                len(prop) >= 3
-                and prop[1] == "Sheetfile"
-                and prop[2] == filename
-            ):
-                return node
+        stored = get_property(node, "Sheetfile")
+        if stored is not None and normalize_name(stored) == wanted:
+            return node
     return None
 
 
 def find_sheet_by_name(tree: list, sheet_name: str) -> list | None:
     """Find a `(sheet ...)` node by its Sheetname property."""
+    wanted = normalize_name(sheet_name)
     for node in tree[1:]:
         if not is_call(node, "sheet"):
             continue
-        for prop in find_children(node, "property"):
-            if (
-                len(prop) >= 3
-                and prop[1] == "Sheetname"
-                and prop[2] == sheet_name
-            ):
-                return node
+        stored = get_property(node, "Sheetname")
+        if stored is not None and normalize_name(stored) == wanted:
+            return node
     return None
 
 
@@ -628,10 +625,7 @@ def get_sheet_uuid(sheet_node: list) -> str:
 
 
 def get_sheet_filename(sheet_node: list) -> str | None:
-    for prop in find_children(sheet_node, "property"):
-        if len(prop) >= 3 and prop[1] == "Sheetfile" and isinstance(prop[2], str):
-            return prop[2]
-    return None
+    return get_property(sheet_node, "Sheetfile")
 
 
 def hierarchy_sch_paths(root_sch: Path) -> list[Path]:
@@ -680,14 +674,9 @@ def list_sheets(tree: list) -> list[dict]:
     for node in tree[1:]:
         if not is_call(node, "sheet"):
             continue
-        name = ""
-        filename = ""
-        for prop in find_children(node, "property"):
-            if len(prop) >= 3:
-                if prop[1] == "Sheetname":
-                    name = prop[2]
-                elif prop[1] == "Sheetfile":
-                    filename = prop[2]
+        # Names are shown to the caller, so decode KiCAD's `{brace}` escapes.
+        name = normalize_name(get_property(node, "Sheetname") or "")
+        filename = get_property(node, "Sheetfile") or ""
         u = find_child(node, "uuid")
         sheet_uuid = u[1] if u and len(u) >= 2 else ""
         out.append({"name": name, "filename": filename, "uuid": sheet_uuid})
@@ -849,7 +838,8 @@ def list_pins_for_symbol(tree: list, reference: str) -> list[dict]:
         out.append(
             {
                 "number": number,
-                "name": name,
+                # Displayed, so decode KiCAD's `{brace}` escapes.
+                "name": normalize_name(name),
                 "position_mm": [round_mm(mcp_x), round_mm(mcp_y)],
                 "angle": (lrot + srot) % 360,
             }

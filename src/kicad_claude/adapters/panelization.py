@@ -144,9 +144,10 @@ def _refresh_uuids(node: list) -> None:
 def _suffix_reference(footprint_node: list, suffix: str) -> str | None:
     """Append `suffix` to the footprint's Reference property. Returns the new ref."""
     for prop in sch_io.find_children(footprint_node, "property"):
-        if len(prop) >= 3 and prop[1] == "Reference" and isinstance(prop[2], str):
-            new_ref = f"{prop[2]}{suffix}"
-            prop[2] = new_ref
+        i = sch_io.property_name_index(prop)
+        if len(prop) > i + 1 and prop[i] == "Reference" and isinstance(prop[i + 1], str):
+            new_ref = f"{prop[i + 1]}{suffix}"
+            prop[i + 1] = new_ref
             return new_ref
     return None
 

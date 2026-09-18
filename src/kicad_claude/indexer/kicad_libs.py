@@ -45,6 +45,7 @@ from typing import Any
 
 import sexpdata
 
+from kicad_claude.adapters.sch_io import property_name_index
 from kicad_claude.utils.kicad_paths import (
     cache_dir,
     find_footprint_lib_dirs,
@@ -104,11 +105,14 @@ def _parse_symbol(node: list, lib_name: str) -> dict[str, Any]:
 
     for child in node[2:]:
         h = _head(child)
-        if h == "property" and len(child) >= 3:
-            # (property "Name" "Value" (...))
-            pname, pval = child[1], child[2]
-            if isinstance(pname, str) and isinstance(pval, str):
-                props[pname] = pval
+        if h == "property":
+            # (property "Name" "Value" (...)), or KiCAD 9+
+            # (property private "Name" "Value" (...))
+            i = property_name_index(child)
+            if len(child) > i + 1:
+                pname, pval = child[i], child[i + 1]
+                if isinstance(pname, str) and isinstance(pval, str):
+                    props[pname] = pval
         elif h == "extends" and len(child) >= 2 and isinstance(child[1], str):
             extends = child[1]
 

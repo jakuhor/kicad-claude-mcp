@@ -24,9 +24,22 @@ LINE_WIDTH = 118
 
 
 def parse_file(path: Path) -> list:
-    """Parse a KiCAD s-expression file. Returns the top-level list."""
+    """Parse a KiCAD s-expression file. Returns the top-level list.
+
+    A truncated or empty file raises `ValueError` naming the file. `sexpdata`
+    signals an empty input with a bare `AssertionError` and unbalanced parens
+    with its own `ExpectClosingBracket`; neither says which file failed.
+    """
     text = Path(path).read_text(encoding="utf-8", errors="replace")
-    return sexpdata.loads(text)
+    if not text.strip():
+        raise ValueError(f"{path} is empty — not a KiCAD file")
+    try:
+        tree = sexpdata.loads(text)
+    except Exception as exc:  # sexpdata raises several unrelated types
+        raise ValueError(f"{path} is not a well-formed s-expression: {exc}") from exc
+    if not isinstance(tree, list) or not tree:
+        raise ValueError(f"{path} has no top-level s-expression")
+    return tree
 
 
 # --------------------------------------------------------------------------- #
@@ -232,3 +245,72 @@ def find_children(node: list, head: str) -> list:
 def sym(name: str) -> sexpdata.Symbol:
     """Convenience: wrap a Python string as a sexpdata.Symbol."""
     return sexpdata.Symbol(name)
+
+
+def find_deep(node: Any, head: str) -> list:
+    """Return every `(head ...)` node at any depth, outermost first."""
+    acc: list = []
+    _find_deep_acc(node, head, acc)
+    return acc
+
+
+def _find_deep_acc(node: Any, head: str, acc: list) -> None:
+    if not isinstance(node, list):
+        return
+    if is_call(node, head):
+        acc.append(node)
+    for child in node:
+        _find_deep_acc(child, head, acc)
+
+
+def is_symbol(x: Any, name: str) -> bool:
+    """True if `x` is the bare token `name` — e.g. the `private` in a property."""
+    return isinstance(x, sexpdata.Symbol) and str(x) == name
+
+
+# --------------------------------------------------------------------------- #
+# Properties
+# --------------------------------------------------------------------------- #
+
+
+def property_name_index(prop: list) -> int:
+    """Index of the *name* atom in a `(property ...)` node.
+
+    KiCAD 9+ may emit `(property private "Name" "Value" ...)`, which shifts
+    name and value one place right. The value sits at the returned index + 1.
+    """
+    return 2 if len(prop) > 1 and is_symbol(prop[1], "private") else 1
+
+
+def get_property(node: list, name: str) -> str | None:
+    """Value of the `(property ... "name" "value")` child of `node`, exact case."""
+    for prop in find_children(node, "property"):
+        i = property_name_index(prop)
+        if len(prop) > i + 1 and prop[i] == name and isinstance(prop[i + 1], str):
+            return prop[i + 1]
+    return None
+
+
+def get_properties(node: list) -> dict[str, str]:
+    """Every property of `node`, keyed by lower-cased name for loose lookup."""
+    out: dict[str, str] = {}
+    for prop in find_children(node, "property"):
+        i = property_name_index(prop)
+        if len(prop) > i + 1 and isinstance(prop[i], str) and isinstance(prop[i + 1], str):
+            out[prop[i].lower()] = prop[i + 1]
+    return out
+
+
+def has_flag(node: list, flag: str) -> bool:
+    """True if `node` carries `flag`, in any of the three forms KiCAD uses.
+
+    - bare token, KiCAD 5-7:   `(pin ... hide ...)`
+    - boolean, post-20241004:  `(pin ... (hide yes) ...)`
+    - explicitly off:          `(pin ... (hide no) ...)` -> False
+    """
+    for child in node:
+        if is_symbol(child, flag):
+            return True
+        if is_call(child, flag) and len(child) >= 2:
+            return str(child[1]).lower() in ("yes", "true")
+    return False
