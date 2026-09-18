@@ -10,8 +10,10 @@ Tools (all operate on the active project's `.kicad_pcb`):
     place_footprints_grid
     add_track
     add_via
+    list_unrouted, get_pad_position, list_pads, net_route_status
 
-Coordinates: millimetres, Y axis pointing UP (same as schematic tools).
+Coordinates: millimetres, KiCAD-native — Y axis points DOWN, the numbers the
+KiCAD PCB editor shows (same convention as the schematic tools).
 Rotations: 0 / 90 / 180 / 270.
 """
 
@@ -25,6 +27,7 @@ import json
 from kicad_claude import state
 from kicad_claude.adapters import pcb_editor as ed
 from kicad_claude.adapters import project_settings as ps
+from kicad_claude.adapters import pcb_netlist
 from kicad_claude.adapters import sch_editor, sch_io
 from kicad_claude.templates.blank import write_blank_pcb
 from kicad_claude.tools import library as lib_tools
@@ -483,6 +486,76 @@ def register(mcp) -> None:
         """List every net declared at the PCB top level."""
         tree, _ = _load_active_pcb()
         return {"nets": ed.list_nets(tree)}
+
+    # ----- Copper connectivity (derived, read-only) ----------------------- #
+
+    @mcp.tool()
+    def list_unrouted() -> dict:
+        """Connections the board still needs, longest first — the ratsnest.
+
+        A `.kicad_pcb` says which net each pad belongs to but not whether copper
+        actually joins them. This walks tracks, vias and filled zones to find
+        out. One entry per missing link, naming the closest pad pair it would
+        join.
+
+        `zones_filled` is False when some zone carries no fill data. An unfilled
+        ground pour connects nothing, so treat the result as pessimistic and
+        re-run after `run_drc(refill_zones=True)`.
+        """
+        tree, _ = _load_active_pcb()
+        return pcb_netlist.list_unrouted(tree)
+
+    @mcp.tool()
+    def get_pad_position(reference: str, pad: str) -> dict:
+        """Absolute position, layers and net of one pad.
+
+        The primitive behind "put this decoupling cap at its IC pin": read the
+        IC pad's position, then `move_footprint` the capacitor next to it.
+        """
+        tree, _ = _load_active_pcb()
+        found = pcb_netlist.find_pad(tree, reference, pad)
+        if found is None:
+            raise KeyError(f"no pad {pad!r} on footprint {reference!r}")
+        return {
+            "reference": found["ref"],
+            "pad": found["pad"],
+            "position_mm": list(found["point"]),
+            "layers": found["layers"],
+            "net": found["net_name"],
+            "net_number": found["net"],
+            "type": found["type"],
+        }
+
+    @mcp.tool()
+    def list_pads(reference: str = "") -> list[dict]:
+        """Every pad on the board, or only those of one footprint."""
+        tree, _ = _load_active_pcb()
+        pads = pcb_netlist.list_pads(tree)
+        if reference:
+            pads = [p for p in pads if p["ref"] == reference]
+            if not pads:
+                raise KeyError(f"no footprint with reference {reference!r}")
+        return [
+            {
+                "reference": p["ref"],
+                "pad": p["pad"],
+                "position_mm": list(p["point"]),
+                "layers": p["layers"],
+                "net": p["net_name"],
+                "type": p["type"],
+            }
+            for p in pads
+        ]
+
+    @mcp.tool()
+    def net_route_status(net_name: str) -> dict:
+        """Whether one net is fully routed, and how its pads are grouped.
+
+        `connected_groups` holds one list per island of joined pads. A routed
+        net has exactly one.
+        """
+        tree, _ = _load_active_pcb()
+        return pcb_netlist.net_route_status(tree, net_name)
 
     @mcp.tool()
     def compute_trace_length(net_name: str) -> dict:

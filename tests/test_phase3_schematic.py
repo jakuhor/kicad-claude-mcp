@@ -265,8 +265,9 @@ def _make_mcp_with_fixture_index(monkeypatch, tmp_path):
     return mcp
 
 
-def _call(mcp, name, **kwargs):
-    return mcp._tool_manager.get_tool(name).fn(**kwargs)
+def _call(mcp, tool_name, /, **kwargs):
+    """Call a registered tool. Positional-only name, so a tool may take `name`."""
+    return mcp._tool_manager.get_tool(tool_name).fn(**kwargs)
 
 
 def test_add_symbol_tool_writes_schematic(blank_project, tmp_path, monkeypatch):
@@ -941,3 +942,388 @@ class TestLineEndingsPreserved:
         p = tmp_path / "mixed.kicad_sch"
         p.write_bytes(b"(a\r\n(b 1)\r\n(c 2)\n)\r\n")
         assert sch_io.detect_newline(p) == "\r\n"
+
+
+# --------------------------------------------------------------------------- #
+# Point 3 — symbol properties and flags
+# --------------------------------------------------------------------------- #
+
+
+def _sheet_with_r1(sch_path: Path) -> list:
+    """Place R1 on a blank sheet and return the re-parsed tree."""
+    tree = sch_io.parse_file(sch_path)
+    sym_def = ed.fetch_symbol_def(FIXTURES / "MiniLib.kicad_sym", "Resistor")
+    ed.add_symbol(
+        tree, qualified_lib_id="MiniLib:Resistor", reference="R1", value="10k",
+        x_mm=100, y_mm=80, rotation=0, sym_def_node=sym_def, project_name="demo",
+    )
+    sch_io.write_file(sch_path, tree)
+    return sch_io.parse_file(sch_path)
+
+
+class TestSymbolProperties:
+    def test_add_property_then_read_it_back(self, blank_project):
+        tree = _sheet_with_r1(blank_project["sch"])
+        s = ed.find_symbol_by_reference(tree, "R1")
+        ed.add_symbol_property(s, "MPN", "RC0603FR-0710KL")
+        sch_io.write_file(blank_project["sch"], tree)
+
+        again = sch_io.parse_file(blank_project["sch"])
+        s2 = ed.find_symbol_by_reference(again, "R1")
+        assert ed.get_symbol_property(s2, "MPN") == "RC0603FR-0710KL"
+
+    def test_added_property_is_hidden_and_placed_like_value(self, blank_project):
+        tree = _sheet_with_r1(blank_project["sch"])
+        s = ed.find_symbol_by_reference(tree, "R1")
+        node = ed.add_symbol_property(s, "LCSC", "C25804")
+        assert sch_io.has_flag(sch_io.find_child(node, "effects"), "hide") is True
+
+        value_at = sch_io.find_child(
+            [p for p in sch_io.find_children(s, "property")
+             if p[sch_io.property_name_index(p)] == "Value"][0], "at")
+        assert sch_io.find_child(node, "at")[1:3] == value_at[1:3]
+
+    def test_add_duplicate_property_rejected(self, blank_project):
+        tree = _sheet_with_r1(blank_project["sch"])
+        s = ed.find_symbol_by_reference(tree, "R1")
+        with pytest.raises(ValueError, match="already exists"):
+            ed.add_symbol_property(s, "Value", "22k")
+
+    def test_remove_property(self, blank_project):
+        tree = _sheet_with_r1(blank_project["sch"])
+        s = ed.find_symbol_by_reference(tree, "R1")
+        ed.add_symbol_property(s, "MPN", "X")
+        assert ed.remove_symbol_property(s, "MPN") is True
+        assert ed.get_symbol_property(s, "MPN") is None
+        assert ed.remove_symbol_property(s, "MPN") is False
+
+    def test_set_property_keeps_the_rest_of_the_node(self, blank_project):
+        tree = _sheet_with_r1(blank_project["sch"])
+        s = ed.find_symbol_by_reference(tree, "R1")
+        prop = [p for p in sch_io.find_children(s, "property")
+                if p[sch_io.property_name_index(p)] == "Value"][0]
+        before = len(prop)
+        ed.set_symbol_property(s, "Value", "22k")
+        assert ed.get_symbol_property(s, "Value") == "22k"
+        assert len(prop) == before  # (at ...) and (effects ...) untouched
+
+
+class TestSymbolFlags:
+    def test_blank_symbol_flags_match_kicad_defaults(self, blank_project):
+        tree = _sheet_with_r1(blank_project["sch"])
+        s = ed.find_symbol_by_reference(tree, "R1")
+        assert ed.get_symbol_flag(s, "dnp") is False
+        assert ed.get_symbol_flag(s, "in_bom") is True
+        assert ed.get_symbol_flag(s, "on_board") is True
+
+    def test_set_dnp_round_trips(self, blank_project):
+        tree = _sheet_with_r1(blank_project["sch"])
+        s = ed.find_symbol_by_reference(tree, "R1")
+        ed.set_symbol_flag(s, "dnp", True)
+        sch_io.write_file(blank_project["sch"], tree)
+
+        again = sch_io.parse_file(blank_project["sch"])
+        s2 = ed.find_symbol_by_reference(again, "R1")
+        assert ed.get_symbol_flag(s2, "dnp") is True
+        ed.set_symbol_flag(s2, "dnp", False)
+        assert ed.get_symbol_flag(s2, "dnp") is False
+
+    def test_missing_flag_node_is_inserted_before_uuid(self, blank_project):
+        tree = _sheet_with_r1(blank_project["sch"])
+        s = ed.find_symbol_by_reference(tree, "R1")
+        assert sch_io.find_child(s, "dnp") is not None
+        s.remove(sch_io.find_child(s, "dnp"))
+        assert sch_io.find_child(s, "dnp") is None
+
+        ed.set_symbol_flag(s, "dnp", True)
+        heads = [sch_io.head_of(c) for c in s]
+        assert heads.index("dnp") < heads.index("uuid")
+
+    def test_unknown_flag_rejected(self, blank_project):
+        tree = _sheet_with_r1(blank_project["sch"])
+        s = ed.find_symbol_by_reference(tree, "R1")
+        with pytest.raises(ValueError, match="unknown symbol flag"):
+            ed.set_symbol_flag(s, "not_a_flag", True)
+
+
+class TestSymbolPropertyTools:
+    """The MCP tool layer for point 3."""
+
+    def test_set_property_tool_writes_and_reports_previous(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=100, y_mm=80)
+        res = _call(mcp, "set_symbol_property", reference="R1",
+                    name="Value", value="22k")
+        assert res["previous"] == "10k"
+        assert res["created"] is False
+
+        props = _call(mcp, "get_symbol_properties", reference="R1")
+        assert props["properties"]["Value"] == "22k"
+
+    def test_set_property_needs_create_for_a_new_field(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=100, y_mm=80)
+        with pytest.raises(KeyError, match="create=True"):
+            _call(mcp, "set_symbol_property", reference="R1", name="MPN", value="X")
+
+        res = _call(mcp, "set_symbol_property", reference="R1", name="MPN",
+                    value="RC0603FR-0710KL", create=True)
+        assert res["created"] is True
+        props = _call(mcp, "get_symbol_properties", reference="R1")
+        assert props["properties"]["MPN"] == "RC0603FR-0710KL"
+
+    def test_reference_rename_refused(self, blank_project, tmp_path, monkeypatch):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=100, y_mm=80)
+        with pytest.raises(ValueError, match="annotate_schematic"):
+            _call(mcp, "set_symbol_property", reference="R1",
+                  name="Reference", value="R9")
+
+    def test_mandatory_field_cannot_be_removed(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=100, y_mm=80)
+        with pytest.raises(ValueError, match="mandatory"):
+            _call(mcp, "remove_symbol_property", reference="R1", name="Value")
+
+    def test_flag_tools_round_trip(self, blank_project, tmp_path, monkeypatch):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=100, y_mm=80)
+        assert _call(mcp, "set_dnp", reference="R1")["previous"] is False
+        assert _call(mcp, "get_symbol_properties", reference="R1")["flags"]["dnp"] is True
+        assert _call(mcp, "set_in_bom", reference="R1", in_bom=False)["value"] is False
+        flags = _call(mcp, "get_symbol_properties", reference="R1")["flags"]
+        assert flags["in_bom"] is False
+        assert flags["on_board"] is True
+
+    def test_unknown_reference_raises(self, blank_project, tmp_path, monkeypatch):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        with pytest.raises(KeyError, match="R99"):
+            _call(mcp, "set_dnp", reference="R99")
+
+
+@pytest.mark.slow
+def test_property_and_dnp_edits_still_pass_erc(tmp_path, monkeypatch):
+    """Point 3 writes must leave the sheet loadable and ERC-clean."""
+    cli = find_kicad_cli()
+    if not cli:
+        pytest.skip("no kicad-cli available")
+    state.clear_active()
+    files = write_blank_project(tmp_path / "prop", "prop")
+    state.set_active(tmp_path / "prop", "prop")
+    try:
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=100.33, y_mm=100.33)
+        _call(mcp, "set_symbol_property", reference="R1", name="Value", value="22k")
+        _call(mcp, "set_symbol_property", reference="R1", name="MPN",
+              value="RC0603FR-0722KL", create=True)
+        _call(mcp, "set_dnp", reference="R1")
+        _call(mcp, "set_in_bom", reference="R1", in_bom=False)
+        sch_path = files["sch"]
+    finally:
+        state.clear_active()
+
+    r = subprocess.run(
+        [str(cli), "sch", "erc", str(sch_path)],
+        capture_output=True, text=True, timeout=60, cwd=tmp_path,
+    )
+    assert r.returncode == 0, f"erc failed: stderr={r.stderr}"
+
+
+# --------------------------------------------------------------------------- #
+# Point 5 — text notes, label renaming, generic moves
+# --------------------------------------------------------------------------- #
+
+
+class TestTextNotes:
+    def test_add_then_list(self, blank_project, tmp_path, monkeypatch):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        res = _call(mcp, "add_text", x_mm=50.8, y_mm=50.8, text="TODO: EMI filter")
+        assert res["uuid"]
+        items = _call(mcp, "list_texts")
+        assert [i["text"] for i in items] == ["TODO: EMI filter"]
+        assert items[0]["position_mm"] == [50.8, 50.8]
+
+    def test_multiline_text_survives_a_round_trip(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        """Issue 1 failure mode: a raw newline makes KiCAD refuse the file."""
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        body = "TODO:\n+ USB PD\n- EMI filter"
+        _call(mcp, "add_text", x_mm=50.8, y_mm=50.8, text=body)
+
+        raw = Path(blank_project["sch"]).read_text(encoding="utf-8")
+        assert "\\n" in raw  # escaped on disk
+        assert _call(mcp, "list_texts")[0]["text"] == body
+
+    def test_set_text(self, blank_project, tmp_path, monkeypatch):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        u = _call(mcp, "add_text", x_mm=50.8, y_mm=50.8, text="old")["uuid"]
+        res = _call(mcp, "set_text", uuid=u, text="new")
+        assert res["previous"] == "old"
+        assert _call(mcp, "list_texts")[0]["text"] == "new"
+
+    def test_remove_text(self, blank_project, tmp_path, monkeypatch):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        u = _call(mcp, "add_text", x_mm=50.8, y_mm=50.8, text="gone")["uuid"]
+        assert _call(mcp, "remove_text", uuid=u)["removed_text"] == "gone"
+        assert _call(mcp, "list_texts") == []
+
+    def test_unknown_uuid_raises(self, blank_project, tmp_path, monkeypatch):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        with pytest.raises(KeyError, match="no text item"):
+            _call(mcp, "set_text", uuid="nope", text="x")
+
+    def test_set_text_refuses_a_non_text_item(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_junction", x_mm=50.8, y_mm=50.8)
+        tree = sch_io.parse_file(blank_project["sch"])
+        j = [n for n in tree[1:] if sch_io.is_call(n, "junction")][0]
+        with pytest.raises(KeyError, match="no text item"):
+            _call(mcp, "set_text", uuid=ed.get_uuid(j), text="x")
+
+
+class TestRenameLabel:
+    def test_renames_label_and_hierarchical_label_together(self, blank_project):
+        tree = sch_io.parse_file(blank_project["sch"])
+        ed.add_label(tree, "+6V", 50.8, 50.8)
+        ed.add_hierarchical_label(tree, net_name="+6V", x_mm=63.5, y_mm=50.8)
+        counts = ed.rename_label_in_tree(tree, "+6V", "+5V")
+        assert counts["label"] == 1
+        assert counts["hierarchical_label"] == 1
+        labels = [n[1] for n in tree[1:] if sch_io.head_of(n) == "label"]
+        assert labels == ["+5V"]
+
+    def test_leaves_other_names_alone(self, blank_project):
+        tree = sch_io.parse_file(blank_project["sch"])
+        ed.add_label(tree, "+6V", 50.8, 50.8)
+        ed.add_label(tree, "GND", 63.5, 50.8)
+        ed.rename_label_in_tree(tree, "+6V", "+5V")
+        names = sorted(n[1] for n in tree[1:] if sch_io.head_of(n) == "label")
+        assert names == ["+5V", "GND"]
+
+    def test_matches_the_escaped_spelling(self, blank_project):
+        tree = sch_io.parse_file(blank_project["sch"])
+        ed.add_label(tree, "VBUS{slash}5V", 50.8, 50.8)
+        counts = ed.rename_label_in_tree(tree, "VBUS/5V", "VBUS_5V")
+        assert counts["label"] == 1
+
+    def test_tool_reports_nothing_found(self, blank_project, tmp_path, monkeypatch):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        with pytest.raises(KeyError, match="no label named"):
+            _call(mcp, "rename_label", old_name="NOPE", new_name="X")
+
+    def test_tool_renames_on_the_active_sheet(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_label", net_name="+6V", x_mm=50.8, y_mm=50.8)
+        res = _call(mcp, "rename_label", old_name="+6V", new_name="+5V")
+        assert res["renamed"]["label"] == 1
+        tree = sch_io.parse_file(blank_project["sch"])
+        assert [n[1] for n in tree[1:] if sch_io.head_of(n) == "label"] == ["+5V"]
+
+    def test_empty_new_name_rejected(self, blank_project, tmp_path, monkeypatch):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        with pytest.raises(ValueError, match="must not be empty"):
+            _call(mcp, "rename_label", old_name="+6V", new_name="")
+
+
+class TestMoveItem:
+    def test_move_a_label(self, blank_project, tmp_path, monkeypatch):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_label", net_name="NET1", x_mm=50.8, y_mm=50.8)
+        tree = sch_io.parse_file(blank_project["sch"])
+        lbl = [n for n in tree[1:] if sch_io.head_of(n) == "label"][0]
+        res = _call(mcp, "move_item", uuid=ed.get_uuid(lbl), x_mm=76.2, y_mm=63.5)
+        assert res["previous_mm"] == [50.8, 50.8]
+
+        again = sch_io.parse_file(blank_project["sch"])
+        moved = [n for n in again[1:] if sch_io.head_of(n) == "label"][0]
+        at = sch_io.find_child(moved, "at")
+        assert [at[1], at[2]] == [76.2, 63.5]
+
+    def test_move_a_wire_keeps_its_length(self, blank_project, tmp_path, monkeypatch):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_wire", x1_mm=50.8, y1_mm=50.8, x2_mm=76.2, y2_mm=50.8)
+        tree = sch_io.parse_file(blank_project["sch"])
+        wire = [n for n in tree[1:] if sch_io.head_of(n) == "wire"][0]
+        _call(mcp, "move_item", uuid=ed.get_uuid(wire), x_mm=63.5, y_mm=63.5)
+
+        again = sch_io.parse_file(blank_project["sch"])
+        moved = [n for n in again[1:] if sch_io.head_of(n) == "wire"][0]
+        xys = sch_io.find_children(sch_io.find_child(moved, "pts"), "xy")
+        assert [[p[1], p[2]] for p in xys] == [[63.5, 63.5], [88.9, 63.5]]
+
+    def test_move_a_symbol_drags_its_fields(self, blank_project, tmp_path, monkeypatch):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=50.8, y_mm=50.8)
+        tree = sch_io.parse_file(blank_project["sch"])
+        s = ed.find_symbol_by_reference(tree, "R1")
+        prop_at = sch_io.find_child(
+            [p for p in sch_io.find_children(s, "property")
+             if p[sch_io.property_name_index(p)] == "Value"][0], "at")
+        before = [float(prop_at[1]), float(prop_at[2])]
+
+        _call(mcp, "move_item", uuid=ed.get_uuid(s), x_mm=76.2, y_mm=63.5)
+
+        again = sch_io.parse_file(blank_project["sch"])
+        s2 = ed.find_symbol_by_reference(again, "R1")
+        at2 = sch_io.find_child(s2, "at")
+        assert [at2[1], at2[2]] == [76.2, 63.5]
+        prop_at2 = sch_io.find_child(
+            [p for p in sch_io.find_children(s2, "property")
+             if p[sch_io.property_name_index(p)] == "Value"][0], "at")
+        # The field moved by the same delta (+25.4, +12.7).
+        assert [float(prop_at2[1]), float(prop_at2[2])] == pytest.approx(
+            [before[0] + 25.4, before[1] + 12.7]
+        )
+
+    def test_unknown_uuid_raises(self, blank_project, tmp_path, monkeypatch):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        with pytest.raises(KeyError, match="no item with uuid"):
+            _call(mcp, "move_item", uuid="nope", x_mm=0, y_mm=0)
+
+
+@pytest.mark.slow
+def test_text_label_and_move_edits_still_pass_erc(tmp_path, monkeypatch):
+    """Point 5 writes must leave the sheet loadable and ERC-clean."""
+    cli = find_kicad_cli()
+    if not cli:
+        pytest.skip("no kicad-cli available")
+    state.clear_active()
+    files = write_blank_project(tmp_path / "txt", "txt")
+    state.set_active(tmp_path / "txt", "txt")
+    try:
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_text", x_mm=50.8, y_mm=25.4,
+              text='Rev A notes:\n- check EMI\n- "quoted" and \\ backslash')
+        _call(mcp, "add_wire", x1_mm=50.8, y1_mm=50.8, x2_mm=76.2, y2_mm=50.8)
+        _call(mcp, "add_label", net_name="+6V", x_mm=50.8, y_mm=50.8)
+        _call(mcp, "rename_label", old_name="+6V", new_name="+5V")
+        tree = sch_io.parse_file(files["sch"])
+        wire = [n for n in tree[1:] if sch_io.head_of(n) == "wire"][0]
+        _call(mcp, "move_item", uuid=ed.get_uuid(wire), x_mm=63.5, y_mm=63.5)
+        sch_path = files["sch"]
+    finally:
+        state.clear_active()
+
+    r = subprocess.run(
+        [str(cli), "sch", "erc", str(sch_path)],
+        capture_output=True, text=True, timeout=60, cwd=tmp_path,
+    )
+    assert r.returncode == 0, f"erc failed: stderr={r.stderr}"

@@ -147,7 +147,7 @@ references.
 
 ---
 
-## 6. Missing edit primitives force hand edits of `.kicad_sch` (Major)
+## 6. Missing edit primitives force hand edits of `.kicad_sch` (Major) — MOSTLY FIXED
 
 The tool set can add wires, labels and symbols, but cannot modify or delete most
 of them. During one session, these operations had no tool:
@@ -176,6 +176,16 @@ no-connect markers orphaned. That produced about 50 dangling items and 2
   stubs that end on the removed pins and are no longer connected to anything else.
 - `replace_symbol(reference, lib_id, pin_map)` — swap a part while keeping
   position and connectivity where pins map.
+
+**Status 2026-09-18.** Every row of the table above now has a tool:
+`remove_wire`, `remove_items_in_box`, `add_junction`/`remove_junction`,
+`set_symbol_property`/`set_dnp`/`set_in_bom`/`set_on_board`, `rename_label`,
+`add_text`/`set_text`/`remove_text`, `move_item`, and
+`remove_symbol(remove_connected_wires=True)`.
+
+Still open, both from the suggestion list rather than the table:
+- `replace_symbol` — not implemented.
+- Autoplacing a symbol's fields — that is issue 7, still open.
 
 ---
 

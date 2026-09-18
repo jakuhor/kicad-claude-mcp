@@ -25,7 +25,7 @@ is a blocker.
 
 ## Layout
 - `server.py` — entry point; creates `FastMCP("kicad-claude")` and calls each
-  `tools/<group>.register(mcp)`. 105 tools total.
+  `tools/<group>.register(mcp)`. 130 tools total.
 - `src/kicad_claude/tools/*.py` — thin MCP tool wrappers: validate arguments,
   call an adapter, return a JSON-friendly dict.
 - `src/kicad_claude/adapters/*.py` — the real work: s-expression IO

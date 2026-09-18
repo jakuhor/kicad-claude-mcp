@@ -4,6 +4,10 @@ Tools (all operate on the active project's `.kicad_sch`):
     add_symbol, remove_symbol, move_symbol
     add_wire, remove_wire, add_label, add_no_connect, add_power_symbol
     add_junction, remove_junction, remove_no_connect, remove_items_in_box
+    get_symbol_properties, set_symbol_property, remove_symbol_property
+    set_dnp, set_in_bom, set_on_board
+    add_text, list_texts, set_text, remove_text, rename_label, move_item
+    list_sch_nets, trace_net, get_pin_net, find_dangling
     list_pins, get_pin_position
     list_components_detailed (richer than Phase 1's list_components)
 
@@ -23,9 +27,11 @@ from pathlib import Path
 from kicad_claude import state
 from kicad_claude.adapters import sch_editor as ed
 from kicad_claude.adapters import sch_io
+from kicad_claude.adapters import sch_netlist as netlist
 from kicad_claude.templates.blank import write_blank_schematic
 from kicad_claude.tools import library as lib_tools
 from kicad_claude.utils.geometry import round_mm, snap_xy
+from kicad_claude.utils.kicad_strings import normalize_name
 
 logger = logging.getLogger("kicad-claude.tools.schematic")
 
@@ -471,6 +477,412 @@ def register(mcp) -> None:
         tree, _ = _load_active_schematic()
         x, y = ed.get_pin_position(tree, reference, pin)
         return {"reference": reference, "pin": pin, "position_mm": [x, y]}
+
+    # ----- Connectivity (derived, read-only) ------------------------------ #
+
+    @mcp.tool()
+    def list_sch_nets(scope: str = "active", include_power_pins: bool = False) -> dict:
+        """Every net of the schematic, derived from wire and pin geometry.
+
+        A `.kicad_sch` stores no net list — nets are geometry, so this rebuilds
+        them the way KiCAD does: wires join their endpoints, a junction joins
+        everything meeting at a point, labels name the result.
+
+        `scope="active"` reads the active sheet; `"all"` walks the hierarchy and
+        merges global labels, power nets and sheet ports across sheets.
+
+        Power symbols (`#PWR`) and power flags (`#FLG`) are real connections but
+        virtual parts, so their pins are hidden unless `include_power_pins=True`
+        — this matches what `kicad-cli sch export netlist` reports.
+        """
+        if scope not in ("active", "all"):
+            raise ValueError(f"scope must be 'active' or 'all' (got {scope!r})")
+
+        if scope == "active":
+            path = state.get_active_sheet_path()
+            nets = netlist.build_sheet_nets(sch_io.parse_file(path), path).nets
+        else:
+            nets = netlist.build_hierarchy_nets(state.get_active().sch_path)
+
+        out = []
+        for name in sorted(nets):
+            entry = nets[name]
+            pins = [
+                p for p in entry["pins"] if include_power_pins or not p["power"]
+            ]
+            out.append(
+                {
+                    "name": name,
+                    "pin_count": len(pins),
+                    "pins": pins,
+                    "labels": entry["labels"],
+                    "sheets": entry["sheets"],
+                    "no_connect": entry["no_connect"],
+                }
+            )
+        return {"scope": scope, "net_count": len(out), "nets": out}
+
+    @mcp.tool()
+    def trace_net(name: str, scope: str = "active") -> dict:
+        """Everything on one net: pins, labels and sheet ports.
+
+        The name is matched against the derived net names from `list_sch_nets`,
+        including generated ones like `Net-(R1-Pad1)`.
+        """
+        if scope not in ("active", "all"):
+            raise ValueError(f"scope must be 'active' or 'all' (got {scope!r})")
+        if scope == "active":
+            path = state.get_active_sheet_path()
+            nets = netlist.build_sheet_nets(sch_io.parse_file(path), path).nets
+        else:
+            nets = netlist.build_hierarchy_nets(state.get_active().sch_path)
+
+        wanted = normalize_name(name)
+        for net_name, entry in nets.items():
+            if normalize_name(net_name) == wanted:
+                return {
+                    "name": net_name,
+                    "pin_count": len([p for p in entry["pins"] if not p["power"]]),
+                    "pins": entry["pins"],
+                    "labels": entry["labels"],
+                    "sheet_ports": entry["sheet_ports"],
+                    "sheets": entry["sheets"],
+                    "no_connect": entry["no_connect"],
+                }
+        raise KeyError(
+            f"no net named {name!r} in scope {scope!r}; "
+            f"call list_sch_nets to see the derived names"
+        )
+
+    @mcp.tool()
+    def get_pin_net(reference: str, pin: str, scope: str = "active") -> dict:
+        """The net a given pin sits on.
+
+        `connected` is False when the pin reaches no other pin. KiCAD still
+        names such a net — `unconnected-(R1-Pad1)` — so read `connected`, not
+        the presence of a name. `net` is None only when the reference or pin
+        does not exist on the sheet.
+        """
+        if scope not in ("active", "all"):
+            raise ValueError(f"scope must be 'active' or 'all' (got {scope!r})")
+        if scope == "active":
+            path = state.get_active_sheet_path()
+            nets = netlist.build_sheet_nets(sch_io.parse_file(path), path).nets
+        else:
+            nets = netlist.build_hierarchy_nets(state.get_active().sch_path)
+
+        ref = normalize_name(reference)
+        for net_name, entry in nets.items():
+            for p in entry["pins"]:
+                if normalize_name(p["ref"]) == ref and p["pin"] == pin:
+                    others = [
+                        q for q in entry["pins"]
+                        if not (q["ref"] == p["ref"] and q["pin"] == p["pin"])
+                    ]
+                    return {
+                        "reference": reference,
+                        "pin": pin,
+                        "net": net_name,
+                        "connected": any(not q["power"] for q in others),
+                        "connected_to": others,
+                    }
+        return {
+            "reference": reference,
+            "pin": pin,
+            "net": None,
+            "connected": False,
+            "connected_to": [],
+        }
+
+    @mcp.tool()
+    def find_dangling(scope: str = "active") -> dict:
+        """Wire ends and pins that connect to nothing.
+
+        The same class of defect ERC reports, without a `kicad-cli` round trip.
+        Pins carrying a `no_connect` marker are not reported.
+        """
+        if scope not in ("active", "all"):
+            raise ValueError(f"scope must be 'active' or 'all' (got {scope!r})")
+        if scope == "active":
+            paths = [state.get_active_sheet_path()]
+        else:
+            paths = ed.hierarchy_sch_paths(state.get_active().sch_path)
+
+        items: list[dict] = []
+        for p in paths:
+            sheet = netlist.build_sheet_nets(sch_io.parse_file(p), p)
+            items.extend(sheet.dangling)
+        return {"scope": scope, "count": len(items), "items": items}
+
+    # ----- Text notes, label renaming, generic moves ---------------------- #
+
+    @mcp.tool()
+    def add_text(
+        x_mm: float,
+        y_mm: float,
+        text: str,
+        size_mm: float = 1.27,
+        rotation: float = 0,
+        snap_to_grid: bool = True,
+    ) -> dict:
+        """Add a free text note to the active sheet.
+
+        A note is documentation — it carries no connectivity. Newlines are
+        allowed. Returns the note's `uuid`, which `set_text`, `remove_text` and
+        `move_item` take.
+        """
+        x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
+        tree, path = _load_active_schematic()
+        node = ed.add_text(tree, text, x_mm, y_mm, size_mm=size_mm, rotation=rotation)
+        backup = _save_with_backup(tree, path)
+        return {
+            "uuid": ed.get_uuid(node),
+            "text": text,
+            "position_mm": [x_mm, y_mm],
+            "size_mm": size_mm,
+            "sheet": state.get_active_sheet_filename() or "root",
+            "backup": str(backup) if backup else None,
+        }
+
+    @mcp.tool()
+    def list_texts() -> list[dict]:
+        """Every free text note on the active sheet, with uuid and position."""
+        tree, _ = _load_active_schematic()
+        items = ed.list_texts(tree)
+        for item in items:
+            item["text"] = normalize_name(item["text"])
+        return items
+
+    @mcp.tool()
+    def set_text(uuid: str, text: str) -> dict:
+        """Replace a text note's content. `uuid` comes from `list_texts`."""
+        tree, path = _load_active_schematic()
+        previous = ed.set_text(tree, uuid, text)
+        backup = _save_with_backup(tree, path)
+        return {
+            "uuid": uuid,
+            "text": text,
+            "previous": previous,
+            "sheet": state.get_active_sheet_filename() or "root",
+            "backup": str(backup) if backup else None,
+        }
+
+    @mcp.tool()
+    def remove_text(uuid: str) -> dict:
+        """Delete a text note by uuid."""
+        tree, path = _load_active_schematic()
+        previous = ed.remove_text(tree, uuid)
+        backup = _save_with_backup(tree, path)
+        return {
+            "uuid": uuid,
+            "removed_text": previous,
+            "sheet": state.get_active_sheet_filename() or "root",
+            "backup": str(backup) if backup else None,
+        }
+
+    @mcp.tool()
+    def rename_label(old_name: str, new_name: str, scope: str = "all") -> dict:
+        """Rename a net label everywhere it appears.
+
+        Rewrites `label`, `global_label`, `hierarchical_label` and the matching
+        `(pin ...)` of every `(sheet ...)`. `scope="all"` (the default) walks
+        the whole hierarchy; `scope="active"` touches only the active sheet.
+
+        The default is `"all"` on purpose: a global label or sheet pin left
+        behind on another sheet splits one net into two, and nothing reports it
+        until ERC.
+        """
+        if scope not in ("active", "all"):
+            raise ValueError(f"scope must be 'active' or 'all' (got {scope!r})")
+        if not new_name:
+            raise ValueError("new_name must not be empty")
+
+        if scope == "active":
+            paths = [state.get_active_sheet_path()]
+        else:
+            paths = ed.hierarchy_sch_paths(state.get_active().sch_path)
+
+        total = {"label": 0, "global_label": 0, "hierarchical_label": 0, "sheet_pin": 0}
+        per_sheet: list[dict] = []
+        backups: list[str] = []
+        for p in paths:
+            tree = sch_io.parse_file(p)
+            counts = ed.rename_label_in_tree(tree, old_name, new_name)
+            if not any(counts.values()):
+                continue
+            backup = _save_with_backup(tree, p)
+            if backup:
+                backups.append(str(backup))
+            for k, v in counts.items():
+                total[k] += v
+            per_sheet.append({"sheet": p.name, **counts})
+
+        if not per_sheet:
+            raise KeyError(f"no label named {old_name!r} found in scope {scope!r}")
+        return {
+            "old_name": old_name,
+            "new_name": new_name,
+            "scope": scope,
+            "renamed": total,
+            "sheets": per_sheet,
+            "backups": backups,
+        }
+
+    @mcp.tool()
+    def move_item(uuid: str, x_mm: float, y_mm: float, snap_to_grid: bool = True) -> dict:
+        """Move one item on the active sheet to an absolute position.
+
+        Works for wire, bus, label, global_label, hierarchical_label, junction,
+        no_connect, text, symbol and sheet. A wire or bus moves as a whole: its
+        first point lands on the target and the rest follow by the same delta.
+
+        Get a `uuid` from `list_texts`, or read it from the file. Moving a wire
+        away from a pin breaks that connection — re-check with `run_erc`.
+        """
+        x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
+        tree, path = _load_active_schematic()
+        result = ed.move_item(tree, uuid, x_mm, y_mm)
+        backup = _save_with_backup(tree, path)
+        return {
+            "uuid": uuid,
+            **result,
+            "sheet": state.get_active_sheet_filename() or "root",
+            "backup": str(backup) if backup else None,
+        }
+
+    # ----- Symbol properties and flags ------------------------------------ #
+
+    @mcp.tool()
+    def get_symbol_properties(reference: str) -> dict:
+        """Every property and flag of a placed symbol.
+
+        `properties` holds the text fields (Value, Footprint, MPN, …) with their
+        exact names. `flags` holds the booleans KiCAD stores as nodes: dnp,
+        in_bom, on_board, exclude_from_sim.
+        """
+        tree, _ = _load_active_schematic()
+        s_node = ed.find_symbol_by_reference(tree, reference)
+        if s_node is None:
+            raise KeyError(f"no symbol with reference {reference!r}")
+        props = {}
+        for prop in sch_io.find_children(s_node, "property"):
+            i = sch_io.property_name_index(prop)
+            if len(prop) > i + 1 and isinstance(prop[i], str):
+                props[prop[i]] = normalize_name(str(prop[i + 1]))
+        return {
+            "reference": reference,
+            "properties": props,
+            "flags": {f: ed.get_symbol_flag(s_node, f) for f in ed.SYMBOL_FLAGS},
+            "sheet": state.get_active_sheet_filename() or "root",
+        }
+
+    @mcp.tool()
+    def set_symbol_property(
+        reference: str, name: str, value: str, create: bool = False
+    ) -> dict:
+        """Set a text property (Value, Footprint, MPN, …) on a placed symbol.
+
+        With `create=True` a property that does not exist yet is added, hidden,
+        positioned like the symbol's Value field.
+
+        `Reference` is refused: renaming a designator here would leave the
+        symbol's `(instances ...)` paths pointing at the old one. Use
+        `annotate_schematic`.
+        """
+        if name == "Reference":
+            raise ValueError(
+                "refusing to set 'Reference' — it would desync the symbol's "
+                "(instances ...) paths; use annotate_schematic instead"
+            )
+        tree, path = _load_active_schematic()
+        s_node = ed.find_symbol_by_reference(tree, reference)
+        if s_node is None:
+            raise KeyError(f"no symbol with reference {reference!r}")
+
+        previous = ed.get_symbol_property(s_node, name)
+        if previous is None:
+            if not create:
+                raise KeyError(
+                    f"symbol {reference!r} has no property {name!r}; "
+                    f"pass create=True to add it"
+                )
+            ed.add_symbol_property(s_node, name, value)
+        else:
+            ed.set_symbol_property(s_node, name, value)
+
+        backup = _save_with_backup(tree, path)
+        return {
+            "reference": reference,
+            "property": name,
+            "value": value,
+            "previous": previous,
+            "created": previous is None,
+            "sheet": state.get_active_sheet_filename() or "root",
+            "backup": str(backup) if backup else None,
+        }
+
+    @mcp.tool()
+    def remove_symbol_property(reference: str, name: str) -> dict:
+        """Remove a text property from a placed symbol.
+
+        KiCAD's five mandatory fields (Reference, Value, Footprint, Datasheet,
+        Description) are refused — removing one makes the symbol invalid.
+        """
+        mandatory = {"Reference", "Value", "Footprint", "Datasheet", "Description"}
+        if name in mandatory:
+            raise ValueError(f"{name!r} is a mandatory KiCAD field and cannot be removed")
+        tree, path = _load_active_schematic()
+        s_node = ed.find_symbol_by_reference(tree, reference)
+        if s_node is None:
+            raise KeyError(f"no symbol with reference {reference!r}")
+        previous = ed.get_symbol_property(s_node, name)
+        if not ed.remove_symbol_property(s_node, name):
+            raise KeyError(f"symbol {reference!r} has no property {name!r}")
+        backup = _save_with_backup(tree, path)
+        return {
+            "reference": reference,
+            "property": name,
+            "previous": previous,
+            "sheet": state.get_active_sheet_filename() or "root",
+            "backup": str(backup) if backup else None,
+        }
+
+    def _set_flag(reference: str, flag: str, value: bool) -> dict:
+        tree, path = _load_active_schematic()
+        s_node = ed.find_symbol_by_reference(tree, reference)
+        if s_node is None:
+            raise KeyError(f"no symbol with reference {reference!r}")
+        previous = ed.get_symbol_flag(s_node, flag)
+        ed.set_symbol_flag(s_node, flag, value)
+        backup = _save_with_backup(tree, path)
+        return {
+            "reference": reference,
+            "flag": flag,
+            "value": value,
+            "previous": previous,
+            "sheet": state.get_active_sheet_filename() or "root",
+            "backup": str(backup) if backup else None,
+        }
+
+    @mcp.tool()
+    def set_dnp(reference: str, dnp: bool = True) -> dict:
+        """Mark a symbol Do Not Populate (or clear the mark).
+
+        DNP parts stay on the board and in the netlist; fabrication BOM and
+        position exports drop them.
+        """
+        return _set_flag(reference, "dnp", dnp)
+
+    @mcp.tool()
+    def set_in_bom(reference: str, in_bom: bool = True) -> dict:
+        """Include or exclude a symbol from the BOM (mounting holes, logos, …)."""
+        return _set_flag(reference, "in_bom", in_bom)
+
+    @mcp.tool()
+    def set_on_board(reference: str, on_board: bool = True) -> dict:
+        """Include or exclude a symbol from the board — `update_pcb_from_schematic`
+        will not push an excluded symbol to the PCB."""
+        return _set_flag(reference, "on_board", on_board)
 
     # ----- Buses (visual grouping of multiple nets) ----------------------- #
 

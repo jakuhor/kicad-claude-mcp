@@ -108,6 +108,100 @@ def set_symbol_property(symbol_node: list, name: str, value: str) -> None:
     raise KeyError(f"property {name!r} not found on symbol")
 
 
+def add_symbol_property(symbol_node: list, name: str, value: str) -> list:
+    """Append a new hidden `(property name value)` to a placed symbol.
+
+    Position and font are copied from the symbol's `Value` property, so the new
+    field lands where KiCAD would put it. It is hidden, like the Footprint and
+    Datasheet fields KiCAD itself adds — a new MPN or LCSC field is metadata,
+    not something to draw on the sheet.
+    """
+    if get_property(symbol_node, name) is not None:
+        raise ValueError(f"property {name!r} already exists on this symbol")
+
+    anchor = None
+    for prop in find_children(symbol_node, "property"):
+        i = property_name_index(prop)
+        if len(prop) > i and prop[i] == "Value":
+            anchor = prop
+            break
+
+    at_node = find_child(anchor, "at") if anchor else None
+    if at_node and len(at_node) >= 4:
+        at = [sym("at"), at_node[1], at_node[2], at_node[3]]
+    else:
+        sym_at = find_child(symbol_node, "at")
+        x = sym_at[1] if sym_at and len(sym_at) > 1 else 0
+        y = sym_at[2] if sym_at and len(sym_at) > 2 else 0
+        at = [sym("at"), x, y, 0]
+
+    node = [
+        sym("property"),
+        name,
+        value,
+        at,
+        [
+            sym("effects"),
+            [sym("font"), [sym("size"), 1.27, 1.27]],
+            [sym("hide"), sym("yes")],
+        ],
+    ]
+    # Keep it with the other properties: after the last one.
+    last_prop_idx = max(
+        (i for i, c in enumerate(symbol_node) if is_call(c, "property")),
+        default=len(symbol_node) - 1,
+    )
+    symbol_node.insert(last_prop_idx + 1, node)
+    return node
+
+
+def remove_symbol_property(symbol_node: list, name: str) -> bool:
+    """Drop a `(property name ...)` from a placed symbol. True if one went."""
+    for idx, child in enumerate(symbol_node):
+        if not is_call(child, "property"):
+            continue
+        i = property_name_index(child)
+        if len(child) > i and child[i] == name:
+            del symbol_node[idx]
+            return True
+    return False
+
+
+# The boolean nodes KiCAD writes on every placed symbol. They are nodes, not
+# properties: `(dnp yes)`, not `(property "dnp" "yes")`.
+SYMBOL_FLAGS = ("dnp", "in_bom", "on_board", "exclude_from_sim")
+
+
+def get_symbol_flag(symbol_node: list, flag: str) -> bool:
+    """Read one of `SYMBOL_FLAGS`. A flag KiCAD omitted reads as False."""
+    if flag not in SYMBOL_FLAGS:
+        raise ValueError(f"unknown symbol flag {flag!r}; expected one of {SYMBOL_FLAGS}")
+    return sch_io.has_flag(symbol_node, flag)
+
+
+def set_symbol_flag(symbol_node: list, flag: str, value: bool) -> None:
+    """Set `(flag yes|no)` on a placed symbol, adding the node if it is absent."""
+    if flag not in SYMBOL_FLAGS:
+        raise ValueError(f"unknown symbol flag {flag!r}; expected one of {SYMBOL_FLAGS}")
+    token = sym("yes" if value else "no")
+
+    node = find_child(symbol_node, flag)
+    if node is not None:
+        if len(node) >= 2:
+            node[1] = token
+        else:
+            node.append(token)
+        return
+
+    # Absent: insert in KiCAD's own order, just before `(uuid ...)`.
+    new_node = [sym(flag), token]
+    for idx, child in enumerate(symbol_node):
+        if is_call(child, "uuid"):
+            symbol_node.insert(idx, new_node)
+            return
+    symbol_node.append(new_node)
+
+
 def find_symbol_by_reference(tree: list, reference: str) -> list | None:
     wanted = normalize_name(reference)
     for s_node in iter_instance_symbols(tree):
@@ -1161,3 +1255,190 @@ def remove_symbol_with_wires(
         tree, pin_points, tolerance_mm=tolerance_mm
     )
     return counts
+
+
+# --------------------------------------------------------------------------- #
+# Text notes, label renaming and generic moves
+# --------------------------------------------------------------------------- #
+
+
+def add_text(
+    tree: list,
+    text: str,
+    x_mm: float,
+    y_mm: float,
+    size_mm: float = 1.27,
+    rotation: float = 0,
+) -> list:
+    """Append a free `(text ...)` note to the sheet.
+
+    A note carries no connectivity — it is documentation. Newlines are allowed;
+    `sch_io` escapes them on write.
+    """
+    if size_mm <= 0:
+        raise ValueError(f"size_mm must be > 0 (got {size_mm})")
+    xk, yk = sch_to_file_xy(x_mm, y_mm)
+    node = [
+        sym("text"),
+        text,
+        [sym("exclude_from_sim"), sym("no")],
+        [sym("at"), round_mm(xk), round_mm(yk), normalize_rotation(rotation)],
+        [
+            sym("effects"),
+            [sym("font"), [sym("size"), round_mm(size_mm), round_mm(size_mm)]],
+            [sym("justify"), sym("left"), sym("bottom")],
+        ],
+        [sym("uuid"), str(uuid.uuid4())],
+    ]
+    tree.append(node)
+    return node
+
+
+def find_by_uuid(tree: list, item_uuid: str) -> list | None:
+    """Return the top-level node whose `(uuid ...)` matches, or None."""
+    for node in tree[1:]:
+        if not isinstance(node, list):
+            continue
+        u = find_child(node, "uuid")
+        if u and len(u) >= 2 and str(u[1]) == item_uuid:
+            return node
+    return None
+
+
+def get_uuid(node: list) -> str | None:
+    u = find_child(node, "uuid")
+    return str(u[1]) if u and len(u) >= 2 else None
+
+
+def set_text(tree: list, item_uuid: str, text: str) -> str:
+    """Replace a `(text ...)` note's content. Returns the previous text."""
+    node = find_by_uuid(tree, item_uuid)
+    if node is None or not is_call(node, "text"):
+        raise KeyError(f"no text item with uuid {item_uuid!r} on this sheet")
+    if len(node) < 2 or not isinstance(node[1], str):
+        raise ValueError(f"text item {item_uuid!r} is malformed")
+    previous = node[1]
+    node[1] = text
+    return previous
+
+
+def remove_text(tree: list, item_uuid: str) -> str:
+    """Delete a `(text ...)` note. Returns the removed text."""
+    node = find_by_uuid(tree, item_uuid)
+    if node is None or not is_call(node, "text"):
+        raise KeyError(f"no text item with uuid {item_uuid!r} on this sheet")
+    previous = node[1] if len(node) > 1 and isinstance(node[1], str) else ""
+    tree.remove(node)
+    return previous
+
+
+def list_texts(tree: list) -> list[dict]:
+    """Every free text note on the sheet, with uuid and position."""
+    out = []
+    for node in tree[1:]:
+        if not is_call(node, "text"):
+            continue
+        at = find_child(node, "at")
+        out.append(
+            {
+                "uuid": get_uuid(node) or "",
+                "text": node[1] if len(node) > 1 and isinstance(node[1], str) else "",
+                "position_mm": [
+                    round_mm(float(at[1])) if at and len(at) > 1 else 0.0,
+                    round_mm(float(at[2])) if at and len(at) > 2 else 0.0,
+                ],
+                "rotation": float(at[3]) if at and len(at) > 3 else 0.0,
+            }
+        )
+    return out
+
+
+# Every node kind whose first atom is a net name that must rename together.
+_LABEL_KINDS = ("label", "global_label", "hierarchical_label")
+
+
+def rename_label_in_tree(tree: list, old_name: str, new_name: str) -> dict[str, int]:
+    """Rename every label on one sheet. Returns counts per kind.
+
+    Covers `label`, `global_label`, `hierarchical_label` and the `(pin ...)`
+    entries of every `(sheet ...)`. Missing a `sheet_pin` or a `global_label`
+    splits one net into two, silently, so they all move together.
+    """
+    wanted = normalize_name(old_name)
+    counts = {k: 0 for k in _LABEL_KINDS}
+    counts["sheet_pin"] = 0
+
+    for node in tree[1:]:
+        if not isinstance(node, list):
+            continue
+        head = head_of(node)
+        if head in _LABEL_KINDS:
+            if len(node) > 1 and isinstance(node[1], str) and normalize_name(node[1]) == wanted:
+                node[1] = new_name
+                counts[head] += 1
+        elif head == "sheet":
+            for pin in find_children(node, "pin"):
+                if len(pin) > 1 and isinstance(pin[1], str) and normalize_name(pin[1]) == wanted:
+                    pin[1] = new_name
+                    counts["sheet_pin"] += 1
+    return counts
+
+
+# Item kinds `move_item` understands, and where each keeps its coordinates.
+#   "at"  -> a single `(at x y [angle])`
+#   "pts" -> a `(pts (xy ..) (xy ..))`, moved as a whole by the delta
+_MOVABLE_AT = (
+    "label", "global_label", "hierarchical_label", "junction", "no_connect",
+    "text", "symbol", "sheet",
+)
+_MOVABLE_PTS = ("wire", "bus", "polyline")
+
+
+def move_item(
+    tree: list, item_uuid: str, x_mm: float, y_mm: float
+) -> dict:
+    """Move any top-level item to an absolute position.
+
+    For a wire or bus the first point lands on the target and the rest follow
+    by the same delta, so the segment keeps its length and direction.
+    """
+    node = find_by_uuid(tree, item_uuid)
+    if node is None:
+        raise KeyError(f"no item with uuid {item_uuid!r} on this sheet")
+    head = head_of(node)
+    xk, yk = sch_to_file_xy(x_mm, y_mm)
+    xk, yk = round_mm(xk), round_mm(yk)
+
+    if head in _MOVABLE_AT:
+        at = find_child(node, "at")
+        if not at or len(at) < 3:
+            raise ValueError(f"{head} {item_uuid!r} has no usable (at ...)")
+        previous = [float(at[1]), float(at[2])]
+        at[1], at[2] = xk, yk
+        # A symbol's property fields carry their own (at); shift them too, or
+        # the reference text stays behind.
+        if head == "symbol":
+            dx, dy = xk - previous[0], yk - previous[1]
+            for prop in find_children(node, "property"):
+                pat = find_child(prop, "at")
+                if pat and len(pat) >= 3:
+                    pat[1] = round_mm(float(pat[1]) + dx)
+                    pat[2] = round_mm(float(pat[2]) + dy)
+        return {"kind": head, "previous_mm": previous, "position_mm": [xk, yk]}
+
+    if head in _MOVABLE_PTS:
+        pts = find_child(node, "pts")
+        xys = find_children(pts, "xy") if pts else []
+        if not xys:
+            raise ValueError(f"{head} {item_uuid!r} has no (pts ...)")
+        previous = [float(xys[0][1]), float(xys[0][2])]
+        dx, dy = xk - previous[0], yk - previous[1]
+        for xy in xys:
+            xy[1] = round_mm(float(xy[1]) + dx)
+            xy[2] = round_mm(float(xy[2]) + dy)
+        return {"kind": head, "previous_mm": previous, "position_mm": [xk, yk]}
+
+    raise ValueError(
+        f"cannot move a {head!r} item; movable kinds: "
+        f"{sorted(_MOVABLE_AT + _MOVABLE_PTS)}"
+    )
