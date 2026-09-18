@@ -18,8 +18,8 @@ asked.
 - Do not push, tag, or open PRs.
 
 ## Current backlog
-`docs/open_points.md` is the live queue, numbered P1-P7. No blockers are open;
-P1 (`replace_symbol`) is the only Major.
+`docs/open_points.md` is the live queue. P1-P7 are all closed as of
+2026-09-18 — the file records what was done and why. Nothing is outstanding.
 
 `docs/kicad_mcp_issues.md` is the original field report from the Firbox base
 board, kept for context — every heading carries its state. Do not work it
@@ -27,7 +27,7 @@ directly; it is not the queue.
 
 ## Layout
 - `server.py` — entry point; creates `FastMCP("kicad-claude")` and calls each
-  `tools/<group>.register(mcp)`. 130 tools total.
+  `tools/<group>.register(mcp)`. 131 tools total.
 - `src/kicad_claude/tools/*.py` — thin MCP tool wrappers: validate arguments,
   call an adapter, return a JSON-friendly dict.
 - `src/kicad_claude/adapters/*.py` — the real work: s-expression IO
@@ -43,14 +43,19 @@ directly; it is not the queue.
 ## File-format rules
 - Round-trip safety first: parse, mutate the tree, write back. A write must
   touch only the nodes it changed — no whole-file reformat, no re-ordering, no
-  re-indent of untouched blocks.
+  re-indent of untouched blocks. Layout comes from `adapters/kicad_prettify.py`,
+  a port of KiCAD's own `Prettify`; all 91 KiCAD 10 demo schematics round-trip
+  byte-identically. Do not hand-tune line widths there — fix the port against
+  `source_repo/kicad` instead.
 - Escape every control character on write (backslash, `"`, `\n`, `\r`, `\t`).
   `sexpdata` decodes escapes on read, so a naive dump corrupts the file.
 - Preserve existing UUIDs. Generate a new UUID only for a new item.
 - Keep the format versions KiCad 10 writes: `.kicad_sch` `20250114`,
   `.kicad_pcb` `20241229`, `.kicad_pro` `meta.version` 3.
-- Mutating tools back up to `<project>/.backups/<timestamp>_<file>` before
-  writing.
+- Mutating tools write through `adapters/safe_write.save_tree`: it refuses to
+  write while KiCAD holds a `.lck` on the project, backs up to
+  `<project>/.backups/<timestamp>_<file>` keeping the newest 10, then re-parses
+  the result and restores the backup if it does not parse.
 - Prove a write is still valid with `kicad-cli` (`sch erc`, `pcb drc`), not by
   eye.
 

@@ -12,9 +12,9 @@ traced in the source, and a suggested fix. Severity:
 - **Major** — produces ERC problems or forces manual GUI work.
 - **Minor** — cosmetic or ergonomic.
 
-**Status.** Every heading carries its state. What is still open lives in
-`docs/open_points.md` under P-numbers; this document is kept as the original
-field report and is not the working queue any more.
+**Status.** Every issue here is closed. `docs/open_points.md` records how, under
+P-numbers. This document is kept as the original field report and is not the
+working queue.
 
 ---
 
@@ -151,7 +151,7 @@ references.
 
 ---
 
-## 6. Missing edit primitives force hand edits of `.kicad_sch` (Major) — MOSTLY FIXED, rest is P1
+## 6. Missing edit primitives force hand edits of `.kicad_sch` (Major) — FIXED
 
 The tool set can add wires, labels and symbols, but cannot modify or delete most
 of them. During one session, these operations had no tool:
@@ -187,13 +187,13 @@ no-connect markers orphaned. That produced about 50 dangling items and 2
 `add_text`/`set_text`/`remove_text`, `move_item`, and
 `remove_symbol(remove_connected_wires=True)`.
 
-Still open, both from the suggestion list rather than the table:
-- `replace_symbol` — not implemented. Tracked as **P1**.
-- Autoplacing a symbol's fields — that is issue 7, still open. Tracked as **P2**.
+The two suggestions outside the table are done as well:
+- `replace_symbol` — built, see **P1**.
+- Autoplacing a symbol's fields — issue 7, see **P2**.
 
 ---
 
-## 7. Symbols placed without autoplaced fields (Minor) — OPEN, see P2
+## 7. Symbols placed without autoplaced fields (Minor) — FIXED, see P2
 
 **Observed.** Reference and value text of `add_symbol` / `add_power_symbol`
 results sat on top of the symbol origin (for example `#PWR0001` overlapping `GND`
@@ -205,7 +205,7 @@ for simple 2-pin parts. Set `(fields_autoplaced yes)` only when that is true.
 
 ---
 
-## 8. Whole-file reformat on every write (Minor) — FIXED, residue is P6
+## 8. Whole-file reformat on every write (Minor) — FIXED
 
 **Observed.** A handful of symbol and wire additions to
 `400_symetric_analog.kicad_sch` gave a git diff of about 6000 lines
@@ -222,7 +222,7 @@ byte-identical.
 
 ---
 
-## 9. `.backups/` directory grows unbounded and is not ignored (Minor) — PARTLY FIXED, see P4
+## 9. `.backups/` directory grows unbounded and is not ignored (Minor) — FIXED, see P4
 
 **Observed.** Every mutating call writes a full copy of the sheet to
 `<project>/.backups/`. One session produced 88 files there, all showing up as
@@ -235,7 +235,7 @@ untracked in git.
 
 ---
 
-## 10. Tool results don't surface post-write validity (Minor) — OPEN, see P3
+## 10. Tool results don't surface post-write validity (Minor) — FIXED, see P3
 
 Given issue 1, a cheap guard would have caught the corruption immediately.
 
@@ -255,4 +255,4 @@ stderr if it fails. Offer to restore from the backup that was just written.
   already documents this. Whether the server checks for the lock file
   (`~<project>.kicad_pro.lck`) was not verified. If it doesn't, a check in every
   mutating tool that returns a clear error would enforce this.
-  Verified 2026-09-18: there is no such check. Tracked as **P5**.
+  Verified 2026-09-18: there was no such check. Added — see **P5**.

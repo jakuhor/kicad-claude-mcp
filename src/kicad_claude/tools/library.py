@@ -22,6 +22,7 @@ from kicad_claude.indexer.kicad_libs import (
     save_cache,
 )
 from kicad_claude.indexer.search import search_footprints, search_symbols
+from kicad_claude.utils.kicad_strings import normalize_name
 
 logger = logging.getLogger("kicad-claude.tools.library")
 
@@ -61,6 +62,22 @@ def _summary(index: dict[str, Any], from_cache: bool) -> dict[str, Any]:
         "footprint_dirs": index.get("footprint_dirs", []),
     }
 
+
+# Fields that are prose for the caller to read, so KiCAD's `{brace}` escapes get
+# decoded. `lib_id` and `name` are identity — callers hand them straight back to
+# `get_symbol_details` and `add_symbol`, and `lib_symbols_has` compares them
+# against the tree, so those stay exactly as the library spells them (P7).
+READABLE_FIELDS = ("description", "keywords", "tags", "datasheet", "default_footprint")
+
+
+def _decode_readable(entry: dict) -> dict:
+    """Return `entry` with its prose fields brace-decoded, identity untouched."""
+    out = dict(entry)
+    for field in READABLE_FIELDS:
+        value = out.get(field)
+        if isinstance(value, str):
+            out[field] = normalize_name(value)
+    return out
 
 def register(mcp) -> None:
     """Register Phase 2 tools on the FastMCP instance."""
@@ -124,13 +141,19 @@ def register(mcp) -> None:
         `_score` (0–100) so the caller can judge match confidence.
         """
         idx = _ensure_index()
-        return search_symbols(query, idx, max_results=max_results)
+        return [
+            _decode_readable(e)
+            for e in search_symbols(query, idx, max_results=max_results)
+        ]
 
     @mcp.tool()
     def search_footprint(query: str, max_results: int = 10) -> list[dict]:
         """Fuzzy search across indexed footprints by lib_id, description, tags."""
         idx = _ensure_index()
-        return search_footprints(query, idx, max_results=max_results)
+        return [
+            _decode_readable(e)
+            for e in search_footprints(query, idx, max_results=max_results)
+        ]
 
     @mcp.tool()
     def get_symbol_details(lib_id: str) -> dict:
@@ -151,4 +174,9 @@ def register(mcp) -> None:
                 pins = get_symbol_pins(lib_path, meta["name"])
                 break
 
-        return {**meta, "pins": pins}
+        pins = [
+            {**pin, "name": normalize_name(pin["name"])}
+            if isinstance(pin.get("name"), str) else pin
+            for pin in pins
+        ]
+        return {**_decode_readable(meta), "pins": pins}

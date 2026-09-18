@@ -14,15 +14,15 @@ from pathlib import Path
 from kicad_claude import state
 from kicad_claude.adapters import electrical_calc as ec
 from kicad_claude.adapters import pcb_editor as ed
-from kicad_claude.adapters import sch_editor, sch_io
+from kicad_claude.adapters import safe_write
+from kicad_claude.adapters import sch_io
 
 logger = logging.getLogger("kicad-claude.tools.rf")
 
 
 def _save_with_backup(tree: list, pcb_path: Path) -> Path | None:
-    backup = sch_editor.backup_file(pcb_path)
-    sch_io.write_file(pcb_path, tree)
-    return backup
+    """Write the board through the guarded path: lock check, backup, verify."""
+    return safe_write.save_tree(tree=tree, path=pcb_path)
 
 
 def register(mcp) -> None:

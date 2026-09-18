@@ -19,6 +19,7 @@ import sexpdata
 
 from kicad_claude import state
 from kicad_claude.adapters import sch_editor as ed
+from kicad_claude.adapters import kicad_prettify
 from kicad_claude.adapters import sch_io
 from kicad_claude.indexer import kicad_libs
 from kicad_claude.templates.blank import write_blank_project, write_blank_schematic
@@ -75,7 +76,7 @@ def test_pretty_print_inline_atoms():
     import sexpdata
 
     node = [sexpdata.Symbol("at"), 39.37, 29.21, 0]
-    assert sch_io.dumps(node) == "(at 39.37 29.21 0)"
+    assert sch_io.dumps(node).rstrip("\n") == "(at 39.37 29.21 0)"
 
 
 def test_pretty_print_multiline_when_list_children():
@@ -374,7 +375,7 @@ def test_escape_control_characters():
     A TAB stays raw — that is what KiCAD itself writes.
     """
     node = [sch_io.sym("text"), "TODO:\n+ USB PD\t- \"EMI\"\\filter\r"]
-    out = sch_io.dumps(node)
+    out = sch_io.dumps(node).rstrip("\n")  # dumps ends with KiCAD's own newline
     assert "\n" not in out[out.index('"'):]  # no raw newline inside the literal
     assert out == '(text "TODO:\\n+ USB PD\t- \\"EMI\\"\\\\filter\\r")'
 
@@ -706,7 +707,7 @@ def test_dump_of_kicad_written_file_is_byte_identical():
     """parse -> dump of a file KiCAD 10 wrote must reproduce it exactly."""
     original = KICAD10_FIXTURE.read_text(encoding="utf-8")
     tree = sch_io.parse_file(KICAD10_FIXTURE)
-    assert sch_io.dumps(tree) + "\n" == original
+    assert sch_io.dumps(tree) == original
 
 
 def test_write_file_of_kicad_written_file_changes_nothing(tmp_path: Path):
@@ -722,10 +723,14 @@ def test_pts_points_are_packed_and_wrapped():
     pts = [sch_io.sym("pts")] + [
         [sch_io.sym("xy"), float(i), 0.0] for i in range(12)
     ]
-    out = sch_io.dumps([sch_io.sym("polyline"), pts], 0)
+    out = sch_io.dumps([sch_io.sym("polyline"), pts])
     point_lines = [ln for ln in out.splitlines() if ln.lstrip("\t").startswith("(xy ")]
-    assert len(point_lines) < 12          # packed, not one per line
-    assert all(len(ln) <= sch_io.LINE_WIDTH for ln in point_lines)
+    assert 1 < len(point_lines) < 40  # packed, and wrapped more than once
+
+    # A line only ends because the next point would start at or past column 99,
+    # so every line but the last must already have reached it.
+    limit = kicad_prettify.XY_SPECIAL_CASE_COLUMN_LIMIT
+    assert all(len(ln) >= limit for ln in point_lines[:-1])
 
 
 def test_data_chunks_are_one_per_line():
@@ -751,7 +756,7 @@ def test_sheet_fill_alpha_has_four_decimals():
 
 def test_float_keeps_full_precision():
     node = [sch_io.sym("at"), 59.209102362204725, 270]
-    assert sch_io.dumps(node) == "(at 59.209102362204725 270)"
+    assert sch_io.dumps(node).rstrip("\n") == "(at 59.209102362204725 270)"
 
 
 # --------------------------------------------------------------------------- #
@@ -1327,3 +1332,369 @@ def test_text_label_and_move_edits_still_pass_erc(tmp_path, monkeypatch):
         capture_output=True, text=True, timeout=60, cwd=tmp_path,
     )
     assert r.returncode == 0, f"erc failed: stderr={r.stderr}"
+
+
+# --------------------------------------------------------------------------- #
+# P1 — replace_symbol
+# --------------------------------------------------------------------------- #
+
+
+def _wired_resistor(mcp, blank_project, ref="R1", lib="MiniLib:Resistor"):
+    """Place a resistor and run a wire off each of its two pins."""
+    _call(mcp, "add_symbol", lib_id=lib, reference=ref, value="10k",
+          x_mm=100.33, y_mm=100.33)
+    pins = {p["number"]: p["position_mm"] for p in _call(mcp, "list_pins", reference=ref)}
+    for num, (px, py) in pins.items():
+        _call(mcp, "add_wire", x1_mm=px, y1_mm=py, x2_mm=px + 25.4, y2_mm=py,
+              snap_to_grid=False)
+    return pins
+
+
+class TestReplaceSymbol:
+    def test_identity_swap_keeps_position_and_reference(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=100.33, y_mm=100.33)
+        before = sch_io.parse_file(blank_project["sch"])
+        old = ed.find_symbol_by_reference(before, "R1")
+        old_at = list(sch_io.find_child(old, "at")[1:4])
+        old_uuid = ed.get_uuid(old)
+
+        res = _call(mcp, "replace_symbol", reference="R1", lib_id="MiniLib:R_Small")
+        assert res["from_lib_id"] == "MiniLib:Resistor"
+        assert res["to_lib_id"] == "MiniLib:R_Small"
+
+        after = sch_io.parse_file(blank_project["sch"])
+        new = ed.find_symbol_by_reference(after, "R1")
+        assert list(sch_io.find_child(new, "at")[1:4]) == old_at
+        assert ed.get_uuid(new) == old_uuid, "uuid must survive — the PCB keys off it"
+        assert sch_io.find_child(new, "lib_id")[1] == "MiniLib:R_Small"
+
+    def test_value_carries_over_unless_overridden(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=100.33, y_mm=100.33)
+        _call(mcp, "replace_symbol", reference="R1", lib_id="MiniLib:R_Small")
+        assert _call(mcp, "get_symbol_properties", reference="R1")["properties"]["Value"] == "10k"
+
+        _call(mcp, "replace_symbol", reference="R1", lib_id="MiniLib:Resistor",
+              value="22k")
+        assert _call(mcp, "get_symbol_properties", reference="R1")["properties"]["Value"] == "22k"
+
+    def test_flags_survive_the_swap(self, blank_project, tmp_path, monkeypatch):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=100.33, y_mm=100.33)
+        _call(mcp, "set_dnp", reference="R1")
+        _call(mcp, "set_in_bom", reference="R1", in_bom=False)
+        _call(mcp, "replace_symbol", reference="R1", lib_id="MiniLib:R_Small")
+
+        flags = _call(mcp, "get_symbol_properties", reference="R1")["flags"]
+        assert flags["dnp"] is True
+        assert flags["in_bom"] is False
+
+    def test_wires_follow_pins_to_their_new_positions(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        """Resistor_Wide's pins sit 5.08 mm out, not 2.54 — the wires must move."""
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        before = _wired_resistor(mcp, blank_project)
+
+        res = _call(mcp, "replace_symbol", reference="R1",
+                    lib_id="MiniLib:Resistor_Wide")
+        assert res["left_dangling"] == []
+        assert res["new_pins_unconnected"] == []
+        assert {r["items_moved"] for r in res["reconnected"]} == {1}
+
+        after = {p["number"]: p["position_mm"]
+                 for p in _call(mcp, "list_pins", reference="R1")}
+        assert after != before
+
+        # Every wire end that sat on a pin now sits on the new pin.
+        tree = sch_io.parse_file(blank_project["sch"])
+        ends = set()
+        for node in tree[1:]:
+            if sch_io.head_of(node) == "wire":
+                for xy in sch_io.find_children(sch_io.find_child(node, "pts"), "xy"):
+                    ends.add((round(float(xy[1]), 4), round(float(xy[2]), 4)))
+        for pos in after.values():
+            assert (round(pos[0], 4), round(pos[1], 4)) in ends
+
+    def test_connectivity_survives_the_swap(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        """The point of the tool: the nets are the same afterwards."""
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _wired_resistor(mcp, blank_project)
+        before = {n["name"]: len(n["pins"]) for n in _call(mcp, "list_sch_nets")["nets"]}
+
+        _call(mcp, "replace_symbol", reference="R1", lib_id="MiniLib:Resistor_Wide")
+
+        after = {n["name"]: len(n["pins"]) for n in _call(mcp, "list_sch_nets")["nets"]}
+        assert after == before
+
+    def test_explicit_pin_map_can_swap_pins(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _wired_resistor(mcp, blank_project)
+        res = _call(mcp, "replace_symbol", reference="R1",
+                    lib_id="MiniLib:Resistor_Wide",
+                    pin_map={"1": "2", "2": "1"})
+        pairs = {(r["from_pin"], r["to_pin"]) for r in res["reconnected"]}
+        assert pairs == {("1", "2"), ("2", "1")}
+        assert res["left_dangling"] == []
+
+    def test_dropped_pin_is_reported_not_hidden(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        """ESP32_Demo has 3 pins, Resistor has 2 — pin 3's wire must be flagged."""
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:ESP32_Demo", reference="U1",
+              value="ESP32", x_mm=100.33, y_mm=100.33)
+        pins = {p["number"]: p["position_mm"]
+                for p in _call(mcp, "list_pins", reference="U1")}
+        px, py = pins["3"]
+        _call(mcp, "add_wire", x1_mm=px, y1_mm=py, x2_mm=px + 25.4, y2_mm=py,
+              snap_to_grid=False)
+
+        res = _call(mcp, "replace_symbol", reference="U1", lib_id="MiniLib:Resistor",
+                    pin_map={"1": "1", "2": "2"})
+        assert [d["pin"] for d in res["left_dangling"]] == ["3"]
+        assert "wire" in res["left_dangling"][0]["items"]
+
+    def test_new_pins_nothing_reached_are_listed(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=100.33, y_mm=100.33)
+        res = _call(mcp, "replace_symbol", reference="R1",
+                    lib_id="MiniLib:ESP32_Demo", pin_map={"1": "1"})
+        assert res["new_pins_unconnected"] == ["2", "3"]
+
+    def test_unknown_reference_raises(self, blank_project, tmp_path, monkeypatch):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        with pytest.raises(KeyError, match="R99"):
+            _call(mcp, "replace_symbol", reference="R99", lib_id="MiniLib:Resistor")
+
+    def test_pin_map_naming_an_absent_old_pin_raises(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=100.33, y_mm=100.33)
+        with pytest.raises(KeyError, match="does not have"):
+            _call(mcp, "replace_symbol", reference="R1",
+                  lib_id="MiniLib:Resistor_Wide", pin_map={"9": "1"})
+
+    def test_rejected_call_leaves_the_symbol_untouched(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        """A raised pin_map error must not leave a half-swapped symbol behind."""
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=100.33, y_mm=100.33)
+        with pytest.raises(KeyError):
+            _call(mcp, "replace_symbol", reference="R1",
+                  lib_id="MiniLib:Resistor_Wide", pin_map={"1": "9"})
+
+        tree = sch_io.parse_file(blank_project["sch"])
+        s = ed.find_symbol_by_reference(tree, "R1")
+        assert sch_io.find_child(s, "lib_id")[1] == "MiniLib:Resistor"
+
+    def test_lib_symbols_gains_the_new_definition(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=100.33, y_mm=100.33)
+        _call(mcp, "replace_symbol", reference="R1", lib_id="MiniLib:Resistor_Wide")
+        tree = sch_io.parse_file(blank_project["sch"])
+        assert ed.find_lib_symbol_def(tree, "MiniLib:Resistor_Wide") is not None
+
+
+@pytest.mark.slow
+def test_replace_symbol_still_passes_erc(tmp_path, monkeypatch):
+    """A swap that reconnects every pin must leave the sheet ERC-clean."""
+    cli = find_kicad_cli()
+    if not cli:
+        pytest.skip("no kicad-cli available")
+    state.clear_active()
+    files = write_blank_project(tmp_path / "swap", "swap")
+    state.set_active(tmp_path / "swap", "swap")
+    try:
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=100.33, y_mm=100.33)
+        pins = {p["number"]: p["position_mm"]
+                for p in _call(mcp, "list_pins", reference="R1")}
+        for num in pins:
+            _call(mcp, "add_no_connect", reference="R1", pin=num)
+        res = _call(mcp, "replace_symbol", reference="R1",
+                    lib_id="MiniLib:Resistor_Wide")
+        assert res["left_dangling"] == []
+        sch_path = files["sch"]
+    finally:
+        state.clear_active()
+
+    r = subprocess.run(
+        [str(cli), "sch", "erc", str(sch_path)],
+        capture_output=True, text=True, timeout=60, cwd=tmp_path,
+    )
+    assert r.returncode == 0, f"erc failed: stderr={r.stderr}"
+
+
+# --------------------------------------------------------------------------- #
+# P2 — symbol fields placed from the library's own offsets
+# --------------------------------------------------------------------------- #
+
+
+def _field_at(symbol_node: list, name: str) -> list:
+    for prop in sch_io.find_children(symbol_node, "property"):
+        i = sch_io.property_name_index(prop)
+        if len(prop) > i and prop[i] == name:
+            return sch_io.find_child(prop, "at")
+    raise AssertionError(f"no {name} property")
+
+
+class TestLibraryFieldOffsets:
+    def test_reads_reference_and_value_only(self):
+        sym_def = ed.fetch_symbol_def(FIXTURES / "MiniLib.kicad_sym", "Resistor")
+        offsets = ed.library_field_offsets(sym_def)
+        assert set(offsets) == {"Reference", "Value"}
+
+    def test_reports_the_libraries_own_numbers(self):
+        sym_def = ed.fetch_symbol_def(FIXTURES / "MiniLib.kicad_sym", "Resistor")
+        ref = ed.library_field_offsets(sym_def)["Reference"]
+        assert (ref["dx"], ref["dy"], ref["angle"]) == (0.0, 0.0, 0.0)
+
+    def test_a_part_with_placed_fields_reports_them(self, tmp_path):
+        """The official Device:C places its Reference above the body."""
+        lib = Path("C:/Program Files/KiCad/10.0/share/kicad/symbols/Device.kicad_sym")
+        if not lib.is_file():
+            pytest.skip("KiCAD symbol libraries not installed")
+        offsets = ed.library_field_offsets(ed.fetch_symbol_def(lib, "C"))
+        assert offsets["Reference"]["dy"] == 2.54
+        assert offsets["Value"]["dy"] == -2.54
+        assert offsets["Reference"]["justify"] == ["left"]
+
+
+class TestPlaceLibraryOffset:
+    def test_no_rotation_subtracts_y(self):
+        """Library +Y is up on screen, file +Y is down."""
+        assert ed.place_library_offset(100.0, 50.0, 0, 0.635, 2.54) == (100.635, 47.46)
+
+    def test_ninety_degrees(self):
+        """Measured against KiCAD: 29 rotated demo symbols land exactly here."""
+        assert ed.place_library_offset(100.0, 50.0, 90, 0.0, 2.54) == (97.46, 50.0)
+
+    def test_one_eighty_negates(self):
+        assert ed.place_library_offset(100.0, 50.0, 180, 0.635, 2.54) == (99.365, 52.54)
+
+
+class TestTextAngle:
+    def test_stays_within_half_a_turn(self):
+        assert ed.text_angle(0, 0) == 0
+        assert ed.text_angle(0, 90) == 90
+        assert ed.text_angle(90, 90) == 0
+        assert ed.text_angle(0, 180) == 0
+        assert ed.text_angle(90, 270) == 0
+
+
+class TestFieldsAutoplaced:
+    def test_we_do_not_claim_kicad_autoplace(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        """Library offsets are not KiCAD's autoplace, so the flag stays off."""
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:ESP32_Demo", reference="U1",
+              value="ESP32", x_mm=100.33, y_mm=100.33)
+        tree = sch_io.parse_file(blank_project["sch"])
+        s = ed.find_symbol_by_reference(tree, "U1")
+        assert sch_io.find_child(s, "fields_autoplaced") is None
+
+    def test_fields_no_longer_all_sit_on_the_origin(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        """Issue 7: Reference and Value used to land exactly on the symbol origin."""
+        lib = Path("C:/Program Files/KiCad/10.0/share/kicad/symbols/Device.kicad_sym")
+        if not lib.is_file():
+            pytest.skip("KiCAD symbol libraries not installed")
+        tree = sch_io.parse_file(blank_project["sch"])
+        ed.add_symbol(
+            tree, qualified_lib_id="Device:C", reference="C1", value="100n",
+            x_mm=100.33, y_mm=100.33, rotation=0,
+            sym_def_node=ed.fetch_symbol_def(lib, "C"), project_name="demo",
+        )
+        s = ed.find_symbol_by_reference(tree, "C1")
+        origin = sch_io.find_child(s, "at")
+        ref_at = _field_at(s, "Reference")
+        val_at = _field_at(s, "Value")
+
+        assert [ref_at[1], ref_at[2]] != [origin[1], origin[2]]
+        assert [val_at[1], val_at[2]] != [origin[1], origin[2]]
+        # Reference above the body, Value below — KiCAD's own layout for a cap.
+        assert float(ref_at[2]) < float(origin[2])
+        assert float(val_at[2]) > float(origin[2])
+
+    def test_offsets_rotate_with_the_symbol(self, blank_project):
+        lib = Path("C:/Program Files/KiCad/10.0/share/kicad/symbols/Device.kicad_sym")
+        if not lib.is_file():
+            pytest.skip("KiCAD symbol libraries not installed")
+        sym_def = ed.fetch_symbol_def(lib, "C")
+        tree = sch_io.parse_file(blank_project["sch"])
+        ed.add_symbol(
+            tree, qualified_lib_id="Device:C", reference="C1", value="100n",
+            x_mm=100.33, y_mm=100.33, rotation=90,
+            sym_def_node=sym_def, project_name="demo",
+        )
+        s = ed.find_symbol_by_reference(tree, "C1")
+        origin = sch_io.find_child(s, "at")
+        ref_at = _field_at(s, "Reference")
+        # Device:C places Reference at (0.635, 2.54). A quarter turn sends the
+        # 2.54 into x and leaves only the 0.635 in y.
+        assert float(ref_at[1]) == pytest.approx(float(origin[1]) - 2.54)
+        assert float(ref_at[2]) == pytest.approx(float(origin[2]) - 0.635)
+
+    def test_justify_carries_over_from_the_library(self, blank_project):
+        lib = Path("C:/Program Files/KiCad/10.0/share/kicad/symbols/Device.kicad_sym")
+        if not lib.is_file():
+            pytest.skip("KiCAD symbol libraries not installed")
+        tree = sch_io.parse_file(blank_project["sch"])
+        ed.add_symbol(
+            tree, qualified_lib_id="Device:C", reference="C1", value="100n",
+            x_mm=100.33, y_mm=100.33, rotation=0,
+            sym_def_node=ed.fetch_symbol_def(lib, "C"), project_name="demo",
+        )
+        s = ed.find_symbol_by_reference(tree, "C1")
+        for prop in sch_io.find_children(s, "property"):
+            i = sch_io.property_name_index(prop)
+            if prop[i] == "Reference":
+                eff = sch_io.find_child(prop, "effects")
+                just = sch_io.find_child(eff, "justify")
+                assert just is not None and str(just[1]) == "left"
+                return
+        raise AssertionError("Reference property missing")
+
+    def test_power_symbol_fields_are_placed_too(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        """`#PWR0001` used to sit on top of the GND graphic."""
+        lib = Path("C:/Program Files/KiCad/10.0/share/kicad/symbols/power.kicad_sym")
+        if not lib.is_file():
+            pytest.skip("KiCAD symbol libraries not installed")
+        tree = sch_io.parse_file(blank_project["sch"])
+        ed.add_symbol(
+            tree, qualified_lib_id="power:GND", reference="#PWR0001", value="GND",
+            x_mm=100.33, y_mm=100.33, rotation=0,
+            sym_def_node=ed.fetch_symbol_def(lib, "GND"), project_name="demo",
+        )
+        s = ed.find_symbol_by_reference(tree, "#PWR0001")
+        origin = sch_io.find_child(s, "at")
+        ref_at = _field_at(s, "Reference")
+        assert [ref_at[1], ref_at[2]] != [origin[1], origin[2]]

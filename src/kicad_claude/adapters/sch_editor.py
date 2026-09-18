@@ -12,9 +12,7 @@ Callers snap to the 1.27 mm grid before calling (see `tools/schematic.py`).
 
 from __future__ import annotations
 
-import shutil
 import uuid
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -46,16 +44,14 @@ from kicad_claude.utils.geometry import (
 
 
 def backup_file(path: Path) -> Path | None:
-    """Copy `path` to `<project>/.backups/<timestamp>_<filename>`. Idempotent if file missing."""
-    path = Path(path)
-    if not path.is_file():
-        return None
-    backups = path.parent / ".backups"
-    backups.mkdir(exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    dest = backups / f"{stamp}_{path.name}"
-    shutil.copy2(path, dest)
-    return dest
+    """Copy `path` to `<project>/.backups/<timestamp>_<filename>`.
+
+    Kept as the adapter-level entry point; the retention limit and the rest of
+    the guarded write live in `adapters/safe_write.py`.
+    """
+    from kicad_claude.adapters import safe_write
+
+    return safe_write.backup_file(path)
 
 
 # --------------------------------------------------------------------------- #
@@ -297,6 +293,57 @@ def collect_pin_numbers(symbol_def_node: list) -> list[str]:
     return pins
 
 
+# Fields KiCAD positions on placement. The rest are metadata and stay hidden
+# at the origin, which is where KiCAD puts them too.
+AUTOPLACED_FIELDS = ("Reference", "Value")
+
+
+def library_field_offsets(sym_def_node: list) -> dict[str, dict]:
+    """Read a library symbol's own field placements.
+
+    Returns `{name: {"dx", "dy", "angle", "justify"}}` in library coordinates,
+    relative to the symbol origin. A part that places nothing returns nothing,
+    and the caller falls back to the origin.
+    """
+    out: dict[str, dict] = {}
+    for prop in find_children(sym_def_node, "property"):
+        i = property_name_index(prop)
+        if len(prop) <= i or not isinstance(prop[i], str):
+            continue
+        name = prop[i]
+        if name not in AUTOPLACED_FIELDS:
+            continue
+        at = find_child(prop, "at")
+        if not at or len(at) < 3:
+            continue
+        effects = find_child(prop, "effects")
+        justify_node = find_child(effects, "justify") if effects else None
+        out[name] = {
+            "dx": float(at[1]),
+            "dy": float(at[2]),
+            "angle": float(at[3]) if len(at) > 3 else 0.0,
+            "justify": [str(x) for x in justify_node[1:]] if justify_node else None,
+        }
+    return out
+
+
+def place_library_offset(
+    x_k: float, y_k: float, rotation_deg: float, dx: float, dy: float
+) -> tuple[float, float]:
+    """Put a library-local offset on the sheet, rotated with the instance.
+
+    Same transform the pins use: library Y runs the same way as sheet Y, and
+    `rotate_xy` works in the maths sense, so the Y term is subtracted.
+    """
+    rx, ry = rotate_xy(dx, dy, rotation_deg)
+    return round_mm(x_k + rx), round_mm(y_k - ry)
+
+
+def text_angle(library_angle: float, rotation_deg: float) -> int:
+    """Field text reads at 0 or 90 degrees only — KiCAD writes nothing else."""
+    return int((library_angle + rotation_deg) % 180)
+
+
 def build_symbol_instance(
     qualified_lib_id: str,
     reference: str,
@@ -310,23 +357,46 @@ def build_symbol_instance(
     footprint: str = "",
     datasheet: str = "~",
     description: str = "",
+    field_offsets: dict[str, dict] | None = None,
 ) -> list:
-    """Construct a new (symbol ...) instance node ready to inject into the schematic."""
+    """Construct a new (symbol ...) instance node ready to inject into the schematic.
+
+    `field_offsets` comes from `library_field_offsets(sym_def)`. Given it, the
+    Reference and Value text is placed where the library part says it belongs,
+    rotated with the instance. Without it every field lands on the symbol
+    origin, which is what produced `#PWR0001` sitting on top of the GND
+    graphic (issue 7).
+
+    `(fields_autoplaced yes)` is deliberately NOT written. KiCAD's autoplace is
+    its own algorithm over pin sides and bounding boxes, not a rotation of the
+    library offsets: across KiCAD 10's demo schematics, 29 rotated symbols land
+    exactly on the rotated library offset and 535 do not. Claiming the flag
+    would assert something that was not done. The offsets are a large
+    improvement on stacking every field at the origin, and "Autoplace Fields"
+    in the GUI still does the real thing.
+    """
     x_k, y_k = sch_to_file_xy(x_mcp, y_mcp)
     x_k, y_k = round_mm(x_k), round_mm(y_k)
 
     inst_uuid = str(uuid.uuid4())
+    offsets = field_offsets or {}
 
-    # Properties — text positioned at the symbol origin; KiCAD will adjust on first
-    # render. We hide Footprint/Datasheet/Description since they are mostly metadata.
     def _prop(name: str, val: str, hide: bool) -> list:
-        node: list[Any] = [
-            sym("property"),
-            name,
-            val,
-            [sym("at"), x_k, y_k, 0],
-        ]
+        spec = offsets.get(name)
+        if spec is None:
+            at = [sym("at"), x_k, y_k, 0]
+            justify = None
+        else:
+            fx, fy = place_library_offset(
+                x_k, y_k, rotation_deg, spec["dx"], spec["dy"]
+            )
+            at = [sym("at"), fx, fy, text_angle(spec["angle"], rotation_deg)]
+            justify = spec.get("justify")
+
+        node: list[Any] = [sym("property"), name, val, at]
         effects: list[Any] = [sym("effects"), [sym("font"), [sym("size"), 1.27, 1.27]]]
+        if justify:
+            effects.append([sym("justify"), *(sym(j) for j in justify)])
         if hide:
             effects.append([sym("hide"), sym("yes")])
         node.append(effects)
@@ -414,6 +484,7 @@ def add_symbol(
 
     pins = collect_pin_numbers(lib_entry_def)
     instance = build_symbol_instance(
+        field_offsets=library_field_offsets(lib_entry_def),
         qualified_lib_id=qualified_lib_id,
         reference=reference,
         value=value,
@@ -1442,3 +1513,221 @@ def move_item(
         f"cannot move a {head!r} item; movable kinds: "
         f"{sorted(_MOVABLE_AT + _MOVABLE_PTS)}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Symbol replacement
+# --------------------------------------------------------------------------- #
+
+
+def _items_at_point(tree: list, point: tuple[float, float], tol: float = 1e-4) -> list[dict]:
+    """Every wire end, junction, no-connect and label sitting on `point`."""
+    from kicad_claude.adapters import sch_netlist
+
+    found: list[dict] = []
+    px, py = point
+    for node in tree[1:]:
+        if not isinstance(node, list):
+            continue
+        head = head_of(node)
+        if head in ("wire", "bus"):
+            pts = find_child(node, "pts")
+            for xy in find_children(pts, "xy") if pts else []:
+                if abs(float(xy[1]) - px) <= tol and abs(float(xy[2]) - py) <= tol:
+                    found.append({"kind": head, "node": node, "xy": xy})
+        elif head in ("junction", "no_connect") + sch_netlist.LABEL_KINDS:
+            at = find_child(node, "at")
+            if (
+                at
+                and len(at) >= 3
+                and abs(float(at[1]) - px) <= tol
+                and abs(float(at[2]) - py) <= tol
+            ):
+                found.append({"kind": head, "node": node, "at": at})
+    return found
+
+
+def _move_items_at_point(
+    tree: list, old: tuple[float, float], new: tuple[float, float]
+) -> int:
+    """Drag everything attached at `old` to `new`. Returns how many moved."""
+    items = _items_at_point(tree, old)
+    if old == new:
+        return len(items)
+    for item in items:
+        if "xy" in item:
+            item["xy"][1], item["xy"][2] = round_mm(new[0]), round_mm(new[1])
+        else:
+            item["at"][1], item["at"][2] = round_mm(new[0]), round_mm(new[1])
+    return len(items)
+
+
+def replace_symbol(
+    tree: list,
+    reference: str,
+    *,
+    qualified_lib_id: str,
+    sym_def_node: list,
+    pin_map: dict[str, str] | None = None,
+    value: str | None = None,
+    footprint: str | None = None,
+    datasheet: str | None = None,
+    description: str | None = None,
+) -> dict:
+    """Swap a placed symbol's library part, keeping what identifies it.
+
+    Kept: reference, position, rotation, mirror, unit, uuid and the whole
+    `(instances ...)` block — so the symbol stays the same symbol to KiCAD and
+    to the PCB. Kept unless overridden: Value, Footprint, Datasheet,
+    Description.
+
+    `pin_map` maps old pin number to new pin number. Wires, junctions,
+    no-connects and labels sitting on a mapped pin move to where that pin is on
+    the new part. An unmapped old pin keeps whatever was attached to it exactly
+    where it is, which usually leaves it dangling — the caller gets told, it is
+    not silently dropped. Omitting `pin_map` maps every pin number that exists
+    on both parts to itself.
+
+    Mappings are applied in pin-number order, and a point is consumed by the
+    first pin that claims it. Where two pins of the old part sat on the same
+    point — which KiCAD allows — only the first mapping moves what was there.
+
+    Returns a report: which pins moved, which were left, and which pins of the
+    new part nothing reached.
+    """
+    from kicad_claude.adapters import sch_netlist
+
+    old_node = find_symbol_by_reference(tree, reference)
+    if old_node is None:
+        raise KeyError(f"no symbol with reference {reference!r}")
+
+    old_lib_node = find_child(old_node, "lib_id")
+    old_lib_id = old_lib_node[1] if old_lib_node and len(old_lib_node) > 1 else ""
+
+    old_pins = {
+        p["number"]: p["point"] for p in sch_netlist.pins_of_instance(tree, old_node)
+    }
+
+    # Everything that makes this symbol *this* symbol stays.
+    at_node = find_child(old_node, "at")
+    if not at_node or len(at_node) < 3:
+        raise ValueError(f"symbol {reference!r} has malformed (at ...)")
+    keep_at = [at_node[1], at_node[2], at_node[3] if len(at_node) > 3 else 0]
+    keep_uuid = get_uuid(old_node)
+    keep_instances = find_child(old_node, "instances")
+    keep_mirror = find_child(old_node, "mirror")
+    keep_unit = find_child(old_node, "unit")
+    keep_flags = {f: get_symbol_flag(old_node, f) for f in SYMBOL_FLAGS}
+
+    old_props = {}
+    for prop in find_children(old_node, "property"):
+        i = property_name_index(prop)
+        if len(prop) > i + 1 and isinstance(prop[i], str):
+            old_props[prop[i]] = prop[i + 1]
+
+    # Build the replacement.
+    lib_entry_def = make_lib_symbol_entry(sym_def_node, qualified_lib_id)
+    inject_lib_symbol(tree, lib_entry_def)
+    new_pin_numbers = collect_pin_numbers(lib_entry_def)
+
+    new_node = build_symbol_instance(
+        field_offsets=library_field_offsets(lib_entry_def),
+        qualified_lib_id=qualified_lib_id,
+        reference=reference,
+        value=value if value is not None else old_props.get("Value", ""),
+        x_mcp=float(keep_at[0]),
+        y_mcp=float(keep_at[1]),
+        rotation_deg=normalize_rotation(float(keep_at[2])),
+        pin_numbers=new_pin_numbers,
+        project_name="",
+        instance_path="/",
+        footprint=footprint if footprint is not None else old_props.get("Footprint", ""),
+        datasheet=datasheet if datasheet is not None else old_props.get("Datasheet", "~"),
+        description=(
+            description if description is not None else old_props.get("Description", "")
+        ),
+    )
+
+    # Restore identity onto the new node.
+    if keep_uuid:
+        u = find_child(new_node, "uuid")
+        if u and len(u) >= 2:
+            u[1] = keep_uuid
+    new_instances = find_child(new_node, "instances")
+    if keep_instances is not None and new_instances is not None:
+        new_node[new_node.index(new_instances)] = keep_instances
+    if keep_unit is not None:
+        n_unit = find_child(new_node, "unit")
+        if n_unit is not None and len(n_unit) >= 2 and len(keep_unit) >= 2:
+            n_unit[1] = keep_unit[1]
+    if keep_mirror is not None:
+        # `(mirror ...)` follows `(at ...)` in KiCAD's order.
+        n_at = find_child(new_node, "at")
+        new_node.insert(new_node.index(n_at) + 1, list(keep_mirror))
+    for flag, on in keep_flags.items():
+        set_symbol_flag(new_node, flag, on)
+
+    # Swap it in place, so the file's ordering does not churn.
+    tree[tree.index(old_node)] = new_node
+
+    new_pins = {
+        p["number"]: p["point"] for p in sch_netlist.pins_of_instance(tree, new_node)
+    }
+
+    if pin_map is None:
+        pin_map = {num: num for num in old_pins if num in new_pins}
+
+    unknown_old = sorted(set(pin_map) - set(old_pins))
+    unknown_new = sorted(set(pin_map.values()) - set(new_pins))
+    if unknown_old or unknown_new:
+        # Put the original back before complaining — a rejected call must not
+        # leave a half-swapped symbol behind.
+        tree[tree.index(new_node)] = old_node
+        if unknown_old:
+            raise KeyError(
+                f"pin_map names pins {unknown_old} that {old_lib_id!r} does not have"
+            )
+        raise KeyError(
+            f"pin_map names pins {unknown_new} that {qualified_lib_id!r} does not have"
+        )
+
+    reconnected: list[dict] = []
+    for old_num, new_num in sorted(pin_map.items()):
+        old_point, new_point = old_pins[old_num], new_pins[new_num]
+        moved = _move_items_at_point(tree, old_point, new_point)
+        reconnected.append(
+            {
+                "from_pin": old_num,
+                "to_pin": new_num,
+                "items_moved": moved,
+                "from_mm": list(old_point),
+                "to_mm": list(new_point),
+            }
+        )
+
+    # Old pins nobody mapped: whatever sat on them stays put and now dangles.
+    left_behind: list[dict] = []
+    mapped_targets = set(pin_map.values())
+    for old_num, old_point in sorted(old_pins.items()):
+        if old_num in pin_map:
+            continue
+        attached = _items_at_point(tree, old_point)
+        if attached:
+            left_behind.append(
+                {
+                    "pin": old_num,
+                    "position_mm": list(old_point),
+                    "items": sorted({i["kind"] for i in attached}),
+                }
+            )
+
+    unconnected_new = sorted(num for num in new_pins if num not in mapped_targets)
+
+    return {
+        "reference": reference,
+        "from_lib_id": old_lib_id,
+        "to_lib_id": qualified_lib_id,
+        "reconnected": reconnected,
+        "left_dangling": left_behind,
+        "new_pins_unconnected": unconnected_new,
+    }

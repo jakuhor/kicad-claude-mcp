@@ -1,7 +1,7 @@
 """Phase 3 — schematic editing tools.
 
 Tools (all operate on the active project's `.kicad_sch`):
-    add_symbol, remove_symbol, move_symbol
+    add_symbol, remove_symbol, move_symbol, replace_symbol
     add_wire, remove_wire, add_label, add_no_connect, add_power_symbol
     add_junction, remove_junction, remove_no_connect, remove_items_in_box
     get_symbol_properties, set_symbol_property, remove_symbol_property
@@ -26,6 +26,7 @@ from pathlib import Path
 
 from kicad_claude import state
 from kicad_claude.adapters import sch_editor as ed
+from kicad_claude.adapters import safe_write
 from kicad_claude.adapters import sch_io
 from kicad_claude.adapters import sch_netlist as netlist
 from kicad_claude.templates.blank import write_blank_schematic
@@ -56,9 +57,8 @@ def _load_active_schematic() -> tuple[list, Path]:
 
 
 def _save_with_backup(tree: list, sch_path: Path) -> Path | None:
-    backup = ed.backup_file(sch_path)
-    sch_io.write_file(sch_path, tree)
-    return backup
+    """Write the sheet through the guarded path: lock check, backup, verify."""
+    return safe_write.save_tree(tree=tree, path=sch_path)
 
 
 def _root_uuid(proj_sch_path: Path) -> str:
@@ -477,6 +477,52 @@ def register(mcp) -> None:
         tree, _ = _load_active_schematic()
         x, y = ed.get_pin_position(tree, reference, pin)
         return {"reference": reference, "pin": pin, "position_mm": [x, y]}
+
+    @mcp.tool()
+    def replace_symbol(
+        reference: str,
+        lib_id: str,
+        pin_map: dict[str, str] | None = None,
+        value: str | None = None,
+    ) -> dict:
+        """Swap a placed symbol's library part, keeping its identity and wiring.
+
+        Kept: reference, position, rotation, mirror, unit, uuid, the
+        `(instances ...)` block and the dnp / in_bom / on_board flags. The
+        symbol stays the same symbol to KiCAD, so the PCB keeps its footprint
+        association. Value, Footprint, Datasheet and Description carry over
+        unless `value` overrides.
+
+        `pin_map` maps old pin number to new pin number, e.g. `{"1": "2"}`.
+        Wires, junctions, no-connects and labels on a mapped pin move to that
+        pin's new position. Omit it to map every pin number the two parts share.
+
+        An old pin with no mapping keeps whatever was attached where it is,
+        which normally leaves it dangling — the result lists those under
+        `left_dangling` rather than dropping them. `new_pins_unconnected` lists
+        pins of the new part nothing reached. Check both, then `run_erc`.
+        """
+        tree, path = _load_active_schematic()
+        lib_path, sym_name, meta = _resolve_lib_symbol(lib_id)
+        sym_def = ed.fetch_symbol_def(lib_path, sym_name)
+
+        result = ed.replace_symbol(
+            tree,
+            reference,
+            qualified_lib_id=lib_id,
+            sym_def_node=sym_def,
+            pin_map=pin_map,
+            value=value,
+        )
+        backup = _save_with_backup(tree, path)
+        logger.info(
+            "replaced %s: %s -> %s (%d pins reconnected, %d left dangling)",
+            reference, result["from_lib_id"], lib_id,
+            len(result["reconnected"]), len(result["left_dangling"]),
+        )
+        result["sheet"] = state.get_active_sheet_filename() or "root"
+        result["backup"] = str(backup) if backup else None
+        return result
 
     # ----- Connectivity (derived, read-only) ------------------------------ #
 

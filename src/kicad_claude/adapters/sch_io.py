@@ -15,9 +15,7 @@ from typing import Any
 
 import sexpdata
 
-# KiCAD wraps its own output at this column (a tab counts as one column).
-# 118 is the longest line KiCAD 10 emits in its own demo schematics.
-LINE_WIDTH = 118
+from kicad_claude.adapters import kicad_prettify
 
 # --------------------------------------------------------------------------- #
 # Parsing
@@ -48,77 +46,38 @@ def parse_file(path: Path) -> list:
 # --------------------------------------------------------------------------- #
 
 
-def dumps(node: Any, indent: int = 0, path: tuple[str, ...] = ()) -> str:
+def dumps(node: Any) -> str:
     """Serialize a parsed s-expression tree the way KiCAD 10 writes it.
 
-    Rules (measured against KiCAD 10's own output — see
-    `docs/issue8_formatting_probe.md`):
-      - Atom-only lists are inline:               (at 39.37 29.21 0)
-      - An inline list longer than `LINE_WIDTH` wraps onto continuation lines
-        indented one level, with the closing `)` on its own line. That is how
-        `(members ...)` and the base64 chunks of `(data ...)` are written.
-      - `(pts ...)` keeps its head alone and packs the points, several to a
-        line, wrapping at the same width.
-      - A sheet's background alpha is written with four decimals:
-        `(sheet ... (fill (color 0 0 0 0.0000)))`.
-      - Other lists with sublists put head + leading atoms on the first line,
-        then each child on its own indented line.
-      - Tab indentation, one tab per level (a tab counts as one column).
-      - Closing `)` on its own line at parent indent.
+    Two steps, matching KiCAD's own: serialize the tree flat, then run it
+    through the port of KiCAD's prettifier in `kicad_prettify.py`. That is how
+    KiCAD does it — `OUTPUTFORMATTER` writes the tokens and
+    `PRETTIFIED_FILE_OUTPUTFORMATTER` lays them out — so our layout matches by
+    construction instead of by measured rules.
 
-    `path` carries the heads of the enclosing nodes; callers pass nothing.
+    `FORMAT_MODE.NORMAL` is what KiCAD uses for schematics and boards unless the
+    `CompactSave` advanced setting is on, and it is off by default.
+    """
+    return kicad_prettify.prettify(dumps_flat(node), kicad_prettify.FormatMode.NORMAL)
+
+
+def dumps_flat(node: Any, path: tuple[str, ...] = ()) -> str:
+    """Serialize the tree to one line, tokens separated by single spaces.
+
+    The prettifier inserts every newline, so this only has to produce
+    well-formed text with the atoms spelled the way KiCAD spells them.
     """
     if not isinstance(node, list):
         return _atom(node)
     if not node:
         return "()"
 
-    inner_pad = "\t" * (indent + 1)
-    outer_pad = "\t" * indent
     head = head_of(node)
+    if head == "color" and path[-2:] == ("sheet", "fill"):
+        return _sheet_fill_color(node)
+
     child_path = path + (head,) if head else path
-
-    # Find first child (after the head) that is itself a list.
-    first_list_idx: int | None = None
-    for i in range(1, len(node)):
-        if isinstance(node[i], list):
-            first_list_idx = i
-            break
-
-    if first_list_idx is None:
-        # All atoms — one line, wrapped if it gets too wide.
-        if head == "color" and path[-2:] == ("sheet", "fill"):
-            return _sheet_fill_color(node)
-        head_text = _atom(node[0])
-        items = [_atom(c) for c in node[1:]]
-        if head == "data" and len(items) > 1:
-            # Embedded-file base64: KiCAD writes exactly one chunk per line.
-            body = "\n".join([f"({head_text} {items[0]}"] + [inner_pad + it for it in items[1:]])
-            return body + "\n" + outer_pad + ")"
-        single = "(" + " ".join([head_text, *items]) + ")"
-        if not items or len(outer_pad) + len(single) <= LINE_WIDTH:
-            return single
-        lines = _pack(outer_pad + "(" + head_text, items, inner_pad, LINE_WIDTH)
-        lines[0] = lines[0][len(outer_pad):]
-        return "\n".join(lines) + "\n" + outer_pad + ")"
-
-    if head == "pts" and all(head_of(c) == "xy" for c in node[1:]):
-        # KiCAD keeps the head alone and packs the points, wrapping at the width.
-        items = [dumps(c, indent + 1, child_path) for c in node[1:]]
-        lines = _pack(inner_pad, items, inner_pad, LINE_WIDTH)
-        return "(pts\n" + "\n".join(lines) + "\n" + outer_pad + ")"
-
-    leading = " ".join(_atom(c) for c in node[:first_list_idx])
-    rest = node[first_list_idx:]
-
-    lines = ["(" + leading]
-    for child in rest:
-        if isinstance(child, list):
-            lines.append(inner_pad + dumps(child, indent + 1, child_path))
-        else:
-            lines.append(inner_pad + _atom(child))
-    lines.append(outer_pad + ")")
-    return "\n".join(lines)
+    return "(" + " ".join(dumps_flat(c, child_path) for c in node) + ")"
 
 
 def _sheet_fill_color(node: list) -> str:
@@ -126,28 +85,6 @@ def _sheet_fill_color(node: list) -> str:
     rgb = " ".join(_atom(c) for c in node[1:4])
     alpha = float(node[4]) if len(node) >= 5 else 0.0
     return f"(color {rgb} {alpha:.4f})"
-
-
-def _pack(first: str, items: list[str], pad: str, width: int) -> list[str]:
-    """Lay `items` out on as few lines of `width` columns as fit.
-
-    `first` is the opening line's text before the items — fully indented, either
-    the head token (`\\t\\t(members`) or just the continuation padding. Every
-    later line starts at `pad`. A single item always gets a line, however long.
-    """
-    lines: list[str] = []
-    current = first
-    empty = not current.strip()
-    for item in items:
-        candidate = current + item if empty else current + " " + item
-        if not empty and len(candidate) > width:
-            lines.append(current)
-            current = pad + item
-        else:
-            current = candidate
-        empty = False
-    lines.append(current)
-    return lines
 
 
 def detect_newline(path: Path) -> str:
@@ -182,7 +119,8 @@ def write_file(path: Path, tree: list) -> None:
     """
     p = Path(path)
     newline = detect_newline(p)
-    text = dumps(tree) + "\n"
+    # `dumps` already ends with the trailing newline KiCAD writes.
+    text = dumps(tree)
     if newline != "\n":
         text = text.replace("\n", newline)
     p.write_bytes(text.encode("utf-8"))

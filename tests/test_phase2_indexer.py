@@ -154,7 +154,7 @@ def test_list_libraries_returns_per_lib_counts(synthetic_index, monkeypatch):
     mcp = _make_mcp_with_lib_tools(monkeypatch, synthetic_index)
     _call(mcp, "index_libraries")  # warm in-process cache
     res = _call(mcp, "list_libraries")
-    assert {"name": "MiniLib", "count": 3} in res["symbol_libraries"]
+    assert {"name": "MiniLib", "count": 4} in res["symbol_libraries"]
     assert {"name": "MiniFP", "count": 1} in res["footprint_libraries"]
 
 
@@ -213,3 +213,93 @@ def test_full_kicad_indexing_meets_acceptance():
     results = search_symbols("ESP32-S3", idx, max_results=20)
     assert any("ESP32" in r["lib_id"] for r in results), \
         f"expected ESP32 match, got {[r['lib_id'] for r in results[:5]]}"
+
+
+# --------------------------------------------------------------------------- #
+# P7 — search results decode prose, not identity
+# --------------------------------------------------------------------------- #
+
+
+class TestSearchBraceDecoding:
+    """`{brace}` escapes are decoded for reading, never for `lib_id`."""
+
+    @staticmethod
+    def _index_with_escapes():
+        return {
+            "symbols": {
+                "MiniLib:Bridge{slash}Rect": {
+                    "lib_id": "MiniLib:Bridge{slash}Rect",
+                    "lib": "MiniLib",
+                    "name": "Bridge{slash}Rect",
+                    "description": "Bridge rectifier, AC{slash}DC input",
+                    "keywords": "diode bridge ac{slash}dc",
+                    "default_footprint": "Diode_THT:D{slash}Bridge",
+                    "datasheet": "~",
+                    "pin_count": 4,
+                    "extends": None,
+                }
+            },
+            "footprints": {
+                "MiniFP:Pad{slash}Big": {
+                    "lib_id": "MiniFP:Pad{slash}Big",
+                    "lib": "MiniFP",
+                    "name": "Pad{slash}Big",
+                    "description": "Big pad, 2{slash}1 aspect",
+                    "tags": "pad big 2{slash}1",
+                }
+            },
+            "symbol_dirs": [],
+            "footprint_dirs": [],
+        }
+
+    def _mcp(self, monkeypatch):
+        from mcp.server.fastmcp import FastMCP
+
+        idx = self._index_with_escapes()
+        monkeypatch.setattr(lib_tools, "load_cache", lambda: idx)
+        monkeypatch.setattr(lib_tools, "_index", None)
+        mcp = FastMCP("test")
+        lib_tools.register(mcp)
+        return mcp
+
+    def test_symbol_description_and_keywords_are_decoded(self, monkeypatch):
+        mcp = self._mcp(monkeypatch)
+        hit = _call(mcp, "search_symbol", query="bridge rectifier")[0]
+        assert hit["description"] == "Bridge rectifier, AC/DC input"
+        assert hit["keywords"] == "diode bridge ac/dc"
+
+    def test_symbol_identity_is_left_alone(self, monkeypatch):
+        """lib_id goes straight back into add_symbol — decoding it breaks lookup."""
+        mcp = self._mcp(monkeypatch)
+        hit = _call(mcp, "search_symbol", query="bridge rectifier")[0]
+        assert hit["lib_id"] == "MiniLib:Bridge{slash}Rect"
+        assert hit["name"] == "Bridge{slash}Rect"
+
+    def test_footprint_description_and_tags_are_decoded(self, monkeypatch):
+        mcp = self._mcp(monkeypatch)
+        hit = _call(mcp, "search_footprint", query="big pad")[0]
+        assert hit["description"] == "Big pad, 2/1 aspect"
+        assert hit["tags"] == "pad big 2/1"
+        assert hit["lib_id"] == "MiniFP:Pad{slash}Big"
+
+    def test_get_symbol_details_decodes_prose_only(self, monkeypatch):
+        mcp = self._mcp(monkeypatch)
+        res = _call(mcp, "get_symbol_details", lib_id="MiniLib:Bridge{slash}Rect")
+        assert res["description"] == "Bridge rectifier, AC/DC input"
+        assert res["default_footprint"] == "Diode_THT:D/Bridge"
+        assert res["lib_id"] == "MiniLib:Bridge{slash}Rect"
+
+    def test_plain_entries_are_unchanged(self, monkeypatch):
+        """No braces, no difference — the common case must not shift."""
+        from mcp.server.fastmcp import FastMCP
+
+        idx = klibs.build_index(symbol_dirs=[FIXTURES], footprint_dirs=[FIXTURES])
+        monkeypatch.setattr(lib_tools, "load_cache", lambda: idx)
+        monkeypatch.setattr(lib_tools, "_index", None)
+        mcp = FastMCP("test")
+        lib_tools.register(mcp)
+
+        hits = _call(mcp, "search_symbol", query="resistor")
+        assert hits
+        for hit in hits:
+            assert "{" not in hit["lib_id"]

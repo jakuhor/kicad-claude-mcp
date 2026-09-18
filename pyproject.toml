@@ -29,6 +29,13 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/kicad_claude"]
 
+[tool.ruff]
+# `source_repo/` holds a clone of KiCAD's own C++ tree, kept for reference (its
+# `Prettify` is ported in `adapters/kicad_prettify.py`). It is gitignored, and
+# ruff honours that by default — this makes it explicit so the exclusion
+# survives the clone being tracked or `respect-gitignore` being turned off.
+extend-exclude = ["source_repo"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [

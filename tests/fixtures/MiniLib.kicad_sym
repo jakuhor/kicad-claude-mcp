@@ -31,6 +31,28 @@
 		(property "Description" "Small resistor symbol" (at 0 0 0))
 		(property "ki_keywords" "R res resistor small" (at 0 0 0))
 	)
+	(symbol "Resistor_Wide"
+		(property "Reference" "R" (at 0 0 0))
+		(property "Value" "Resistor_Wide" (at 0 0 0))
+		(property "Footprint" "Resistor_SMD:R_1206_3216Metric" (at 0 0 0))
+		(property "Datasheet" "~" (at 0 0 0))
+		(property "Description" "Resistor with pins further apart, for replace_symbol tests" (at 0 0 0))
+		(property "ki_keywords" "R res resistor wide" (at 0 0 0))
+		(symbol "Resistor_Wide_0_1"
+			(pin passive line
+				(at 0 5.08 270)
+				(length 1.27)
+				(name "~" (effects (font (size 1 1))))
+				(number "1" (effects (font (size 1 1))))
+			)
+			(pin passive line
+				(at 0 -5.08 90)
+				(length 1.27)
+				(name "~" (effects (font (size 1 1))))
+				(number "2" (effects (font (size 1 1))))
+			)
+		)
+	)
 	(symbol "ESP32_Demo"
 		(property "Reference" "U" (at 0 0 0))
 		(property "Value" "ESP32-S3-DEMO" (at 0 0 0))
@@ -40,20 +62,20 @@
 		(property "ki_keywords" "wifi bt esp32 microcontroller" (at 0 0 0))
 		(symbol "ESP32_Demo_1_1"
 			(pin power_in line
-				(at 0 0 0)
-				(length 1)
+				(at 0 5.08 270)
+				(length 1.27)
 				(name "VCC" (effects (font (size 1 1))))
 				(number "1" (effects (font (size 1 1))))
 			)
 			(pin power_in line
-				(at 0 0 0)
-				(length 1)
+				(at 0 -5.08 90)
+				(length 1.27)
 				(name "GND" (effects (font (size 1 1))))
 				(number "2" (effects (font (size 1 1))))
 			)
 			(pin bidirectional line
-				(at 0 0 0)
-				(length 1)
+				(at 5.08 0 180)
+				(length 1.27)
 				(name "GPIO0" (effects (font (size 1 1))))
 				(number "3" (effects (font (size 1 1))))
 			)

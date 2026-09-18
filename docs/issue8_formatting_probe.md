@@ -9,16 +9,23 @@ and are not part of the repo.
 
 ## Result
 
-| Dumper | Byte-identical files (of 78) |
+| Dumper | Byte-identical files |
 |---|---|
-| before | 0 |
-| after | 66 |
+| before | 0 of 78 |
+| measured rules | 66 of 78 |
+| port of KiCAD's `Prettify` | 91 of 91 |
+
+The last row counts every KiCAD 10-format schematic in the demos, which is more
+files than the original probe covered.
 
 One `add_wire` on the 3 519-line `tests/fixtures/kicad10_ecc83-pp_v2.kicad_sch`
 now produces a 10-line diff — the wire itself. Before, a handful of edits gave
 ~6 000 changed lines.
 
-## Rules implemented in `sch_io.dumps`
+## Rules that were implemented in `sch_io.dumps` (superseded)
+
+Kept as the record of what was measured before the port existed. None of these
+are in the code now.
 
 1. **`(pts ...)` packs its points.** The head stays alone on its line and the
    `(xy ...)` children are packed several to a line, wrapping at `LINE_WIDTH`.
@@ -41,7 +48,7 @@ now produces a 10-line diff — the wire itself. Before, a handful of edits gave
    escaped — KiCad escapes those too, and a raw newline inside a quoted string
    makes KiCad refuse to load the file (issue 1).
 
-## Known remaining deviation — tracked as P6
+## Known remaining deviation — SOLVED, see P6
 
 The 12 files that still differ all differ only in **`(members ...)` wrapping**
 inside `(bus_alias ...)`. KiCad breaks those lines earlier than a 118-column
@@ -50,6 +57,46 @@ budget explains, and inconsistently between files: lines are kept at 92, 91 and
 where the next item would only reach column 78. No single column or item-count
 rule fits all of them, so our writer wraps `members` at `LINE_WIDTH` like any
 other long atom list. It affects bus aliases only, and KiCad loads the result.
+
+### Measured 2026-09-18: there is no column rule to find
+
+The wrapping was measured across every `(members ...)` block in KiCAD 10's
+demo schematics — 67 wrapped lines in 15 files. If a single column budget `B`
+explained the breaks, then every written line would fit in `B` and every line
+that wrapped would have exceeded `B` by taking one more item. It does not hold:
+
+| tab counted as | longest line written | shortest line that still wrapped |
+|---|---|---|
+| 1 column | 93 | 77 |
+| 4 columns | 99 | 84 |
+| 8 columns | 109 | 92 |
+
+A line reaches 93 columns in one file while another wraps rather than reach 77.
+No tab width rescues it, and it is not a fixed item count either: full lines
+carry between 3 and 14 members.
+
+The likely explanation is that KiCAD's prettifier preserves line breaks the
+previous writer chose, rather than re-flowing the list. That information is not
+in the parsed tree — `sexpdata` discards line breaks — so it cannot be
+reproduced from what we hold.
+
+### Resolved by porting KiCAD's own prettifier
+
+The measurement above is correct and its conclusion was wrong. Reading
+`common/io/kicad/kicad_io_utils.cpp::Prettify` in `source_repo/kicad` showed the
+rule is not a line-length budget at all: KiCAD breaks when the column *before*
+the next token has reached `consecutiveTokenWrapThreshold = 72`, so the line
+ends wherever that token ends. No maximum width describes it, which is why none
+was found.
+
+`adapters/kicad_prettify.py` is now a line-for-line port of that function, and
+`sch_io.dumps` serialises flat and runs it — the same two steps KiCAD uses. The
+measured rules below are superseded; the constants they approximated
+(`LINE_WIDTH = 118`) fall out of `xySpecialCaseColumnLimit = 99` plus the length
+of one `(xy ...)` token.
+
+**91 of 91** KiCAD 10-format demo schematics now round-trip byte-identically,
+up from 66 of 78. See P6 in `docs/open_points.md`.
 
 ## Regression tests
 

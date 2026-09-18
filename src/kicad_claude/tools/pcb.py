@@ -28,7 +28,8 @@ from kicad_claude import state
 from kicad_claude.adapters import pcb_editor as ed
 from kicad_claude.adapters import project_settings as ps
 from kicad_claude.adapters import pcb_netlist
-from kicad_claude.adapters import sch_editor, sch_io
+from kicad_claude.adapters import safe_write
+from kicad_claude.adapters import sch_io
 from kicad_claude.templates.blank import write_blank_pcb
 from kicad_claude.tools import library as lib_tools
 
@@ -47,9 +48,8 @@ def _load_active_pcb() -> tuple[list, Path]:
 
 
 def _save_with_backup(tree: list, pcb_path: Path) -> Path | None:
-    backup = sch_editor.backup_file(pcb_path)
-    sch_io.write_file(pcb_path, tree)
-    return backup
+    """Write the board through the guarded path: lock check, backup, verify."""
+    return safe_write.save_tree(tree=tree, path=pcb_path)
 
 
 def _resolve_footprint(lib_id: str) -> Path:
