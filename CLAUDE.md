@@ -50,8 +50,11 @@ directly; it is not the queue.
 - Escape every control character on write (backslash, `"`, `\n`, `\r`, `\t`).
   `sexpdata` decodes escapes on read, so a naive dump corrupts the file.
 - Preserve existing UUIDs. Generate a new UUID only for a new item.
-- Keep the format versions KiCad 10 writes: `.kicad_sch` `20250114`,
-  `.kicad_pcb` `20241229`, `.kicad_pro` `meta.version` 3.
+- Keep the format versions KiCad 10.0.6 writes: `.kicad_sch` `20260306`,
+  `.kicad_pcb` `20260206`, `.kicad_mod` `20260206`, `.kicad_sym` `20251024`,
+  `.kicad_pro` `meta.version` 3. Read them back from the tool, not from
+  `source_repo/kicad` (that checkout is master and runs ahead — board
+  `20260901` as of 2026-09-17): `kicad-cli sch|pcb|fp|sym upgrade <file>`.
 - Mutating tools write through `adapters/safe_write.save_tree`: it refuses to
   write while KiCAD holds a `.lck` on the project, backs up to
   `<project>/.backups/<timestamp>_<file>` keeping the newest 10, then re-parses

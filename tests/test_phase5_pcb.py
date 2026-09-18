@@ -306,3 +306,52 @@ def test_acceptance_small_board_with_real_libs(tmp_path):
     )
     # DRC will report unconnected/clearance issues but the file MUST parse.
     assert r.returncode == 0, f"drc parse failed: stderr={r.stderr}"
+
+
+# ===== Float spelling preserved on round-trip ============================== #
+
+
+def test_number_spelling_survives_round_trip(tmp_path: Path):
+    """Untouched numbers are written back exactly as the board spells them.
+
+    KiCAD 10 keeps a negative zero in a 3D model's `(xyz ...)` (`{:.10g}` of
+    -0.0 is `-0`, and `int("-0")` would drop the sign), and prints a value
+    below 0.0001 as a plain decimal, never an exponent.
+    """
+    src = (
+        "(kicad_pcb\n"
+        "\t(version 20260206)\n"
+        '\t(generator "pcbnew")\n'
+        '\t(generator_version "10.0")\n'
+        '\t(footprint "X"\n'
+        '\t\t(model "m.wrl"\n'
+        "\t\t\t(offset\n"
+        "\t\t\t\t(xyz 0 -0 -0)\n"
+        "\t\t\t)\n"
+        "\t\t\t(scale\n"
+        "\t\t\t\t(xyz 1 1 0.00001)\n"
+        "\t\t\t)\n"
+        "\t\t)\n"
+        "\t)\n"
+        ")\n"
+    )
+    pcb = tmp_path / "raw.kicad_pcb"
+    pcb.write_text(src, encoding="utf-8", newline="")
+
+    tree = sch_io.parse_file(pcb)
+    assert sch_io.dumps(tree) == src
+
+
+def test_mutated_float_uses_kicad_formatting(tmp_path: Path):
+    """A value we replace is spelled by `_format_float`, not by the old token."""
+    pcb = tmp_path / "raw.kicad_pcb"
+    pcb.write_text(
+        "(kicad_pcb\n\t(version 20260206)\n\t(thickness 1.6)\n)\n",
+        encoding="utf-8",
+        newline="",
+    )
+    tree = sch_io.parse_file(pcb)
+    node = sch_io.find_child(tree, "thickness")
+    assert float(node[1]) == 1.6
+    node[1] = 0.8
+    assert "(thickness 0.8)" in sch_io.dumps(tree)

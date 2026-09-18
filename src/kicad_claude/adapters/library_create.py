@@ -377,7 +377,7 @@ def build_footprint_node(
     name_only = qualified_lib_id.split(":", 1)[-1] if ":" in qualified_lib_id else qualified_lib_id
     fp: list[Any] = [
         sym("footprint"), name_only,
-        [sym("version"), 20240108],
+        [sym("version"), 20260206],
         [sym("generator"), "kicad-claude"],
         [sym("generator_version"), "0.1"],
         [sym("layer"), "F.Cu"],

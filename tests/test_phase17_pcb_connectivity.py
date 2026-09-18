@@ -193,7 +193,7 @@ class TestUnfilledZones:
     def test_a_zone_without_fill_data_is_reported(self, tmp_path):
         tree = [
             sch_io.sym("kicad_pcb"),
-            [sch_io.sym("version"), 20241229],
+            [sch_io.sym("version"), 20260206],
             [
                 sch_io.sym("zone"),
                 [sch_io.sym("net"), 1, "GND"],

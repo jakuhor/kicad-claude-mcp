@@ -33,12 +33,69 @@ def parse_file(path: Path) -> list:
     if not text.strip():
         raise ValueError(f"{path} is empty — not a KiCAD file")
     try:
-        tree = sexpdata.loads(text)
+        parsed = _RawNumberParser(text).parse()
+        if len(parsed) != 1:
+            raise ValueError(f"expected one top-level s-expression, got {len(parsed)}")
+        tree = parsed[0]
     except Exception as exc:  # sexpdata raises several unrelated types
         raise ValueError(f"{path} is not a well-formed s-expression: {exc}") from exc
     if not isinstance(tree, list) or not tree:
         raise ValueError(f"{path} has no top-level s-expression")
     return tree
+
+
+# --------------------------------------------------------------------------- #
+# Number atoms that remember their spelling
+# --------------------------------------------------------------------------- #
+
+
+class RawFloat(float):
+    """A float that remembers the text it was read from.
+
+    KiCAD 10 spells a number per field: `FormatDouble2Str` and
+    `FormatInternalUnits` print `{:.10g}`, `{:.10f}` below 0.0001, and keep a
+    negative zero as `-0`. Re-deriving that per field would need precision
+    knowledge from all of `pcbnew/`, so an atom we never touched is written
+    back verbatim instead. A mutated value becomes a plain `float` and goes
+    through `_format_float`.
+    """
+
+    def __new__(cls, value: float, raw: str) -> "RawFloat":
+        self = super().__new__(cls, value)
+        self.raw = raw
+        return self
+
+    def __reduce__(self):  # copy / deepcopy / pickle keep the spelling
+        return (RawFloat, (float(self), self.raw))
+
+
+class RawInt(int):
+    """An int that remembers the text it was read from — see `RawFloat`.
+
+    `-0` matters here: `int("-0")` is `0`, and KiCAD writes the sign back.
+    """
+
+    def __new__(cls, value: int, raw: str) -> "RawInt":
+        self = super().__new__(cls, value)
+        self.raw = raw
+        return self
+
+    def __reduce__(self):
+        return (RawInt, (int(self), self.raw))
+
+
+class _RawNumberParser(sexpdata.Parser):
+    """`sexpdata.Parser` that wraps numeric atoms in `RawFloat` / `RawInt`."""
+
+    def atom(self, token: str) -> Any:
+        value = super().atom(token)
+        if isinstance(value, bool):  # must precede int — bool is an int subclass
+            return value
+        if isinstance(value, int):
+            return RawInt(value, token)
+        if isinstance(value, float):
+            return RawFloat(value, token)
+        return value
 
 
 # --------------------------------------------------------------------------- #
@@ -61,7 +118,7 @@ def dumps(node: Any) -> str:
     return kicad_prettify.prettify(dumps_flat(node), kicad_prettify.FormatMode.NORMAL)
 
 
-def dumps_flat(node: Any, path: tuple[str, ...] = ()) -> str:
+def dumps_flat(node: Any) -> str:
     """Serialize the tree to one line, tokens separated by single spaces.
 
     The prettifier inserts every newline, so this only has to produce
@@ -71,20 +128,7 @@ def dumps_flat(node: Any, path: tuple[str, ...] = ()) -> str:
         return _atom(node)
     if not node:
         return "()"
-
-    head = head_of(node)
-    if head == "color" and path[-2:] == ("sheet", "fill"):
-        return _sheet_fill_color(node)
-
-    child_path = path + (head,) if head else path
-    return "(" + " ".join(dumps_flat(c, child_path) for c in node) + ")"
-
-
-def _sheet_fill_color(node: list) -> str:
-    """`(color r g b a)` of a sheet's fill — KiCAD prints the alpha as %.4f."""
-    rgb = " ".join(_atom(c) for c in node[1:4])
-    alpha = float(node[4]) if len(node) >= 5 else 0.0
-    return f"(color {rgb} {alpha:.4f})"
+    return "(" + " ".join(dumps_flat(c) for c in node) + ")"
 
 
 def detect_newline(path: Path) -> str:
@@ -136,6 +180,8 @@ def _atom(x: Any) -> str:
         return str(x)
     if isinstance(x, bool):  # must precede int — bool is an int subclass
         return "yes" if x else "no"
+    if isinstance(x, (RawFloat, RawInt)):
+        return x.raw
     if isinstance(x, str):
         return '"' + _escape(x) + '"'
     if isinstance(x, int):
@@ -166,18 +212,21 @@ def _escape(s: str) -> str:
 
 
 def _format_float(x: float) -> str:
-    """Format a float the way KiCAD does: trim trailing zeros, keep no `e`-notation."""
+    """Format a float the way KiCAD 10 does.
+
+    Port of `EDA_UNIT_UTILS::FormatInternalUnits` (`common/eda_units.cpp`) and
+    `FormatDouble2Str` (`common/string_utils.cpp`), which share one rule:
+    `{:.10g}`, except below 0.0001 where `%g` would switch to an exponent and
+    KiCAD prints `{:.10f}` with the trailing zeros trimmed. `{:.10g}` keeps an
+    integer-valued float integer-style (`90`, not `90.0`) and a negative zero
+    as `-0`, both of which KiCAD writes.
+    """
     if math.isnan(x) or math.isinf(x):
         return repr(x)
-    if x == 0.0:
-        return "0"
-    if x == int(x) and abs(x) < 1e15:
-        # Integer-valued floats: keep as integer-style "5", not "5.0".
-        # KiCAD writes pin angles as `0`, `90` (no decimal).
-        return str(int(x))
-    # Shortest representation that round-trips, like KiCAD's own output
-    # (e.g. `59.209102362204725` stays intact instead of being truncated).
-    return repr(x)
+    if x != 0.0 and abs(x) <= 0.0001:
+        buf = f"{x:.10f}".rstrip("0")
+        return buf[:-1] if buf.endswith(".") else buf
+    return f"{x:.10g}"
 
 
 # --------------------------------------------------------------------------- #

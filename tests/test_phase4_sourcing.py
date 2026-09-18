@@ -54,7 +54,7 @@ def _make_vendor_zip(target: Path, name: str = "ACME_PART") -> Path:
         z.writestr(
             f"KiCad/{name}.pretty/{name}_PKG.kicad_mod",
             f"""(footprint "{name}_PKG"
-\t(version 20240108)
+\t(version 20260206)
 \t(generator "snapeda")
 \t(layer "F.Cu")
 \t(descr "Synthetic test footprint")

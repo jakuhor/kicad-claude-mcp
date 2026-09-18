@@ -742,21 +742,35 @@ def test_data_chunks_are_one_per_line():
     assert lines[3] == ")"
 
 
-def test_sheet_fill_alpha_has_four_decimals():
+def test_sheet_fill_alpha_uses_format_double2str():
+    """KiCAD 10 prints a sheet fill's alpha with `FormatDouble2Str`, like any
+    other double — `(color 0 0 0 0)`, not the `%.4f` of KiCAD 8/9."""
     sheet = [
         sch_io.sym("sheet"),
         [sch_io.sym("at"), 0, 0],
         [sch_io.sym("fill"), [sch_io.sym("color"), 0, 0, 0, 0.0]],
     ]
-    assert "(color 0 0 0 0.0000)" in sch_io.dumps(sheet)
-    # Outside a sheet's fill, KiCAD writes the alpha plainly.
-    junction = [sch_io.sym("junction"), [sch_io.sym("color"), 0, 0, 0, 0.0]]
-    assert "(color 0 0 0 0)" in sch_io.dumps(junction)
+    assert "(color 0 0 0 0)" in sch_io.dumps(sheet)
+    junction = [sch_io.sym("junction"), [sch_io.sym("color"), 0, 0, 0, 0.5]]
+    assert "(color 0 0 0 0.5)" in sch_io.dumps(junction)
 
 
-def test_float_keeps_full_precision():
+def test_float_uses_kicad10_precision():
+    """KiCAD 10 prints `{:.10g}` — 10 significant digits, no exponent here."""
     node = [sch_io.sym("at"), 59.209102362204725, 270]
-    assert sch_io.dumps(node).rstrip("\n") == "(at 59.209102362204725 270)"
+    assert sch_io.dumps(node).rstrip("\n") == "(at 59.20910236 270)"
+
+
+def test_small_float_avoids_exponent():
+    """Below 0.0001 KiCAD switches to `{:.10f}`, trailing zeros trimmed."""
+    node = [sch_io.sym("at"), 0.00001, 0]
+    assert sch_io.dumps(node).rstrip("\n") == "(at 0.00001 0)"
+
+
+def test_negative_zero_keeps_its_sign():
+    """`{:.10g}` of -0.0 is `-0`, which is what KiCAD writes in `(xyz ...)`."""
+    node = [sch_io.sym("xyz"), 0.0, -0.0, -0.0]
+    assert sch_io.dumps(node).rstrip("\n") == "(xyz 0 -0 -0)"
 
 
 # --------------------------------------------------------------------------- #
@@ -907,13 +921,13 @@ class TestParseFileErrors:
 
     def test_truncated_file(self, tmp_path):
         p = tmp_path / "trunc.kicad_sch"
-        p.write_text("(kicad_sch (version 20250114) (symbol", encoding="utf-8")
+        p.write_text("(kicad_sch (version 20260306) (symbol", encoding="utf-8")
         with pytest.raises(ValueError, match="well-formed"):
             sch_io.parse_file(p)
 
     def test_good_file_still_parses(self, tmp_path):
         p = tmp_path / "ok.kicad_sch"
-        p.write_text("(kicad_sch (version 20250114))", encoding="utf-8")
+        p.write_text("(kicad_sch (version 20260306))", encoding="utf-8")
         assert sch_io.head_of(sch_io.parse_file(p)) == "kicad_sch"
 
 

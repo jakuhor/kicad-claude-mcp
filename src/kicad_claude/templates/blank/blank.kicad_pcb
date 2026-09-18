@@ -1,5 +1,5 @@
 (kicad_pcb
-	(version 20241229)
+	(version 20260206)
 	(generator "kicad-claude")
 	(generator_version "0.1")
 	(general
@@ -73,7 +73,10 @@
 		)
 		(pad_to_mask_clearance 0)
 		(allow_soldermask_bridges_in_footprints no)
-		(tenting front back)
+		(tenting
+			(front yes)
+			(back yes)
+		)
 	)
 	(net 0 "")
 	(embedded_fonts no)

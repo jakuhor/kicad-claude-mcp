@@ -116,7 +116,7 @@ class TestWriteVerification:
 
     def test_a_first_write_with_no_previous_file_has_no_backup(self, tmp_path):
         target = tmp_path / "fresh.kicad_sch"
-        tree = [sexpdata.Symbol("kicad_sch"), [sexpdata.Symbol("version"), 20250114]]
+        tree = [sexpdata.Symbol("kicad_sch"), [sexpdata.Symbol("version"), 20260306]]
         assert safe_write.save_tree(target, tree) is None
         assert target.is_file()
 

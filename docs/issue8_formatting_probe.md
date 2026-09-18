@@ -1,8 +1,9 @@
 # Issue 8 — MCP writes no longer reformat the whole file
 
 Measured against the KiCad 10.0.6 demo schematics in
-`C:\Program Files\KiCad\10.0\share\kicad\demos` — 78 of them are in the KiCad 10
-format `(version 20250114)`. Method: parse a KiCad-written file with
+`C:\Program Files\KiCad\10.0\share\kicad\demos` — 78 of them are in the
+`(version 20250114)` schematic format, which is what KiCad 9 wrote; KiCad
+10.0.6 itself writes `20260306`. Method: parse a KiCad-written file with
 `sch_io.parse_file`, dump it back with `sch_io.dumps`, compare byte for byte.
 Probe scripts live in the session scratchpad (`fmt_probe*.py`, `verify_fmt.py`)
 and are not part of the repo.
