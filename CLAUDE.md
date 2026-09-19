@@ -18,7 +18,7 @@ asked.
 - Do not push, tag, or open PRs.
 
 ## Current backlog
-`docs/open_points_2.md` is the live queue. P1-P13 are all closed as of
+`docs/open_points_2.md` is the live queue. P1-P15 are all closed as of
 2026-09-19 — the file records what was done and why. Nothing is outstanding.
 
 `docs/open_points_1.md` is the previous round (P1-P7, closed 2026-09-18), kept
@@ -30,7 +30,7 @@ directly; it is not the queue.
 
 ## Layout
 - `server.py` — entry point; creates `FastMCP("kicad-claude")` and calls each
-  `tools/<group>.register(mcp)`. 132 tools total.
+  `tools/<group>.register(mcp)`. 134 tools total.
 - `src/kicad_claude/tools/*.py` — thin MCP tool wrappers: validate arguments,
   call an adapter, return a JSON-friendly dict.
 - `src/kicad_claude/adapters/*.py` — the real work: s-expression IO

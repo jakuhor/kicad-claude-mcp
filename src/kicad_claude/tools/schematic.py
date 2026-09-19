@@ -8,6 +8,7 @@ Tools (all operate on the active project's `.kicad_sch`):
     set_dnp, set_in_bom, set_on_board
     add_text, list_texts, set_text, remove_text, rename_label, move_item
     list_sch_nets, trace_net, get_pin_net, find_dangling
+    list_lib_symbols, refresh_lib_symbols
     list_pins, get_pin_position
     list_components_detailed (richer than Phase 1's list_components)
 
@@ -123,27 +124,51 @@ def _resolve_lib_symbol(lib_id: str) -> tuple[Path, str, dict]:
     )
 
 
-def _next_power_reference(tree: list) -> str:
-    """Auto-increment a `#PWR####` reference, picking the smallest unused number.
+def _library_reference_prefix(sym_def_node: list, default: str = "#PWR") -> str:
+    """The reference prefix a library symbol asks for — `#PWR`, `#FLG`, …
 
-    Scans the whole hierarchy, not just the active sheet: `#PWR` references
-    must be unique across all sheets or KiCAD reports annotation errors.
+    KiCAD's `power:PWR_FLAG` carries `#FLG`, while `power:GND` and the rails
+    carry `#PWR`. Assuming `#PWR` for everything in the power library gives a
+    flag the wrong designator, which KiCAD's own annotation then renumbers.
+    """
+    prefix = ed.get_symbol_property(sym_def_node, "Reference")
+    return prefix if prefix else default
+
+
+def _next_virtual_reference(tree: list, prefix: str = "#PWR") -> str:
+    """Smallest unused `<prefix>####` reference, e.g. `#PWR0003` or `#FLG0001`.
+
+    Scans the whole hierarchy, not just the active sheet: these references must
+    be unique across all sheets or KiCAD reports annotation errors. Each prefix
+    is numbered independently, the way KiCAD numbers them.
     """
     refs = list(ed.all_references(tree))
     proj = state.get_active_or_none()
     if proj is not None:
         refs.extend(ed.all_references_in_hierarchy(proj.sch_path))
+    pattern = re.compile(rf"{re.escape(prefix)}0*(\d+)")
     used = set()
     for ref in refs:
         if not ref:
             continue
-        m = re.fullmatch(r"#PWR0*(\d+)", ref)
+        m = pattern.fullmatch(ref)
         if m:
             used.add(int(m.group(1)))
     n = 1
     while n in used:
         n += 1
-    return f"#PWR{n:04d}"
+    return f"{prefix}{n:04d}"
+
+
+def _next_power_reference(tree: list) -> str:
+    """Back-compat alias — the `#PWR` case of `_next_virtual_reference`."""
+    return _next_virtual_reference(tree, "#PWR")
+
+
+def _fresh_lib_def(qualified_lib_id: str) -> list:
+    """Read a symbol definition straight from the library file on disk."""
+    lib_path, sym_name, _meta = _resolve_lib_symbol(qualified_lib_id)
+    return ed.fetch_symbol_def(lib_path, sym_name)
 
 
 # --------------------------------------------------------------------------- #
@@ -441,9 +466,12 @@ def register(mcp) -> None:
     ) -> dict:
         """Place a power symbol (e.g. +5V, +3V3, GND) from the `power` library.
 
-        Auto-assigns a `#PWR####` reference. The library symbol id is
-        `power:{net}`; if that doesn't exist in the index, the call fails with
-        a hint listing valid power nets.
+        Auto-assigns the reference the library part asks for: `#PWR####` for a
+        rail or ground, `#FLG####` for `PWR_FLAG`. The two are numbered
+        independently, as KiCAD numbers them.
+
+        The library symbol id is `power:{net}`; if that doesn't exist in the
+        index, the call fails with a hint listing valid power nets.
         """
         x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
         candidate = f"power:{net}"
@@ -458,9 +486,11 @@ def register(mcp) -> None:
             )
 
         tree, path = _load_active_schematic()
-        ref = _next_power_reference(tree)
         lib_path, sym_name, meta = _resolve_lib_symbol(candidate)
         sym_def = ed.fetch_symbol_def(lib_path, sym_name)
+        # The prefix comes from the library part: PWR_FLAG wants #FLG, the
+        # rails want #PWR, and the two are numbered separately.
+        ref = _next_virtual_reference(tree, _library_reference_prefix(sym_def))
         proj = state.get_active()
         ed.add_symbol(
             tree,
@@ -557,6 +587,118 @@ def register(mcp) -> None:
         result["sheet"] = state.get_active_sheet_filename() or "root"
         result["backup"] = str(backup) if backup else None
         return result
+
+    # ----- Cached library definitions ------------------------------------- #
+
+    @mcp.tool()
+    def list_lib_symbols(scope: str = "active") -> dict:
+        """The library definitions a sheet has cached in its `(lib_symbols ...)`.
+
+        Each sheet carries its own copy of every part it places, so it opens
+        without the libraries. `stale: true` means the copy no longer matches
+        the library on disk — see `refresh_lib_symbols`.
+        """
+        if scope not in ("active", "all"):
+            raise ValueError(f"scope must be 'active' or 'all' (got {scope!r})")
+        paths = (
+            [state.get_active_sheet_path()]
+            if scope == "active"
+            else ed.hierarchy_sch_paths(state.get_active().sch_path)
+        )
+
+        out: list[dict] = []
+        for path in paths:
+            tree = sch_io.parse_file(path)
+            for lib_id in ed.lib_symbol_ids(tree):
+                entry = {"sheet": path.name, "lib_id": lib_id, "stale": None}
+                try:
+                    fresh = _fresh_lib_def(lib_id)
+                except (KeyError, FileNotFoundError) as exc:
+                    entry["error"] = str(exc)
+                else:
+                    diff = ed.diff_lib_symbol(tree, lib_id, fresh)
+                    entry["stale"] = diff["changed"]
+                    entry["pins_added"] = diff["pins_added"]
+                    entry["pins_removed"] = diff["pins_removed"]
+                    entry["pins_moved"] = diff["pins_moved"]
+                out.append(entry)
+        return {"scope": scope, "count": len(out), "symbols": out}
+
+    @mcp.tool()
+    def refresh_lib_symbols(
+        lib_id: str = "",
+        scope: str = "active",
+        update_fields: list[str] | None = None,
+        dry_run: bool = True,
+    ) -> dict:
+        """Re-copy library definitions from disk into a sheet's cache.
+
+        A sheet caches each part it places in `(lib_symbols ...)`, and nothing
+        updates that copy when the library changes — so pin positions the tools
+        report can drift from the library, and a part placed after the change
+        still gets the old geometry.
+
+        `dry_run=True` (the default) reports what would change and writes
+        nothing. Read `connections_at_risk` before turning it off: a pin that
+        moves or disappears leaves whatever was wired to it behind, exactly
+        where it was, and `find_dangling` will then show it.
+
+        `lib_id` empty refreshes every cached part; naming one refreshes that
+        one. `update_fields` copies named properties from the library onto the
+        placements — nothing is copied by default, because Reference, Value and
+        Footprint belong to the placement, not the library.
+        """
+        if scope not in ("active", "all"):
+            raise ValueError(f"scope must be 'active' or 'all' (got {scope!r})")
+        paths = (
+            [state.get_active_sheet_path()]
+            if scope == "active"
+            else ed.hierarchy_sch_paths(state.get_active().sch_path)
+        )
+
+        reports: list[dict] = []
+        backups: list[str] = []
+        for path in paths:
+            tree = sch_io.parse_file(path)
+            wanted = [lib_id] if lib_id else ed.lib_symbol_ids(tree)
+            if lib_id and not ed.lib_symbols_has(tree, lib_id):
+                continue
+
+            touched = False
+            for one in wanted:
+                try:
+                    fresh = _fresh_lib_def(one)
+                except (KeyError, FileNotFoundError) as exc:
+                    reports.append({"sheet": path.name, "lib_id": one, "error": str(exc)})
+                    continue
+                report = (
+                    ed.diff_lib_symbol(tree, one, fresh)
+                    if dry_run
+                    else ed.refresh_lib_symbol(
+                        tree, one, fresh, update_fields=update_fields
+                    )
+                )
+                report["sheet"] = path.name
+                reports.append(report)
+                touched = touched or (report["changed"] or bool(update_fields))
+
+            if not dry_run and touched:
+                backup = _save_with_backup(tree, path)
+                if backup:
+                    backups.append(str(backup))
+
+        if lib_id and not reports:
+            raise KeyError(f"{lib_id!r} is not cached on any sheet in scope {scope!r}")
+
+        changed = [r for r in reports if r.get("changed")]
+        return {
+            "dry_run": dry_run,
+            "scope": scope,
+            "checked": len(reports),
+            "changed": len(changed),
+            "reports": reports,
+            "backups": backups,
+        }
 
     # ----- Connectivity (derived, read-only) ------------------------------ #
 

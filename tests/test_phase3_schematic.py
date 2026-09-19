@@ -1766,3 +1766,89 @@ def test_remove_junction_finds_an_off_grid_junction(blank_project):
     res = mcp._tool_manager.get_tool("remove_junction").fn(x_mm=200.0, y_mm=140.0)
     assert res["removed"] == "junction"
     assert sch_io.find_children(sch_io.parse_file(sch_path), "junction") == []
+
+
+# --------------------------------------------------------------------------- #
+# PWR_FLAG takes the reference prefix its library part asks for
+# --------------------------------------------------------------------------- #
+
+POWER_LIB = Path("C:/Program Files/KiCad/10.0/share/kicad/symbols/power.kicad_sym")
+
+
+class TestLibraryReferencePrefix:
+    def test_reads_the_prefix_from_the_part(self):
+        if not POWER_LIB.is_file():
+            pytest.skip("KiCAD symbol libraries not installed")
+        flag = ed.fetch_symbol_def(POWER_LIB, "PWR_FLAG")
+        gnd = ed.fetch_symbol_def(POWER_LIB, "GND")
+        assert sch_tools._library_reference_prefix(flag) == "#FLG"
+        assert sch_tools._library_reference_prefix(gnd) == "#PWR"
+
+    def test_falls_back_when_the_part_has_no_reference(self):
+        node = [sch_io.sym("symbol"), "Nameless"]
+        assert sch_tools._library_reference_prefix(node) == "#PWR"
+        assert sch_tools._library_reference_prefix(node, default="#X") == "#X"
+
+
+class TestNextVirtualReference:
+    def test_numbers_each_prefix_independently(self, blank_project):
+        tree = sch_io.parse_file(blank_project["sch"])
+        sym_def = ed.fetch_symbol_def(FIXTURES / "MiniLib.kicad_sym", "Resistor")
+        for ref in ("#PWR0001", "#PWR0002", "#FLG0001"):
+            ed.add_symbol(
+                tree, qualified_lib_id="MiniLib:Resistor", reference=ref, value="x",
+                x_mm=50, y_mm=50, rotation=0, sym_def_node=sym_def, project_name="demo",
+            )
+        assert sch_tools._next_virtual_reference(tree, "#PWR") == "#PWR0003"
+        assert sch_tools._next_virtual_reference(tree, "#FLG") == "#FLG0002"
+
+    def test_a_flag_does_not_consume_a_pwr_number(self, blank_project):
+        tree = sch_io.parse_file(blank_project["sch"])
+        sym_def = ed.fetch_symbol_def(FIXTURES / "MiniLib.kicad_sym", "Resistor")
+        ed.add_symbol(
+            tree, qualified_lib_id="MiniLib:Resistor", reference="#FLG0001", value="x",
+            x_mm=50, y_mm=50, rotation=0, sym_def_node=sym_def, project_name="demo",
+        )
+        assert sch_tools._next_virtual_reference(tree, "#PWR") == "#PWR0001"
+
+    def test_the_pwr_alias_still_works(self, blank_project):
+        tree = sch_io.parse_file(blank_project["sch"])
+        assert sch_tools._next_power_reference(tree) == "#PWR0001"
+
+    def test_a_prefix_with_regex_characters_is_matched_literally(self, blank_project):
+        tree = sch_io.parse_file(blank_project["sch"])
+        assert sch_tools._next_virtual_reference(tree, "#P+W") == "#P+W0001"
+
+
+class TestAddPowerSymbolPrefix:
+    """The bug: every power part got `#PWR`, including PWR_FLAG."""
+
+    def _mcp(self, monkeypatch, tmp_path):
+        from mcp.server.fastmcp import FastMCP
+
+        idx = kicad_libs.build_index(
+            symbol_dirs=[Path("C:/Program Files/KiCad/10.0/share/kicad/symbols")],
+            footprint_dirs=[],
+        )
+        monkeypatch.setattr(lib_tools, "load_cache", lambda: idx)
+        monkeypatch.setattr(lib_tools, "_index", None)
+        mcp = FastMCP("test")
+        sch_tools.register(mcp)
+        lib_tools.register(mcp)
+        return mcp
+
+    @pytest.mark.slow
+    def test_pwr_flag_gets_flg_and_rails_get_pwr(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        if not POWER_LIB.is_file():
+            pytest.skip("KiCAD symbol libraries not installed")
+        mcp = self._mcp(monkeypatch, tmp_path)
+
+        got = [
+            _call(mcp, "add_power_symbol", net=net, x_mm=50.8 + 12.7 * i, y_mm=50.8)[
+                "reference"
+            ]
+            for i, net in enumerate(["GND", "+3V3", "PWR_FLAG", "PWR_FLAG", "GND"])
+        ]
+        assert got == ["#PWR0001", "#PWR0002", "#FLG0001", "#FLG0002", "#PWR0003"]

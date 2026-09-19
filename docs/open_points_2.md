@@ -10,8 +10,10 @@ header) in a scratch directory and drove every tool through the same
 `register(mcp)` entry points the MCP server uses. KiCad 10.0.6, board format
 `20260206`, schematic format `20260306`.
 
-**Status: P1–P13 are all closed, worked the same day (2026-09-19).** Each
-point keeps its diagnosis and records what was done.
+**Status: P1–P15 are all closed.** P1–P13 came from the end-to-end run and
+were worked the same day; P14 and P15 were found later on 2026-09-19 by
+checking two specific questions. Each point keeps its diagnosis and records
+what was done.
 
 **What already worked.** Project creation, symbol and footprint creation,
 symbol placement with autoplaced fields, arbitrary symbol properties (`MPN`,
@@ -338,12 +340,111 @@ tools were never exercised against a board `pcbnew` wrote.
 
 ---
 
+## P14 — `add_power_symbol("PWR_FLAG")` got a `#PWR` reference (Minor) — DONE
+
+Every part from the `power` library was given a `#PWR####` designator,
+including `PWR_FLAG`, which KiCAD designates `#FLG`. Reproduced:
+
+```
+add_power_symbol('GND')      -> '#PWR0001'
+add_power_symbol('+3V3')     -> '#PWR0002'
+add_power_symbol('PWR_FLAG') -> '#PWR0003'   <- should be #FLG0001
+```
+
+**Cause.** `tools/schematic.py::_next_power_reference` hardcoded the prefix: it
+scanned `#PWR0*(\d+)` and returned `f"#PWR{n:04d}"` whatever part was being
+placed. The prefix is in the library part's own `Reference` property — `#FLG`
+for `PWR_FLAG`, `#PWR` for `GND` and the rails — and nothing read it.
+
+**Impact, measured.** Minor. ERC does not object: a sheet with the wrong prefix
+gives the same violations as one without. Connectivity is unaffected, because
+`sch_netlist._is_power_symbol` already accepted both prefixes. What it cost was
+diff churn — KiCAD's own annotation assigns `#FLG` and would renumber our flags
+— and flags consuming `#PWR` numbers.
+
+**Built.** `_library_reference_prefix` reads the prefix off the library part,
+and `_next_virtual_reference(tree, prefix)` numbers each prefix independently,
+as KiCAD does. `_next_power_reference` stays as the `#PWR` alias so existing
+callers and tests keep working. Now:
+
+```
+GND -> #PWR0001, +3V3 -> #PWR0002, PWR_FLAG -> #FLG0001,
+PWR_FLAG -> #FLG0002, GND -> #PWR0003
+```
+
+---
+
+## P15 — a sheet's cached `lib_symbols` could not be refreshed (Major) — DONE
+
+A sheet carries its own copy of every library part it places, in
+`(lib_symbols ...)`, so it opens without the libraries. Nothing updated that
+copy when the library changed.
+
+**Worse than a missing tool.** `sch_editor.inject_lib_symbol` returns early
+when the `lib_id` is already cached, so a symbol placed *after* a library
+change still got the old geometry:
+
+```
+pins as placed:         [('1', (100.33, 97.79)), ('2', (100.33, 102.87))]
+library edited on disk (pin 1 moved 2.54 -> 7.62)
+pins after lib edit:    [('1', (100.33, 97.79)), ...]   <- stale, expected
+a NEW placement's pins: [('1', (150.0,  97.79)), ...]   <- stale, not expected
+```
+
+Everything downstream reads the cache — `pins_of_instance`, hence
+`list_sch_nets`, `trace_net`, `find_dangling` and `get_pin_position` — so wires
+were placed against coordinates the library no longer used. `replace_symbol`
+had the same hole when swapping to an already-cached `lib_id`.
+
+**No shortcut existed.** `kicad-cli sch` offers only `erc`, `export` and
+`upgrade`. KiCAD does this in the GUI through **Tools → Update Symbols from
+Library** (`SCH_ACTIONS::updateSymbolFields`), whose dialog has per-field
+checkboxes — because overwriting `Value` and `Footprint` on every placement
+undoes the board's part choices.
+
+**Built.** Two tools, and the adapter functions under them
+(`replace_lib_symbol`, `lib_symbol_ids`, `diff_lib_symbol`,
+`refresh_lib_symbol`):
+
+- `list_lib_symbols(scope)` — what each sheet has cached, with `stale` and the
+  pins added, removed or moved against the library on disk.
+- `refresh_lib_symbols(lib_id="", scope, update_fields=None, dry_run=True)` —
+  re-copies the definitions.
+
+Three deliberate choices:
+
+- **`dry_run=True` is the default.** A refresh can orphan wiring, so the first
+  call reports and writes nothing.
+- **`connections_at_risk`** names, per placement, each pin that would move or
+  disappear while carrying a wire, junction, no-connect or label.
+  `find_dangling` is the after-check: in the test, the orphaned wire shows up
+  as a `wire_end` at the pin's old position.
+- **No field is copied onto placements unless named.** `Reference`, `Value` and
+  `Footprint` belong to the placement (`ed.INSTANCE_OWNED_FIELDS`). Naming one
+  in `update_fields` is allowed, but has to be explicit.
+
+The cached entry is replaced in place, so the block keeps its order and the
+diff stays small.
+
+**Tests.** New `tests/test_phase19_lib_symbol_refresh.py`, 27 tests including
+the two staleness demonstrations above and a `kicad-cli sch erc` load check
+after the block is rewritten.
+
+---
+
 ## Verification
 
 ```bash
 uv run pytest -m "not slow and not network" -q   # 428 passed
 uv run pytest -m "slow" -q                       # 46 passed
 uv run ruff check .                              # 47 pre-existing findings, unchanged
+```
+
+P14 and P15 were verified afterwards:
+
+```bash
+uv run pytest -m "not network" -q                # 508 passed
+uv run ruff check .                              # 47, unchanged
 ```
 
 The end-to-end flow was re-run afterwards with no environment configuration at

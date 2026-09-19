@@ -1731,3 +1731,161 @@ def replace_symbol(
         "left_dangling": left_behind,
         "new_pins_unconnected": unconnected_new,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Refreshing the sheet's cached library definitions
+# --------------------------------------------------------------------------- #
+
+# Fields a placement owns, not the library. `Reference` is the designator,
+# `Value` is what the user typed, and `Footprint` is usually chosen per board.
+# KiCAD's own "Update Symbols from Library" dialog defaults to leaving these
+# alone too, which is why refreshing defaults to geometry only.
+INSTANCE_OWNED_FIELDS = ("Reference", "Value", "Footprint")
+
+
+def replace_lib_symbol(tree: list, symbol_def_node: list) -> bool:
+    """Overwrite a `lib_symbols` entry in place. True if one was replaced.
+
+    Unlike `inject_lib_symbol`, which returns early when the id is already
+    cached, this swaps the cached definition for a newer one and keeps its
+    position in the block, so the file's ordering does not churn.
+    """
+    block = find_child(tree, "lib_symbols")
+    if block is None:
+        return False
+    qualified = symbol_def_node[1] if len(symbol_def_node) >= 2 else None
+    for idx, child in enumerate(block):
+        if is_call(child, "symbol") and len(child) >= 2 and child[1] == qualified:
+            block[idx] = symbol_def_node
+            return True
+    return False
+
+
+def lib_symbol_ids(tree: list) -> list[str]:
+    """Every `lib_id` the sheet has cached, in file order."""
+    block = find_child(tree, "lib_symbols")
+    if block is None:
+        return []
+    return [
+        child[1]
+        for child in block[1:]
+        if is_call(child, "symbol") and len(child) >= 2 and isinstance(child[1], str)
+    ]
+
+
+def _pin_map_of(tree: list, s_node: list) -> dict[str, tuple[float, float]]:
+    """Pin number to absolute position for one placed symbol."""
+    from kicad_claude.adapters import sch_netlist
+
+    return {p["number"]: p["point"] for p in sch_netlist.pins_of_instance(tree, s_node)}
+
+
+def diff_lib_symbol(tree: list, qualified_lib_id: str, fresh_def: list) -> dict:
+    """What would change if the cached definition were replaced by `fresh_def`.
+
+    Compares pin numbers and their library-local positions, and reports the
+    placements affected — including, for each, the pins that currently carry
+    something and would move or disappear.
+    """
+    cached = find_lib_symbol_def(tree, qualified_lib_id)
+    if cached is None:
+        raise KeyError(f"{qualified_lib_id!r} is not cached on this sheet")
+
+    def _pins(def_node: list) -> dict[str, tuple[float, float, float]]:
+        out: dict[str, tuple[float, float, float]] = {}
+        for pin_node, _parent in _iter_pins(def_node):
+            number, _name = _pin_id(pin_node)
+            out[number] = _pin_local_at(pin_node)
+        return out
+
+    old_pins, new_pins = _pins(cached), _pins(fresh_def)
+    added = sorted(set(new_pins) - set(old_pins))
+    removed = sorted(set(old_pins) - set(new_pins))
+    moved = sorted(
+        num for num in set(old_pins) & set(new_pins) if old_pins[num] != new_pins[num]
+    )
+
+    instances = []
+    for s_node in iter_instance_symbols(tree):
+        lib_id_node = find_child(s_node, "lib_id")
+        if not lib_id_node or len(lib_id_node) < 2 or lib_id_node[1] != qualified_lib_id:
+            continue
+        reference = get_symbol_property(s_node, "Reference") or "?"
+        before = _pin_map_of(tree, s_node)
+        at_risk = []
+        for number in removed + moved:
+            point = before.get(number)
+            if point and _items_at_point(tree, point):
+                at_risk.append(
+                    {
+                        "pin": number,
+                        "position_mm": list(point),
+                        "items": sorted({i["kind"] for i in _items_at_point(tree, point)}),
+                        "reason": "removed" if number in removed else "moved",
+                    }
+                )
+        instances.append({"reference": reference, "connections_at_risk": at_risk})
+
+    return {
+        "lib_id": qualified_lib_id,
+        "pins_added": added,
+        "pins_removed": removed,
+        "pins_moved": moved,
+        "changed": bool(added or removed or moved),
+        "instances": instances,
+    }
+
+
+def refresh_lib_symbol(
+    tree: list,
+    qualified_lib_id: str,
+    fresh_def: list,
+    *,
+    update_fields: list[str] | None = None,
+) -> dict:
+    """Replace one cached definition and optionally push its fields onto placements.
+
+    `update_fields` names the properties to copy from the library onto every
+    placement of this part. Nothing is copied by default: `Reference`, `Value`
+    and `Footprint` belong to the placement, and overwriting them is how a
+    library refresh silently undoes a board's part choices. Naming one of
+    `INSTANCE_OWNED_FIELDS` is allowed but has to be explicit.
+    """
+    report = diff_lib_symbol(tree, qualified_lib_id, fresh_def)
+
+    if not replace_lib_symbol(tree, make_lib_symbol_entry(fresh_def, qualified_lib_id)):
+        raise KeyError(f"{qualified_lib_id!r} is not cached on this sheet")
+
+    fields_written: list[dict] = []
+    for name in update_fields or []:
+        value = get_property(fresh_def, name)
+        if value is None:
+            continue
+        for s_node in iter_instance_symbols(tree):
+            lib_id_node = find_child(s_node, "lib_id")
+            if (
+                not lib_id_node
+                or len(lib_id_node) < 2
+                or lib_id_node[1] != qualified_lib_id
+            ):
+                continue
+            reference = get_symbol_property(s_node, "Reference") or "?"
+            previous = get_symbol_property(s_node, name)
+            if previous == value:
+                continue
+            if previous is None:
+                add_symbol_property(s_node, name, value)
+            else:
+                set_symbol_property(s_node, name, value)
+            fields_written.append(
+                {
+                    "reference": reference,
+                    "field": name,
+                    "from": previous,
+                    "to": value,
+                }
+            )
+
+    report["fields_written"] = fields_written
+    return report
