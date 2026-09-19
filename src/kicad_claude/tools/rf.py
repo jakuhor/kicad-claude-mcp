@@ -50,7 +50,7 @@ def register(mcp) -> None:
         pcb_path = state.get_active_board_path()
         tree = sch_io.parse_file(pcb_path)
         # Allow nets that don't exist yet — pass None to skip net assignment.
-        net_arg = net_name if net_name and ed.find_net_index(tree, net_name) is not None else None
+        net_arg = net_name if net_name and ed.net_exists(tree, net_name) else None
         nodes = ed.add_via_array_along_line(
             tree,
             start_mm=(start_x_mm, start_y_mm),
@@ -95,7 +95,7 @@ def register(mcp) -> None:
         """
         pcb_path = state.get_active_board_path()
         tree = sch_io.parse_file(pcb_path)
-        net_arg = net_name if ed.find_net_index(tree, net_name) is not None else None
+        net_arg = net_name if net_name and ed.net_exists(tree, net_name) else None
 
         upper = ed.add_via_array_along_line(
             tree,
@@ -160,16 +160,10 @@ def register(mcp) -> None:
 
         pcb_path = state.get_active_board_path()
         tree = sch_io.parse_file(pcb_path)
-        net_idx = 0
-        if net_name:
-            idx = ed.find_net_index(tree, net_name)
-            if idx is None:
-                raise KeyError(f"net {net_name!r} not found")
-            net_idx = idx
         ed.add_track(
             tree,
             start_x_mm, start_y_mm, end_x_mm, end_y_mm,
-            width_mm=width, layer=layer, net=net_idx,
+            width_mm=width, layer=layer, net=net_name or 0,
         )
         backup = _save_with_backup(tree, pcb_path)
         return {

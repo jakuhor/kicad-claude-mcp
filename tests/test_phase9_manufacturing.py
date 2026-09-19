@@ -192,3 +192,39 @@ def test_export_fab_package_bundles_everything(tiny_board):
     base = Path(res["output_dir"])
     assert (base / "gerbers").is_dir()
     assert (base / "drill").is_dir()
+
+
+# ===== Defaults that used to fail ========================================= #
+
+
+def test_svg_export_has_a_default_layer_set():
+    """`kicad-cli pcb export svg` refuses to run without `--layers`."""
+    assert "F.Cu" in kicad_cli.DEFAULT_SVG_LAYERS
+    assert "Edge.Cuts" in kicad_cli.DEFAULT_SVG_LAYERS
+
+
+def test_fab_package_bom_asks_for_the_sourcing_fields():
+    """An assembly house cannot quote a BOM with no part number on it."""
+    from kicad_claude.tools.manufacturing import DEFAULT_BOM_FIELDS
+
+    assert "MPN" in DEFAULT_BOM_FIELDS
+    assert "Manufacturer" in DEFAULT_BOM_FIELDS
+    assert DEFAULT_BOM_FIELDS.startswith("Reference,Value,Footprint")
+
+
+@pytest.mark.slow
+def test_export_pcb_svg_without_arguments(tiny_board):
+    """The bare call used to fail: 'At least one layer must be specified'."""
+    res = tiny_board["call"]("export_pcb_svg")
+    assert res["kind"] == "svg"
+    assert res["file_count"] >= 1
+
+
+@pytest.mark.slow
+def test_fab_package_bom_carries_the_mpn_column(tiny_board):
+    res = tiny_board["call"]("export_fab_package", include_render=False)
+    bom = res["steps"]["bom"]
+    assert "error" not in bom
+    header = Path(bom["output_path"]).read_text(encoding="utf-8").splitlines()[0]
+    assert "MPN" in header
+    assert "Manufacturer" in header

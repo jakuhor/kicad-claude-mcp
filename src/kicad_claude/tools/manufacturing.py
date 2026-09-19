@@ -24,6 +24,10 @@ from kicad_claude.adapters import kicad_cli
 
 logger = logging.getLogger("kicad-claude.tools.manufacturing")
 
+# Columns of the BOM inside a fab package: KiCAD's own set plus what an
+# assembly house needs to buy the parts.
+DEFAULT_BOM_FIELDS = "Reference,Value,Footprint,MPN,Manufacturer,Datasheet,${QUANTITY},${DNP}"
+
 
 def _fab_dir(subdir: str | None = None) -> Path:
     """Default output directory for manufacturing artifacts."""
@@ -243,8 +247,10 @@ def register(mcp) -> None:
     ) -> dict:
         """Export one SVG per layer for documentation/preview.
 
-        `layers`: comma-separated subset (e.g. "F.Cu,B.Cu,F.SilkS"). When
-        omitted, all visible layers are written.
+        `layers`: comma-separated subset (e.g. "F.Cu,B.Cu,F.Silkscreen"). When
+        omitted, the documentation set is written: both copper layers, both
+        silkscreens, both solder masks and Edge.Cuts. `kicad-cli` itself has no
+        "every layer" default and refuses to run without a layer list.
         """
         proj = state.get_active()
         out = Path(output_dir).expanduser() if output_dir else _fab_dir("svg")
@@ -264,12 +270,21 @@ def register(mcp) -> None:
         output_dir: str | None = None,
         include_render: bool = True,
         include_svg: bool = False,
+        bom_fields: str = DEFAULT_BOM_FIELDS,
         timeout_seconds: float = 240.0,
     ) -> dict:
         """One-shot: export gerbers + drill + pos + BOM + (optional) render to `<project>/fab/`.
 
         Produces a directory ready to zip and send to a fab house. If
         `include_render` is True, also writes a 3D render of the top side.
+
+        `bom_fields` is the BOM's column list. The default carries the sourcing
+        fields (`MPN`, `Manufacturer`) as well as the reference/value/footprint
+        that KiCAD writes by default — an assembly house cannot quote a BOM
+        without a part number.
+
+        Note that this overwrites `<project>/fab/<name>-bom.csv`; export a BOM
+        with other columns to a path of its own.
         """
         proj = state.get_active()
         base = Path(output_dir).expanduser() if output_dir else _fab_dir()
@@ -296,10 +311,13 @@ def register(mcp) -> None:
             )
         except kicad_cli.KicadCliError as e:
             results["steps"]["pos"] = {"error": str(e)}
-        # BOM
+        # BOM. Assembly needs the part number, so the sourcing fields are
+        # asked for by name; kicad-cli leaves a field blank when a symbol does
+        # not carry it.
         try:
             results["steps"]["bom"] = kicad_cli.export_bom(
                 proj.sch_path, base / f"{proj.name}-bom.csv",
+                fields=bom_fields,
                 timeout=timeout_seconds,
             )
         except kicad_cli.KicadCliError as e:

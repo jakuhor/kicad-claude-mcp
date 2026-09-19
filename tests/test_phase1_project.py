@@ -89,7 +89,8 @@ def test_create_project_tool_then_state(tmp_path: Path):
     assert result["active"] is True
     assert result["symbols"] == 0
     assert result["footprints"] == 0
-    assert result["nets"] == 1
+    # A blank board carries no net but the unconnected one, which is not listed.
+    assert result["nets"] == 0
 
     proj_state = _call(mcp, "get_project_state")
     assert proj_state["name"] == "blinky"
@@ -189,3 +190,44 @@ def test_platform_default_cli_paths_are_versioned(monkeypatch):
 
     monkeypatch.setattr(kicad_paths.platform, "system", lambda: "Linux")
     assert Path("/usr/bin/kicad-cli") in kicad_paths._platform_default_cli_paths()
+
+
+def test_summary_counts_a_populated_board(tmp_path: Path):
+    """`set_project` used to raise on any board that had a footprint on it.
+
+    The counts came from `kicad-skip`, which cannot parse a KiCAD 10
+    footprint's text items, so opening a real project blew up.
+    """
+    from kicad_claude.adapters import pcb_editor, sch_io
+
+    mcp = _make_mcp()
+    _call(mcp, "create_project", path=str(tmp_path / "pop"), name="pop")
+
+    pcb_path = tmp_path / "pop" / "pop.kicad_pcb"
+    tree = sch_io.parse_file(pcb_path)
+    fp = [
+        sch_io.sym("footprint"), "L:R",
+        [sch_io.sym("layer"), "F.Cu"],
+        [sch_io.sym("uuid"), "33333333-3333-3333-3333-333333333331"],
+        [sch_io.sym("at"), 100, 100],
+        [sch_io.sym("property"), "Reference", "R1",
+         [sch_io.sym("at"), 0, 0, 0],
+         [sch_io.sym("layer"), "F.SilkS"],
+         [sch_io.sym("uuid"), "33333333-3333-3333-3333-333333333332"]],
+        [sch_io.sym("pad"), "1", sch_io.sym("smd"), sch_io.sym("rect"),
+         [sch_io.sym("at"), 0, 0],
+         [sch_io.sym("size"), 1, 1],
+         [sch_io.sym("layers"), "F.Cu"],
+         [sch_io.sym("net"), "SIG"],
+         [sch_io.sym("uuid"), "33333333-3333-3333-3333-333333333333"]],
+    ]
+    tree.append(fp)
+    sch_io.write_file(pcb_path, tree)
+    assert pcb_editor.list_nets(sch_io.parse_file(pcb_path)) == [
+        {"index": None, "name": "SIG"}
+    ]
+
+    res = _call(mcp, "set_project", project_path=str(tmp_path / "pop"))
+    assert res["footprints"] == 1
+    assert res["nets"] == 1
+    assert res["symbols"] == 0

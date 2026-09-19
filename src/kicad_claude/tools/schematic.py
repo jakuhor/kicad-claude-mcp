@@ -44,6 +44,21 @@ def _snap(x_mm: float, y_mm: float, snap_to_grid: bool) -> tuple[float, float]:
     return snap_xy(x_mm, y_mm)
 
 
+def _candidate_points(x_mm: float, y_mm: float, snap_to_grid: bool) -> list[tuple[float, float]]:
+    """Points to try when removing an item: as given, then snapped.
+
+    A wire drawn to a pin is off the 1.27 mm grid more often than not, and
+    `snap_to_grid=True` on the remove call used to move the lookup somewhere
+    the wire never was. The exact point is therefore tried first, whatever the
+    caller asked for, and the snapped one only as a fallback.
+    """
+    exact = (round_mm(x_mm), round_mm(y_mm))
+    if not snap_to_grid:
+        return [exact]
+    snapped = snap_xy(x_mm, y_mm)
+    return [exact] if snapped == exact else [exact, snapped]
+
+
 # --------------------------------------------------------------------------- #
 # Helpers shared across tools
 # --------------------------------------------------------------------------- #
@@ -238,15 +253,26 @@ def register(mcp) -> None:
         Endpoint order does not matter. `kind` is "wire" or "bus". Points are
         matched with a 0.01 mm tolerance; pass the same coordinates used to
         create the segment, or read them back with `list_pins`.
+
+        The coordinates are tried exactly as given first, and only then snapped
+        to the grid — a wire drawn to a pin usually does not sit on it.
         """
         if kind not in ("wire", "bus"):
             raise ValueError(f"kind must be 'wire' or 'bus' (got {kind!r})")
-        x1_mm, y1_mm = _snap(x1_mm, y1_mm, snap_to_grid)
-        x2_mm, y2_mm = _snap(x2_mm, y2_mm, snap_to_grid)
         tree, path = _load_active_schematic()
-        if not ed.remove_wire(tree, x1_mm, y1_mm, x2_mm, y2_mm, kind=kind):
+        tried: list[tuple] = []
+        for (x1, y1), (x2, y2) in zip(
+            _candidate_points(x1_mm, y1_mm, snap_to_grid),
+            _candidate_points(x2_mm, y2_mm, snap_to_grid),
+        ):
+            tried.append(((x1, y1), (x2, y2)))
+            if ed.remove_wire(tree, x1, y1, x2, y2, kind=kind):
+                x1_mm, y1_mm, x2_mm, y2_mm = x1, y1, x2, y2
+                break
+        else:
             raise KeyError(
-                f"no {kind} between ({x1_mm}, {y1_mm}) and ({x2_mm}, {y2_mm})"
+                f"no {kind} between any of the points tried: "
+                + "; ".join(f"{a} to {b}" for a, b in tried)
             )
         backup = _save_with_backup(tree, path)
         return {
@@ -278,10 +304,14 @@ def register(mcp) -> None:
     @mcp.tool()
     def remove_junction(x_mm: float, y_mm: float, snap_to_grid: bool = True) -> dict:
         """Remove the junction dot at a point."""
-        x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
         tree, path = _load_active_schematic()
-        if not ed.remove_junction(tree, x_mm, y_mm):
-            raise KeyError(f"no junction at ({x_mm}, {y_mm})")
+        points = _candidate_points(x_mm, y_mm, snap_to_grid)
+        for x, y in points:
+            if ed.remove_junction(tree, x, y):
+                x_mm, y_mm = x, y
+                break
+        else:
+            raise KeyError(f"no junction at any of {points}")
         backup = _save_with_backup(tree, path)
         return {
             "removed": "junction",
@@ -296,10 +326,14 @@ def register(mcp) -> None:
 
         Use `get_pin_position` to find the point of a pin's marker.
         """
-        x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
         tree, path = _load_active_schematic()
-        if not ed.remove_no_connect(tree, x_mm, y_mm):
-            raise KeyError(f"no no-connect marker at ({x_mm}, {y_mm})")
+        points = _candidate_points(x_mm, y_mm, snap_to_grid)
+        for x, y in points:
+            if ed.remove_no_connect(tree, x, y):
+                x_mm, y_mm = x, y
+                break
+        else:
+            raise KeyError(f"no no-connect marker at any of {points}")
         backup = _save_with_backup(tree, path)
         return {
             "removed": "no_connect",

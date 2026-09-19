@@ -12,10 +12,10 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from skip import PCB, Schematic
-
 from kicad_claude import state
+from kicad_claude.adapters import pcb_editor as pcb_ed
 from kicad_claude.adapters import sch_editor as ed
+from kicad_claude.adapters import sch_io
 from kicad_claude.templates.blank import write_blank_project
 from kicad_claude.utils.kicad_strings import normalize_name
 
@@ -49,9 +49,14 @@ def _resolve_project_dir_and_name(project_path: str) -> tuple[Path, str]:
 
 
 def _summarize(proj: state.ActiveProject) -> dict:
-    """Cheap counts of an active project: symbols, footprints, nets."""
-    sch = Schematic(str(proj.sch_path))
-    pcb = PCB(str(proj.pcb_path))
+    """Cheap counts of an active project: symbols, footprints, nets.
+
+    Read with this project's own parsers. `kicad-skip` was used here until it
+    turned out it cannot parse a KiCAD 10 footprint's text items, which made
+    `set_project` raise on every board that had a footprint on it.
+    """
+    sch_tree = sch_io.parse_file(proj.sch_path)
+    pcb_tree = sch_io.parse_file(proj.pcb_path)
     return {
         "path": str(proj.path),
         "name": proj.name,
@@ -60,27 +65,22 @@ def _summarize(proj: state.ActiveProject) -> dict:
             "sch": str(proj.sch_path),
             "pcb": str(proj.pcb_path),
         },
-        "symbols": len(sch.symbol),
-        "footprints": len(getattr(pcb, "footprint", [])),
-        "nets": len(pcb.net),
+        "symbols": sum(1 for _ in ed.iter_instance_symbols(sch_tree)),
+        "footprints": sum(1 for _ in pcb_ed.iter_footprints(pcb_tree)),
+        "nets": len(pcb_ed.list_nets(pcb_tree)),
     }
 
 
-def _component_dict(sym) -> dict:
+def _component_dict(sym: list) -> dict:
     """Best-effort extraction of a symbol's identity. Tolerant of missing fields."""
-    def _val(getter, default=None):
-        try:
-            return getter()
-        except Exception:
-            return default
-
-    reference = _val(lambda: sym.property.Reference.value, "?")
-    value = _val(lambda: sym.property.Value.value, "")
-    lib_id = _val(lambda: sym.lib_id.value, "")
-    at = _val(lambda: list(sym.at.value), [0.0, 0.0, 0.0])
-    x = at[0] if len(at) > 0 else 0.0
-    y = at[1] if len(at) > 1 else 0.0
-    rotation = at[2] if len(at) > 2 else 0.0
+    reference = ed.get_symbol_property(sym, "Reference") or "?"
+    value = ed.get_symbol_property(sym, "Value") or ""
+    lib_id_node = sch_io.find_child(sym, "lib_id")
+    lib_id = str(lib_id_node[1]) if lib_id_node and len(lib_id_node) > 1 else ""
+    at = sch_io.find_child(sym, "at") or []
+    x = float(at[1]) if len(at) > 1 else 0.0
+    y = float(at[2]) if len(at) > 2 else 0.0
+    rotation = float(at[3]) if len(at) > 3 else 0.0
     return {
         # Shown to the caller, so decode KiCAD's `{brace}` escapes.
         "reference": normalize_name(reference) if isinstance(reference, str) else reference,
@@ -154,9 +154,9 @@ def register(mcp) -> None:
             paths = ed.hierarchy_sch_paths(proj.sch_path)
         out: list[dict] = []
         for path in paths:
-            sch = Schematic(str(path))
+            tree = sch_io.parse_file(path)
             sheet_name = path.name
-            for symbol in sch.symbol:
+            for symbol in ed.iter_instance_symbols(tree):
                 entry = _component_dict(symbol)
                 entry["sheet"] = sheet_name
                 out.append(entry)

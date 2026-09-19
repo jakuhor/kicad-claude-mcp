@@ -80,8 +80,8 @@ def register(mcp) -> None:
         by_layer: dict[str, float] = {}
         zone_count_per_layer: dict[str, int] = {}
         for z in sch_io.find_children(tree, "zone"):
-            net_name = sch_io.find_child(z, "net_name")
-            if not (net_name and len(net_name) >= 2 and net_name[1] in ("GND", "0V", "VSS")):
+            # KiCAD 10 writes `(net "GND")`; older zones carry `(net_name ...)`.
+            if ed.net_of(z) not in ("GND", "0V", "VSS"):
                 continue
             layer_node = sch_io.find_child(z, "layer")
             if not layer_node or len(layer_node) < 2:
@@ -128,32 +128,30 @@ def register(mcp) -> None:
         routing, or impedance control.
         """
         tree = sch_io.parse_file(state.get_active_board_path())
-        per_net: dict[int, float] = {}
+        per_net: dict[str, float] = {}
         for seg in sch_io.find_children(tree, "segment"):
-            net_node = sch_io.find_child(seg, "net")
             start = sch_io.find_child(seg, "start")
             end = sch_io.find_child(seg, "end")
-            if not (net_node and start and end):
+            # Copper with no net still radiates; it is reported under one bucket.
+            net = ed.net_of(seg) or "(no net)"
+            if not (start and end):
                 continue
             try:
-                net_idx = int(net_node[1])
                 length = math.hypot(
                     float(end[1]) - float(start[1]),
                     float(end[2]) - float(start[2]),
                 )
             except (ValueError, TypeError):
                 continue
-            per_net[net_idx] = per_net.get(net_idx, 0.0) + length
+            per_net[net] = per_net.get(net, 0.0) + length
 
-        # Resolve names
-        idx_to_name = {n["index"]: n["name"] for n in ed.list_nets(tree)}
         long_nets = [
             {
-                "net": idx_to_name.get(idx, f"<net{idx}>"),
+                "net": net,
                 "length_mm": round(L, 2),
                 "lambda_estimate_at_1GHz_mm": round(L / 200, 2),  # λ at 1GHz on FR4 ≈ 100 mm, λ/10 ≈ 10
             }
-            for idx, L in per_net.items()
+            for net, L in per_net.items()
             if L >= threshold_mm
         ]
         long_nets.sort(key=lambda r: -r["length_mm"])

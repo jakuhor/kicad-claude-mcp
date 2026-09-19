@@ -335,6 +335,44 @@ def add_footprint(
     return placed
 
 
+def set_footprint_property(fp: list, name: str, value: str) -> bool:
+    """Set a footprint's `(property name value)`, adding it hidden if absent.
+
+    Returns True when the file changed. A field KiCAD did not put there —
+    `MPN`, `Manufacturer`, an order code — is metadata for the fab, so a new
+    one is written hidden on `F.Fab`, which is where KiCAD's own update puts
+    the fields it copies from the schematic.
+    """
+    for prop in find_children(fp, "property"):
+        i = property_name_index(prop)
+        if len(prop) > i + 1 and prop[i] == name:
+            if str(prop[i + 1]) == value:
+                return False
+            prop[i + 1] = value
+            return True
+
+    node = [
+        sym("property"),
+        name,
+        value,
+        [sym("at"), 0, 0, 0],
+        [sym("unlocked"), sym("yes")],
+        [sym("layer"), "F.Fab"],
+        [sym("hide"), sym("yes")],
+        [sym("uuid"), str(uuid.uuid4())],
+        [
+            sym("effects"),
+            [sym("font"), [sym("size"), 1.0, 1.0], [sym("thickness"), 0.15]],
+        ],
+    ]
+    last_prop_idx = max(
+        (i for i, c in enumerate(fp) if is_call(c, "property")),
+        default=1,
+    )
+    fp.insert(last_prop_idx + 1, node)
+    return True
+
+
 def remove_footprint(tree: list, reference: str) -> bool:
     for i, child in enumerate(tree):
         if is_call(child, "footprint") and get_footprint_reference(child) == reference:
@@ -385,14 +423,24 @@ def place_footprints_grid(
     columns: int = 5,
     origin_mcp: tuple[float, float] = (15.0, 15.0),
     unplaced_threshold_mm: float = 0.5,
+    only_unplaced: bool = True,
 ) -> dict:
-    """Distribute footprints whose position is within `unplaced_threshold_mm` of (0,0).
+    """Lay footprints out on a grid, sorted by reference.
+
+    `only_unplaced` (the default) moves just the footprints sitting within
+    `unplaced_threshold_mm` of (0, 0) — where KiCAD drops a part it has no
+    position for. Pass False to re-arrange every footprint on the board, which
+    is what `update_pcb_from_schematic` leaves behind: it places new parts in a
+    row below the outline, not at the origin.
 
     Sorted by reference (R1, R2, …, C1, C2, …) so prefix groups stay contiguous.
     """
 
     unplaced: list[list] = []
     for fp in iter_footprints(tree):
+        if not only_unplaced:
+            unplaced.append(fp)
+            continue
         at = find_child(fp, "at")
         if at is None:
             unplaced.append(fp)
@@ -435,8 +483,10 @@ def add_track(
     y2_mm: float,
     width_mm: float = 0.25,
     layer: str = "F.Cu",
-    net: int = 0,
+    net: int | str = 0,
 ) -> list:
+    """Add a track segment. `net` is a net name, or a legacy integer index."""
+    net_value = net_ref(tree, net)
     x1k, y1k = pcb_to_file_xy(x1_mm, y1_mm)
     x2k, y2k = pcb_to_file_xy(x2_mm, y2_mm)
     node = [
@@ -445,7 +495,7 @@ def add_track(
         [sym("end"), round_mm(x2k), round_mm(y2k)],
         [sym("width"), width_mm],
         [sym("layer"), layer],
-        [sym("net"), net],
+        [sym("net"), net_value],
         [sym("uuid"), str(uuid.uuid4())],
     ]
     tree.append(node)
@@ -485,13 +535,7 @@ def add_via_array_along_line(
     # Perpendicular (math CCW)
     px, py = -uy, ux
 
-    # Resolve net by name (if given)
-    net_idx = 0
-    if net_name:
-        idx = find_net_index(tree, net_name)
-        if idx is None:
-            raise KeyError(f"net {net_name!r} not found")
-        net_idx = idx
+    net_value = net_ref(tree, net_name) if net_name else 0
 
     n = max(1, int(length / spacing_mm) + 1)
     new_nodes: list[list] = []
@@ -506,7 +550,7 @@ def add_via_array_along_line(
             [sym("size"), round_mm(diameter_mm)],
             [sym("drill"), round_mm(drill_mm)],
             [sym("layers"), "F.Cu", "B.Cu"],
-            [sym("net"), net_idx],
+            [sym("net"), net_value],
             [sym("uuid"), _uuid()],
         ]
         tree.append(node)
@@ -520,9 +564,11 @@ def add_via(
     y_mm: float,
     drill_mm: float = 0.4,
     diameter_mm: float = 0.8,
-    net: int = 0,
+    net: int | str = 0,
     layers: tuple[str, str] = ("F.Cu", "B.Cu"),
 ) -> list:
+    """Add a via. `net` is a net name, or a legacy integer index."""
+    net_value = net_ref(tree, net)
     xk, yk = pcb_to_file_xy(x_mm, y_mm)
     node = [
         sym("via"),
@@ -530,7 +576,7 @@ def add_via(
         [sym("size"), diameter_mm],
         [sym("drill"), drill_mm],
         [sym("layers"), layers[0], layers[1]],
-        [sym("net"), net],
+        [sym("net"), net_value],
         [sym("uuid"), str(uuid.uuid4())],
     ]
     tree.append(node)
@@ -542,26 +588,141 @@ def add_via(
 # --------------------------------------------------------------------------- #
 
 
-def list_nets(tree: list) -> list[dict]:
-    """Return [{index, name}] for every (net N "name") declaration in the PCB.
+def read_net_node(node: list) -> tuple[int | None, str]:
+    """Read a `(net ...)` child of `node` as (index, name).
 
-    Names are decoded for display: a net stored `VBUS{slash}5V` is reported
-    as `VBUS/5V`. The tree keeps the stored form.
+    Three spellings exist in the wild:
+      `(net 3 "GND")` — the table entry and, before KiCAD 10, every pad;
+      `(net "GND")`   — KiCAD 10's pads, zones, tracks and vias;
+      `(net 3)`       — an index-only reference into the table.
+    A missing or unreadable node reads as (None, "").
+    """
+    net_node = find_child(node, "net")
+    if not net_node or len(net_node) < 2:
+        return None, ""
+    first = net_node[1]
+    if isinstance(first, int):
+        name = str(net_node[2]) if len(net_node) > 2 else ""
+        return first, normalize_name(name)
+    return None, normalize_name(str(first))
+
+
+def net_of(node: list, tree: list | None = None) -> str:
+    """The net a pad / zone / track / via belongs to, by name.
+
+    Empty for the unconnected net. A KiCAD 10 zone carries only `(net "GND")`;
+    a zone this server wrote before that carries `(net 0) (net_name "GND")`,
+    so the `net_name` child is read as a fallback. Pass `tree` for a board that
+    still has a net table: its tracks reference nets by index alone, and only
+    the table can name them.
+    """
+    index, name = read_net_node(node)
+    if name:
+        return name
+    net_name_node = find_child(node, "net_name")
+    if net_name_node and len(net_name_node) >= 2 and str(net_name_node[1]):
+        return normalize_name(str(net_name_node[1]))
+    if index:
+        if tree is not None:
+            for entry in _net_table(tree):
+                if entry["index"] == index:
+                    return entry["name"]
+        return f"#{index}"  # index-only reference, no table entry to name it
+    return ""
+
+
+def _net_table(tree: list) -> list[dict]:
+    """The top-level `(net N "name")` declarations, if the board has any.
+
+    KiCAD 10 (board format 20260206) stopped writing this table: pads, zones
+    and tracks name their net directly. Older boards still carry it, and their
+    items reference nets by index, so it is read when present.
     """
     out: list[dict] = []
-    for n in find_children(tree, "net"):
-        if len(n) >= 3 and isinstance(n[1], int):
+    for n in tree[1:]:
+        if is_call(n, "net") and len(n) >= 3 and isinstance(n[1], int):
             out.append({"index": int(n[1]), "name": normalize_name(str(n[2]))})
     return out
 
 
+def has_net_table(tree: list) -> bool:
+    """True when the board still carries a top-level net table."""
+    return bool(_net_table(tree))
+
+
+def list_nets(tree: list) -> list[dict]:
+    """Every net on the board as [{index, name}], sorted by name.
+
+    Read from the top-level table when the board has one, and otherwise from
+    the items themselves — a KiCAD 10 board declares its nets nowhere else.
+    `index` is None for a net that has no table entry. The unconnected net
+    (empty name) is not listed.
+
+    Names are decoded for display: a net stored `VBUS{slash}5V` is reported
+    as `VBUS/5V`. The tree keeps the stored form.
+    """
+    by_name: dict[str, int | None] = {}
+    for entry in _net_table(tree):
+        if entry["name"]:
+            by_name.setdefault(entry["name"], entry["index"])
+
+    def _note(node: list) -> None:
+        name = net_of(node)
+        if name:
+            by_name.setdefault(name, None)
+
+    for node in tree[1:]:
+        if is_call(node, "footprint"):
+            for pad in find_children(node, "pad"):
+                _note(pad)
+        elif is_call(node, "zone") or is_call(node, "segment") or is_call(node, "arc") or is_call(node, "via"):
+            _note(node)
+
+    return [{"index": idx, "name": name} for name, idx in sorted(by_name.items())]
+
+
 def find_net_index(tree: list, net_name: str) -> int | None:
-    """Index of a net by name. Matches the decoded or the stored spelling."""
+    """Index of a net by name, or None when the board has no table entry for it.
+
+    A KiCAD 10 board has no table at all, so this returns None for every net.
+    Use `net_exists` to ask whether a net is on the board, and `net_ref` to get
+    the value to write into a new `(net ...)` node.
+    """
     wanted = normalize_name(net_name)
-    for n in find_children(tree, "net"):
-        if len(n) >= 3 and isinstance(n[2], str) and normalize_name(n[2]) == wanted:
-            return int(n[1])
+    for entry in _net_table(tree):
+        if entry["name"] == wanted:
+            return entry["index"]
     return None
+
+
+def net_exists(tree: list, net_name: str) -> bool:
+    """True when `net_name` is used anywhere on the board."""
+    wanted = normalize_name(net_name)
+    return any(n["name"] == wanted for n in list_nets(tree))
+
+
+def net_ref(tree: list, net: int | str | None) -> int | str:
+    """The value to write into a new `(net ...)` node for `net`.
+
+    Accepts a net name (preferred) or a legacy integer index. Returns the
+    board's own spelling: an index on a board that still has a net table, the
+    name on a KiCAD 10 board. `None`, `0` and `""` mean the unconnected net.
+
+    Raises KeyError for a name the board does not know — a track on a net that
+    exists nowhere else is invisible to KiCAD and to every check here.
+    """
+    if net is None or net == "" or net == 0:
+        return 0
+    if isinstance(net, int):
+        return net
+    name = normalize_name(str(net))
+    idx = find_net_index(tree, name)
+    if idx is not None:
+        return idx
+    if not net_exists(tree, name):
+        known = [n["name"] for n in list_nets(tree)]
+        raise KeyError(f"net {net!r} not found on this board; known nets: {known}")
+    return name
 
 
 # Suffix conventions for diff pair members. Order matters: more-specific first.
@@ -613,15 +774,19 @@ def compute_trace_length(tree: list, net_name: str) -> dict:
     Returns mm total plus per-layer breakdown. Multi-layer traces are
     counted across all layers; vias add zero length.
     """
-    idx = find_net_index(tree, net_name)
-    if idx is None:
+    wanted = normalize_name(net_name)
+    if not net_exists(tree, wanted):
         raise KeyError(f"unknown net {net_name!r}")
+    idx = find_net_index(tree, wanted)
     total = 0.0
     by_layer: dict[str, float] = {}
     seg_count = 0
     for seg in find_children(tree, "segment"):
-        net = find_child(seg, "net")
-        if not net or int(net[1]) != idx:
+        seg_index, seg_name = read_net_node(seg)
+        if seg_name:
+            if seg_name != wanted:
+                continue
+        elif idx is None or seg_index != idx:
             continue
         start = find_child(seg, "start")
         end = find_child(seg, "end")
@@ -673,12 +838,7 @@ def add_meander_segments(
         side=side_map[side],
         base_width_mm=base_width_mm,
     )
-    net_idx = 0
-    if net_name:
-        idx = find_net_index(tree, net_name)
-        if idx is None:
-            raise KeyError(f"net {net_name!r} not found; declare it first or omit net_name")
-        net_idx = idx
+    net_value = net_ref(tree, net_name) if net_name else 0
 
     new_segments: list[list] = []
     for i in range(len(waypoints) - 1):
@@ -692,7 +852,7 @@ def add_meander_segments(
             [sym("end"), round_mm(x2k), round_mm(y2k)],
             [sym("width"), round_mm(width_mm)],
             [sym("layer"), layer],
-            [sym("net"), net_idx],
+            [sym("net"), net_value],
             [sym("uuid"), _uuid()],
         ]
         tree.append(node)
@@ -757,27 +917,22 @@ def add_zone(
     if not polygon_mcp or len(polygon_mcp) < 3:
         raise ValueError("polygon needs at least 3 points")
 
-    # Resolve net index by name
-    nets = find_children(tree, "net")
-    net_idx = 0
-    for n in nets:
-        if (
-            len(n) >= 3
-            and isinstance(n[2], str)
-            and n[2] == net_name
-        ):
-            net_idx = int(n[1])
-            break
-    else:
-        # Allocate a new (net N "name") at the top level
-        if net_name:
-            next_idx = max(
-                (int(n[1]) for n in nets if len(n) >= 2),
-                default=-1,
-            ) + 1
+    # Resolve the net the way the board spells nets. On a board with a legacy
+    # table that is an index — allocate an entry when the net has none. On a
+    # KiCAD 10 board it is the name itself; net 0 is the unconnected net, so a
+    # named zone must never be written with index 0.
+    net_nodes: list[list]
+    if net_name and has_net_table(tree):
+        idx = find_net_index(tree, net_name)
+        if idx is None:
+            idx = max((e["index"] for e in _net_table(tree)), default=-1) + 1
             tree.insert(_first_child_index(tree, "footprint", default=len(tree)),
-                        [sym("net"), next_idx, net_name])
-            net_idx = next_idx
+                        [sym("net"), idx, net_name])
+        net_nodes = [[sym("net"), idx], [sym("net_name"), net_name]]
+    elif net_name:
+        net_nodes = [[sym("net"), net_name]]
+    else:
+        net_nodes = [[sym("net"), 0]]
 
     pts_kicad = [pcb_to_file_xy(x, y) for (x, y) in polygon_mcp]
     pts_block: list[Any] = [sym("pts")]
@@ -792,8 +947,7 @@ def add_zone(
 
     zone_node = [
         sym("zone"),
-        [sym("net"), net_idx],
-        [sym("net_name"), net_name],
+        *net_nodes,
         layer_node,
         [sym("uuid"), str(uuid.uuid4())],
         [sym("name"), name or f"{net_name}_{layer}"],

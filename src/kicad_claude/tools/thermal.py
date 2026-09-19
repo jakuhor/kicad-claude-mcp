@@ -112,8 +112,8 @@ def register(mcp) -> None:
         for seg in sch_io.find_children(tree, "segment"):
             width_node = sch_io.find_child(seg, "width")
             layer_node = sch_io.find_child(seg, "layer")
-            net_node = sch_io.find_child(seg, "net")
-            if not (width_node and layer_node and net_node):
+            net_name = pcb_ed.net_of(seg) or "(no net)"
+            if not (width_node and layer_node):
                 continue
             try:
                 width_mm = float(width_node[1])
@@ -121,7 +121,6 @@ def register(mcp) -> None:
                 continue
             layer = layer_node[1] if len(layer_node) >= 2 else ""
             location = "external" if layer in ("F.Cu", "B.Cu") else "internal"
-            net_idx = int(net_node[1])
 
             try:
                 amps = ec.trace_current_ipc2152(
@@ -133,15 +132,8 @@ def register(mcp) -> None:
             except ValueError:
                 continue
 
-            # Resolve net name once per net
-            net_name = ""
-            for n in pcb_ed.list_nets(tree):
-                if n["index"] == net_idx:
-                    net_name = n["name"]
-                    break
-
             entry = per_net.setdefault(
-                net_name or f"<net{net_idx}>",
+                net_name,
                 {"min_width_mm": float("inf"), "min_capacity_a": float("inf"),
                  "segments": 0, "layers": set()},
             )

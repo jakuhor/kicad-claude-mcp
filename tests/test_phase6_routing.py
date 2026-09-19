@@ -176,3 +176,35 @@ def test_autoroute_pcb_tool_end_to_end(tmp_path: Path):
     assert Path(res["ses_path"]).is_file()
     assert Path(res["pcb_path"]).is_file()
     state.clear_active()
+
+
+def test_versioned_jar_names_are_found(tmp_path, monkeypatch):
+    """Releases download as `freerouting-2.1.0.jar`, not `freerouting.jar`."""
+    from pathlib import Path
+
+    third_party = tmp_path / "third_party"
+    third_party.mkdir()
+    (third_party / "freerouting-2.0.1.jar").write_bytes(b"old")
+    (third_party / "freerouting-2.1.0.jar").write_bytes(b"new")
+    monkeypatch.delenv("FREEROUTING_JAR", raising=False)
+    monkeypatch.setattr(
+        freerouting, "__file__",
+        str(tmp_path / "src" / "kicad_claude" / "adapters" / "freerouting.py"),
+    )
+    found = freerouting.find_freerouting_jar()
+    assert found == Path(third_party / "freerouting-2.1.0.jar")
+
+
+def test_unversioned_jar_still_wins(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    third_party = tmp_path / "third_party"
+    third_party.mkdir()
+    (third_party / "freerouting.jar").write_bytes(b"plain")
+    (third_party / "freerouting-2.1.0.jar").write_bytes(b"versioned")
+    monkeypatch.delenv("FREEROUTING_JAR", raising=False)
+    monkeypatch.setattr(
+        freerouting, "__file__",
+        str(tmp_path / "src" / "kicad_claude" / "adapters" / "freerouting.py"),
+    )
+    assert freerouting.find_freerouting_jar() == Path(third_party / "freerouting.jar")

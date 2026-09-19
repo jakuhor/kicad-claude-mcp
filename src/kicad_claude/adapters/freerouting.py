@@ -43,7 +43,9 @@ _PATTERNS = {
 def find_freerouting_jar() -> Path | None:
     """Resolve the Freerouting JAR path.
 
-    Order: FREEROUTING_JAR env > <repo>/third_party/freerouting.jar.
+    Order: FREEROUTING_JAR env > `<repo>/third_party/freerouting*.jar`. The
+    release downloads are named `freerouting-2.1.0.jar`, so the versioned names
+    are matched too, newest version first.
     """
     env = os.environ.get("FREEROUTING_JAR")
     if env:
@@ -51,11 +53,22 @@ def find_freerouting_jar() -> Path | None:
         if p.is_file():
             return p
 
-    repo_root = Path(__file__).resolve().parents[3]
-    candidate = repo_root / "third_party" / "freerouting.jar"
+    third_party = Path(__file__).resolve().parents[3] / "third_party"
+    candidate = third_party / "freerouting.jar"
     if candidate.is_file():
         return candidate
-    return None
+    versioned = sorted(
+        (p for p in third_party.glob("freerouting*.jar") if p.is_file()),
+        key=lambda p: _version_key(p.stem),
+        reverse=True,
+    )
+    return versioned[0] if versioned else None
+
+
+def _version_key(stem: str) -> tuple[int, ...]:
+    """Sort key from a jar's name: `freerouting-2.1.0` -> (2, 1, 0)."""
+    digits = re.findall(r"\d+", stem)
+    return tuple(int(d) for d in digits) or (0,)
 
 
 def find_java() -> Path | None:

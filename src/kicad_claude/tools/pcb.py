@@ -188,16 +188,38 @@ def register(mcp) -> None:
         }
 
     @mcp.tool()
+    def remove_footprint(reference: str) -> dict:
+        """Delete a placed footprint from the active PCB.
+
+        Tracks and vias that were routed to its pads stay where they are —
+        KiCAD does the same — so re-run `run_drc` afterwards to see what the
+        removal left dangling. To clear out every footprint whose symbol is
+        gone, use `update_pcb_from_schematic(remove_extra=True)`.
+        """
+        tree, path = _load_active_pcb()
+        if not ed.remove_footprint(tree, reference):
+            raise KeyError(f"no footprint with reference {reference!r} on this board")
+        backup = _save_with_backup(tree, path)
+        return {
+            "removed": reference,
+            "backup": str(backup) if backup else None,
+        }
+
+    @mcp.tool()
     def place_footprints_grid(
         spacing_mm: float = 10.0,
         columns: int = 5,
         origin_x_mm: float = 15.0,
         origin_y_mm: float = 15.0,
+        only_unplaced: bool = True,
     ) -> dict:
-        """Distribute footprints currently at (0,0) onto a regular grid.
+        """Lay footprints out on a regular grid, sorted by reference.
 
-        Useful right after KiCAD's Update PCB from Schematic, when every new
-        footprint is stacked at the origin.
+        By default only the footprints sitting at (0, 0) are moved — where
+        KiCAD leaves a part it has no position for. Pass
+        `only_unplaced=False` to re-arrange every footprint on the board,
+        which is what `update_pcb_from_schematic` needs: it drops new parts in
+        a row below the board outline rather than at the origin.
         """
         tree, path = _load_active_pcb()
         result = ed.place_footprints_grid(
@@ -205,6 +227,7 @@ def register(mcp) -> None:
             spacing_mm=spacing_mm,
             columns=columns,
             origin_mcp=(origin_x_mm, origin_y_mm),
+            only_unplaced=only_unplaced,
         )
         backup = _save_with_backup(tree, path)
         result["backup"] = str(backup) if backup else None

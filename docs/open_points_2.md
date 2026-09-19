@@ -10,8 +10,11 @@ header) in a scratch directory and drove every tool through the same
 `register(mcp)` entry points the MCP server uses. KiCad 10.0.6, board format
 `20260206`, schematic format `20260306`.
 
-**What works.** Project creation, symbol and footprint creation, symbol
-placement with autoplaced fields, arbitrary symbol properties (`MPN`,
+**Status: P1–P13 are all closed, worked the same day (2026-09-19).** Each
+point keeps its diagnosis and records what was done.
+
+**What already worked.** Project creation, symbol and footprint creation,
+symbol placement with autoplaced fields, arbitrary symbol properties (`MPN`,
 `Manufacturer`, ...), wires, junctions, power symbols, labels, annotation of
 `?` references, `list_sch_nets` / `trace_net` / `find_dangling`, board outline,
 layer count, footprint placement and moves, `validate_decoupling_caps`, DRC
@@ -20,54 +23,50 @@ STEP, 3D render, `export_fab_package`, backups through `safe_write`, and
 formatting preservation — a symbol added and then removed leaves a
 byte-identical file, and every write produced a minimal diff.
 
-**What does not.** The list below. P1 and P2 are the serious ones: ERC always
-reports a clean schematic, and every net-aware PCB tool misreads boards written
-by KiCad 10.
-
 ---
 
-## P1 — `run_erc` always reports zero violations (Critical)
+## P1 — `run_erc` always reported zero violations (Critical) — DONE
 
-`adapters/kicad_cli.py:142` `_shape_erc` reads `data["violations"]`. KiCad 10's
-ERC JSON (`https://schemas.kicad.org/erc.v1.json`) has no top-level
-`violations` key — violations are nested per sheet:
+`adapters/kicad_cli.py` `_shape_erc` read `data["violations"]`. KiCad 10's ERC
+JSON (`https://schemas.kicad.org/erc.v1.json`) has no top-level `violations`
+key — violations are nested per sheet:
 
 ```
 {"source": ..., "sheets": [{"path": "/", "uuid_path": ..., "violations": [...]}]}
 ```
 
-The key is therefore always missing, and the tool reports
-`errors: 0, warnings: 0, total_violations: 0` for every schematic.
-
-Measured on the test board, with an unconnected LM358 and a dangling wire in
-place:
-
-- `run_erc()` returned `{"errors": 0, "warnings": 0, "total_violations": 0}`.
-- `kicad-cli sch erc --severity-all` on the same file found 6 violations:
-  2 x `power_pin_not_driven` (error), 1 x `wire_dangling` (error),
-  1 x `endpoint_off_grid`, 2 x `unconnected_wire_endpoint` (warnings).
-
-The MCP call even wrote the correct raw report to `e2e.erc.json`; only the
-shaping dropped it. This is the worst defect found: the project's own rule is
-to prove a write valid with `kicad-cli`, and ERC currently certifies every
+The key was therefore always missing, and the tool reported
+`errors: 0, warnings: 0, total_violations: 0` for every schematic. Measured on
+the test board, with an unconnected LM358 and a dangling wire in place,
+`run_erc()` said 0 while `kicad-cli sch erc --severity-all` on the same file
+found 6. The MCP call even wrote the correct raw report; only the shaping
+dropped it. That is the one failure mode nobody notices, because the project's
+rule is to prove a write valid with `kicad-cli` and ERC was certifying every
 schematic as clean.
 
-`run_drc` is unaffected — the DRC schema does keep `violations` at the top
-level — but it should be re-checked against the schema rather than assumed.
+**Fixed.** `_erc_violations` walks `data["sheets"][*]["violations"]`, tags each
+violation with the `sheet` it came from, and still reads a flat `violations`
+list so older reports keep working. The result gains a `sheets` list with a
+per-sheet error/warning breakdown.
 
-Fix: walk `data["sheets"][*]["violations"]`, keep a per-sheet breakdown, and
-fall back to the flat key for older reports.
+`run_drc` was checked against the DRC schema rather than assumed: that one does
+keep `violations`, `unconnected_items` and `schematic_parity` at the top level,
+so it was already right.
 
-## P2 — the PCB net model is the pre-KiCad-10 one (Critical)
+Verified on the round-2 test board: `run_erc()` now returns 3 errors and 3
+warnings — the same 6 `kicad-cli` reports.
+
+## P2 — the PCB net model was the pre-KiCad-10 one (Critical) — DONE
 
 KiCad 10 (board `20260206`) no longer writes a top-level
 `(net <index> "<name>")` table. Pads, zones and tracks carry the net **by
-name**: `(pad "1" smd rect ... (net "GND"))`, `(zone (net "GND") ...)`. A board
-saved by `pcbnew` in this run contains zero top-level `(net ...)` declarations.
+name**: `(pad "1" smd rect … (net "GND"))`, `(zone (net "GND") …)`. A board
+saved by `pcbnew` contains zero top-level `(net …)` declarations.
 
-`adapters/pcb_editor.list_nets` (and `find_net_index`) only recognise
-`(net <int> "<name>")`, so on a KiCad 10 board they see nothing. Everything
-built on them degrades silently:
+`pcb_editor.list_nets` (and `find_net_index`) only recognised
+`(net <int> "<name>")`, so on a KiCad 10 board they saw nothing, and
+`pcb_netlist` keyed its whole connectivity graph on the integer, which is 0 for
+every pad on such a board. Everything built on them degraded silently:
 
 | Tool | Observed on the test board | Truth |
 |---|---|---|
@@ -77,55 +76,75 @@ built on them degrades silently:
 | `get_pad_position` | `net_number: 0` for `/+3V3` | pcbnew reports netcode 3 |
 | `analyze_ground_coverage` | `"no GND zone on B.Cu"` | a GND zone is on B.Cu |
 
-Two writers make it worse:
+Two writers made it worse: `add_zone` wrote the legacy pair `(net 0)` +
+`(net_name "GND")` plus a fabricated top-level `(net 0 "GND")` — index 0 is
+reserved for the unconnected net — and `add_track(net=…)` took an integer index
+that exists nowhere in a KiCad 10 file and wrote it unchecked.
 
-- `add_zone` writes the legacy pair `(net 0)` + `(net_name "GND")` and appends
-  a fabricated top-level `(net 0 "GND")`. Index 0 is reserved for the
-  unconnected net. KiCad still resolves the zone to GND through `net_name`, so
-  the board is not corrupt, but the declaration is wrong, and it is what makes
-  `list_nets` return a single bogus entry on boards this server wrote.
-- `add_track(net=...)` takes an integer net index. On a KiCad 10 board no such
-  index exists in the file; the call accepts any number and writes it
-  unchecked.
+**Fixed.** Net identity is a name everywhere:
 
-Fix: make net identity a name everywhere — read the set of nets from pad, zone
-and track `(net ...)` nodes, accept a name in `add_track` / `add_via`, and
-write zones as `(net "<name>")`. Keep reading the legacy table so older boards
-still load.
+- `pcb_editor.read_net_node` reads all three spellings (`(net 3 "GND")`,
+  `(net "GND")`, `(net 3)`); `net_of(node, tree)` resolves the name, falling
+  back to a zone's `net_name` child and, on a board that still has a table, to
+  the table entry for an index-only reference.
+- `list_nets` collects nets from the table when there is one and otherwise from
+  the pads, zones, tracks and vias themselves; `index` is None for a net with
+  no table entry, and the unconnected net is not listed. `net_exists` and
+  `has_net_table` answer the two questions callers actually have.
+- `net_ref(tree, net)` returns what to write into a new `(net …)` node — an
+  index on a legacy board, the name on a KiCad 10 one — and raises `KeyError`
+  naming the known nets when the net is not on the board. `add_track`,
+  `add_via`, `add_via_array_along_line` and `add_meander_segments` take a name
+  (an integer still works) and go through it, so a track can no longer be
+  written onto a net that exists nowhere.
+- `add_zone` writes `(net "<name>")` on a KiCad 10 board and the legacy pair on
+  a board with a table, allocating a table entry when the net has none. It
+  never fabricates a `(net 0 "<name>")` declaration.
+- `pcb_netlist` keys connectivity on the net name, so `list_unrouted`,
+  `net_route_status` and `build_connectivity` work on both formats.
+- `emc.analyze_ground_coverage` and `emc.find_long_traces`, `thermal` and
+  `simulation` read their nets through `net_of`. Copper with no net is reported
+  under one `(no net)` bucket rather than dropped — it still radiates and still
+  has a current limit.
 
-Blast radius beyond the table above: `add_via`, `add_ground_stitching`,
-`add_via_array`, `add_rf_microstrip`, the diff-pair tools and
-`check_return_path_continuity` resolve nets the same way and were not
-exercised individually.
+Verified: on the test board `list_nets` reports all 4 nets, `list_unrouted`
+counts 9 — the same number KiCad's DRC reports — and the slow acceptance gate
+(`test_unrouted_count_matches_kicad_drc`) still matches DRC on all five demo
+boards.
 
-## P3 — Windows library auto-detection never finds KiCad (Major)
+## P3 — Windows library auto-detection never found KiCad (Major) — DONE
 
-`utils/kicad_paths._KICAD_VERSIONS = ("10", "9", "8", "7")` builds
+`utils/kicad_paths._KICAD_VERSIONS = ("10", "9", "8", "7")` built
 `C:\Program Files\KiCad\10\share\kicad\symbols`. The installer uses `10.0`,
-`7.0`, ... — with a dot. `find_symbol_lib_dirs()` and
-`find_footprint_lib_dirs()` therefore return `[]` on a stock Windows install,
-and only a `KICAD_LIBRARY_PATH` entry hides it. The `.env` in this repo has the
-variable present but empty, so a fresh checkout indexes nothing.
+`7.0`, … — with a dot — so `find_symbol_lib_dirs()` and
+`find_footprint_lib_dirs()` returned `[]` on a stock Windows install, and only
+a `KICAD_LIBRARY_PATH` entry hid it. The `.env` in this repo has the variable
+present but empty, so a fresh checkout indexed nothing.
 
-The failure is silent and destructive: `index_libraries(force=True)` with no
-directories found builds an empty index and **overwrites**
+The failure was also silent and destructive: `index_libraries(force=True)` with
+no directories found built an empty index and **overwrote**
 `~/.cache/kicad-claude/index.json` with `0 symbols, 0 footprints`. That
-happened during this run and had to be repaired by hand.
+happened during the review and had to be repaired by hand.
 
-Fix: probe `major.minor` directory names (glob `C:\Program Files\KiCad\*`), and
-refuse to save an index that found no libraries — return an error naming the
-directories that were searched.
+**Fixed.** `_windows_share_dirs(leaf)` lists the real version directories under
+every `Program Files\KiCad`, newest first, exactly as `_platform_default_cli_paths`
+already did for `kicad-cli`, and keeps the bare names as a fallback. And
+`index_libraries` refuses to save an index that found neither a symbol nor a
+footprint: it raises, names the directories it searched, and leaves the
+previous cache alone.
 
-## P4 — libraries the server creates are not usable by the server (Major)
+Verified without any environment variable set: `find_symbol_lib_dirs()` returns
+`C:/Program Files/KiCad/10.0/share/kicad/symbols` and a forced re-index finds
+223 libraries.
+
+## P4 — libraries the server creates were not usable by the server (Major) — DONE
 
 `create_symbol` writes `<project>/lib/<Lib>.kicad_sym` and registers it in the
 project's `sym-lib-table`; `create_footprint` does the same for
-`<project>/lib/<Lib>.pretty` and `fp-lib-table`. Neither path is ever indexed:
-`indexer.build_index` walks the global directories only, and reads neither
-`sym-lib-table` / `fp-lib-table` nor the active project's `lib/`.
-
-`add_symbol` and `add_footprint` resolve a `lib_id` exclusively through the
-index, so the sequence the tools advertise fails:
+`<project>/lib/<Lib>.pretty` and `fp-lib-table`. Neither path was ever indexed:
+`indexer.build_index` walks the global directories only. `add_symbol` and
+`add_footprint` resolve a `lib_id` exclusively through the index, so the
+sequence the tools advertise failed:
 
 ```
 create_symbol("E2ELib", "MYREG", ...)  -> OK
@@ -133,20 +152,22 @@ index_libraries(force=True)            -> 224 libs, 22874 symbols (E2ELib absent
 add_symbol("E2ELib:MYREG", "U1", ...)  -> KeyError: unknown lib_id 'E2ELib:MYREG'
 ```
 
-Adding `<project>/lib` to `KICAD_LIBRARY_PATH` makes the same sequence work, so
-the gap is indexing scope only. `import_vendor_zip` lands in the same place and
-has the same problem.
+**Fixed.** `tools/library._ensure_index` overlays the active project's own
+libraries on the global index: `<project>/lib`, plus every directory named by
+the project's `sym-lib-table` / `fp-lib-table` with `${KIPRJMOD}` expanded. The
+overlay is read fresh on every lookup rather than cached, because a project
+library changes under the server's own hands, and it is small. `index_libraries`
+reports the merged totals.
 
-Fix: include the active project's `lib/` — better, the directories listed in
-its `sym-lib-table` / `fp-lib-table` — in the index, and re-index the project
-library automatically after `create_symbol`, `create_footprint` and
-`import_vendor_zip`.
+Verified with no `KICAD_LIBRARY_PATH` at all: `create_symbol` →
+`add_symbol` → `create_footprint` → `add_footprint` with no re-index in
+between, and `search_symbol` finds the new part.
 
-## P5 — `set_project` raises on any project with a populated PCB (Major)
+## P5 — `set_project` raised on any project with a populated PCB (Major) — DONE
 
-`tools/project.py:15` imports `PCB` and `Schematic` from `kicad-skip`, used by
-`_summarize` for the symbol / footprint / net counts. `kicad-skip` cannot parse
-a KiCad 10 footprint's text items:
+`tools/project.py` imported `PCB` and `Schematic` from `kicad-skip` for the
+symbol / footprint / net counts. `kicad-skip` cannot parse a KiCad 10
+footprint's text items:
 
 ```
 File ".../skip/sexp/parser.py", line 618, in __init__
@@ -154,114 +175,180 @@ File ".../skip/sexp/parser.py", line 618, in __init__
 AttributeError: 'Symbol' object has no attribute '_base_coords'
 ```
 
-So `set_project` raises on a project whose `.kicad_pcb` holds at least one
-footprint — that is, on any real project. `state.set_active` runs first, so the
-project *is* active and the following calls work, which makes the error look
-random. `get_project_state` and the summary returned by `create_project` fail
-the same way. `_summarize` also reads `pcb.net`, which is P2 again.
+So `set_project` raised on any project whose `.kicad_pcb` held a footprint —
+that is, on any real project. `state.set_active` runs first, so the project
+*was* active and the following calls worked, which made the error look random.
+`get_project_state` and the summary returned by `create_project` failed the
+same way.
 
-Fix: drop `kicad-skip` from the summary and count with the project's own
-`sch_io` / `pcb_editor` readers, which parse these files correctly.
+**Fixed.** `kicad-skip` is gone from `tools/project.py`. `_summarize` counts
+with `sch_editor.iter_instance_symbols`, `pcb_editor.iter_footprints` and
+`pcb_editor.list_nets`; `list_components` and `_component_dict` read the parsed
+tree through `sch_io`. One behaviour changed: a blank project now reports
+`nets: 0` rather than 1, because the unconnected net is not a net.
 
-## P6 — `update_pcb_from_schematic` is netlist-only (Major)
+Verified on the round-2 test board: `set_project` returns
+`symbols: 11, footprints: 6, nets: 5`.
 
-The tool exports the netlist and assigns pad nets through `pcbnew`. It does
-not:
+## P6 — `update_pcb_from_schematic` was netlist-only (Major) — DONE
 
-- add footprints for schematic symbols missing from the PCB — it lists them in
-  `missing_in_pcb` and expects the caller to call `add_footprint` once per
-  component, with the `lib_id` retyped by hand instead of read from the
-  symbol's `Footprint` property;
-- remove footprints whose symbol is gone;
-- update a footprint's value, or copy the symbol's fields. DRC schematic parity
-  on the test board reported 6 x `footprint_symbol_field_mismatch` (`MPN`
-  missing on four footprints, `Datasheet` and `Description` differing).
+The tool exported the netlist and assigned pad nets through `pcbnew`. It did
+not place footprints (it listed them in `missing_in_pcb` and expected the
+caller to call `add_footprint` once per component, retyping the lib_id the
+symbol already carried), did not remove footprints whose symbol was gone, and
+did not copy any field — DRC schematic parity on the test board reported 6 ×
+`footprint_symbol_field_mismatch`. Its docstring also pointed at
+`remove_footprint`, which did not exist.
 
-For "update the PCB from the schematic" to mean what it says, the tool should
-at least place the missing footprints from each symbol's `Footprint` property
-and carry the fields across. Until then the docstring should say plainly that
-the caller must place footprints first.
+**Built.** `tools/sync_components.py` does the component side, and
+`update_pcb_from_schematic` gained three switches:
 
-Also: the docstring points at `remove_footprint`, which does not exist — the
-server has no tool to delete a footprint from a board.
+- `place_missing=True` — a footprint for every symbol that has none on the
+  board, from the symbol's own `Footprint` property, dropped in a grid just
+  below the board outline. A symbol with no `Footprint` is reported in
+  `no_footprint`; a lib_id the index does not know in `unresolved`. Neither
+  stops the rest of the update.
+- `sync_fields=True` — `Value` and the symbol's other fields (`MPN`,
+  `Manufacturer`, …) copied onto the matching footprint, hidden on `F.Fab`,
+  which is what schematic parity compares and what an assembly BOM taken from
+  the board needs. Idempotent: a second pass writes nothing.
+- `remove_extra=False` — footprints whose symbol is gone are only listed in
+  `orphan_footprints` unless this is on. A board legitimately carries
+  footprints no symbol knows about (mounting holes, fiducials, logos), and
+  losing those to a sync would be worse than leaving a stale part behind.
 
-## P7 — `export_pcb_svg()` fails with default arguments (Minor)
+`remove_footprint(reference)` now exists as a tool as well. And
+`place_footprints_grid` gained `only_unplaced` (default True, the old
+behaviour): the new placement puts parts below the outline rather than at
+(0, 0), so arranging them needs `only_unplaced=False`.
 
-`layers` defaults to `None`, and `kicad-cli pcb export svg` then exits 1 with
-`At least one layer must be specified`. Either default to the usual set
-(`F.Cu,B.Cu,F.Silkscreen,B.Silkscreen,Edge.Cuts`) or make the argument required
-with a message that names the format.
+Verified: a three-part schematic goes from a blank board to placed, net-assigned
+footprints in one call, with DRC reporting 0 violations and 0 parity findings;
+deleting a symbol and re-running with `remove_extra=True` drops its footprint.
 
-## P8 — the fab package's BOM has no sourcing fields (Minor)
+## P7 — `export_pcb_svg()` failed with default arguments (Minor) — DONE
 
-`export_fab_package` calls `export_bom` with the default field set, so
-`fab/<project>-bom.csv` is `Refs,Value,Footprint,Qty,DNP`. The `MPN` and
-`Manufacturer` properties the sourcing tools write never reach it, and the
-package is not ready for assembly quoting. `export_bom(fields=...)` works when
-called directly — the fields are passed through correctly.
+`layers` defaulted to `None`, and `kicad-cli pcb export svg` then exited 1 with
+`At least one layer must be specified`.
 
-Worth knowing as well: `export_fab_package` overwrites
-`fab/<project>-bom.csv`, so a BOM exported earlier with custom fields is lost.
+**Fixed.** `kicad_cli.DEFAULT_SVG_LAYERS` — both copper layers, both
+silkscreens, both solder masks and `Edge.Cuts` — is used when the caller names
+none, and the docstrings say so.
 
-## P9 — `create_symbol` cannot set arbitrary fields (Minor)
+## P8 — the fab package's BOM had no sourcing fields (Minor) — DONE
 
-`create_symbol` takes `value`, `footprint`, `datasheet`, `description` and
-`keywords` only. A library symbol cannot be given `MPN`, `Manufacturer`, `LCSC`
-or any other property; those can be added only to a placed instance, via
-`set_symbol_property`. For a house library that is the wrong way round — the
-part number belongs to the library symbol.
+`export_fab_package` called `export_bom` with the default field set, so
+`fab/<project>-bom.csv` was `Refs,Value,Footprint,Qty,DNP`. The `MPN` and
+`Manufacturer` properties the sourcing tools write never reached it, and the
+package was not ready for assembly quoting.
 
-## P10 — `remove_wire` cannot remove an off-grid wire (Minor)
+**Fixed.** `manufacturing.DEFAULT_BOM_FIELDS` is
+`Reference,Value,Footprint,MPN,Manufacturer,Datasheet,${QUANTITY},${DNP}`, and
+`export_fab_package` takes `bom_fields` to override it. The docstring says that
+the call overwrites `fab/<project>-bom.csv`, so a BOM with other columns wants
+a path of its own.
 
-`add_wire` has `snap_to_grid`; `remove_wire` does not, and always snaps the
-coordinates it is given. A wire drawn with `snap_to_grid=False` — the normal
-case when connecting to pins that are not on the 1.27 mm grid — cannot be
-removed:
+## P9 — `create_symbol` could not set arbitrary fields (Minor) — DONE
+
+`create_symbol` took `value`, `footprint`, `datasheet`, `description` and
+`keywords` only. A library symbol could not be given `MPN`, `Manufacturer` or
+`LCSC`; those could be added only to a placed instance. For a house library
+that is the wrong way round — the part number belongs to the library symbol.
+
+**Built.** `create_symbol(fields={"MPN": "...", "Manufacturer": "..."})` writes
+each field as a hidden property on the library symbol, so every placement
+inherits it. A field that has its own argument (`Footprint`, `Datasheet`, …) is
+refused rather than written twice.
+
+## P10 — `remove_wire` could not remove an off-grid wire (Minor) — DONE
+
+`remove_wire` snapped the coordinates it was given before looking, so a wire
+drawn with `snap_to_grid=False` — the normal case when connecting to pins that
+are not on the 1.27 mm grid — could not be removed:
 
 ```
 remove_wire(200, 140, 210, 140)
 -> KeyError: no wire between (199.39, 139.7) and (209.55, 139.7)
 ```
 
-`remove_junction` and `remove_no_connect` should be checked for the same thing.
+**Fixed.** `_candidate_points` tries the coordinates exactly as given first and
+the snapped point only as a fallback, in `remove_wire`, `remove_junction` and
+`remove_no_connect`. The error now lists every point that was tried.
 
-## P11 — malformed `pins` / `pads` raise a bare `KeyError` (Minor)
+## P11 — malformed `pins` / `pads` raised a bare `KeyError` (Minor) — DONE
 
-`create_symbol(pins=[{"number": "1", "name": "VIN", "side": "left"}])` raises
+`create_symbol(pins=[{"number": "1", "name": "VIN", "side": "left"}])` raised
 `KeyError: 'x_mm'`, naming neither the offending pin nor the expected schema.
-`create_footprint` fails the same way. Validate the dicts and say which entry
-is wrong.
+`create_footprint` failed the same way.
 
-## P12 — autorouting not verified (Info)
+**Fixed.** `_check_keys` validates every pin and pad dict before it reaches the
+node builders:
 
-`autoroute_pcb` raises `FreeroutingError: freerouting.jar not found` on this
-machine; `FREEROUTING_JAR` is empty and `third_party/freerouting.jar` is
-absent. `export_dsn` works (8 kB DSN written from the test board), so only the
-Freerouting leg is untested. Not a code defect — it needs the jar and a JRE.
+```
+pins[0] is missing x_mm, y_mm; a pin takes {number, name, x_mm, y_mm,
+length_mm, angle_deg, angle, type, shape} (required: number, x_mm, y_mm)
+```
 
-## P13 — the tests encode the old formats (Major, test debt)
+An unknown key is refused too, rather than silently leaving the value at its
+default — `{"pin_type": "power_in"}` used to produce a passive pin without a
+word.
 
-`uv run pytest -m "not slow and not network"` is 390 passed, 1 skipped — with
-P1 and P2 both live. Two reasons:
+## P12 — autorouting was not verified (Info) — DONE
 
-- `tests/test_phase7_validation.py:36` feeds `_shape_erc` a hand-written report
-  with a flat `violations` list. KiCad 10 does not produce that shape, so the
-  test passes while the tool is blind. The acceptance test at line 152 asserts
-  `total_violations >= 0`, which cannot fail.
-- The PCB fixtures still carry a legacy top-level net table, so the net tools
-  are never exercised against a board `pcbnew` wrote.
+`autoroute_pcb` raised `FreeroutingError: freerouting.jar not found`, so only
+`export_dsn` had been exercised (8 kB DSN written from the test board).
 
-Fix alongside P1 and P2: generate the ERC and DRC fixtures with `kicad-cli`
-from a schematic with known violations, and add a PCB fixture saved by KiCad 10
-(no net table, named pad nets).
+The jar was then placed at `third_party/freerouting-2.1.0.jar` — the name the
+releases download under — and `find_freerouting_jar` only ever looked for the
+exact name `freerouting.jar`, so it was still not found.
+
+**Fixed.** `find_freerouting_jar` falls back to `third_party/freerouting*.jar`,
+newest version first, after `FREEROUTING_JAR` and the unversioned name.
+
+Verified end to end on the round-2 test board with Freerouting 2.1.0 and
+JDK 21: 6 unrouted connections before, 0 after, and `run_drc(refill_zones=True)`
+reports 0 errors, 0 unconnected items and 0 parity findings — only two
+`silk_overlap` warnings from the scratch placement.
+
+## P13 — the tests encoded the old formats (Major, test debt) — DONE
+
+The fast suite passed with P1 and P2 both live: the ERC unit test fed
+`_shape_erc` a hand-written report with a flat `violations` list, a shape KiCad
+10 does not produce, and the acceptance test asserted `total_violations >= 0`,
+which cannot fail. The PCB fixtures all carried a legacy net table, so the net
+tools were never exercised against a board `pcbnew` wrote.
+
+**Built.** The suite is 425 fast tests (was 390) and 43 slow ones, with:
+
+- `test_phase7_validation.py` — `_shape_erc` against a KiCad 10 per-sheet
+  report and against a flat one, plus a slow test that builds a schematic with
+  a dangling wire and requires `run_erc` to report it. That test fails against
+  the old shaping.
+- `test_phase17_pcb_connectivity.py` — a KiCad 10 board fixture (no net table,
+  pads named by net) covering `list_nets`, `list_unrouted`, writing a track by
+  name, refusing an unknown net, and a zone written as `(net "GND")`; plus the
+  legacy-board counterparts, so both formats stay covered.
+- `test_phase2_indexer.py` — dotted Windows version directories, the refusal to
+  save an empty index, and the project-library overlay.
+- `test_phase1_project.py` — the summary on a board with a footprint on it.
+- `test_phase10_rules_sync.py` — the component sync: placement, the two
+  reporting paths, field copying and idempotence, orphan listing vs removal.
+- `test_phase3_schematic.py`, `test_phase5_pcb.py`, `test_phase9_manufacturing.py`,
+  `test_phase13_advanced.py` — the P7–P11 behaviours.
 
 ---
 
-## Suggested order
+## Verification
 
-1. P1 — one function; restores the ability to prove a schematic is valid.
-2. P2 — the net model; touches `pcb_editor` and every net-aware tool.
-3. P13 — fixtures, so 1 and 2 stay fixed.
-4. P5, P3, P4 — the flow is unusable on a clean machine without them.
-5. P6 — makes `update_pcb_from_schematic` match its name.
-6. P7-P11 — small and independent.
+```bash
+uv run pytest -m "not slow and not network" -q   # 428 passed
+uv run pytest -m "slow" -q                       # 46 passed
+uv run ruff check .                              # 47 pre-existing findings, unchanged
+```
+
+The end-to-end flow was re-run afterwards with no environment configuration at
+all — no `KICAD_LIBRARY_PATH` — from `create_project` through custom symbol and
+footprint creation, wiring, annotation, ERC, `update_pcb_from_schematic`,
+ground plane, DRC, STEP, render, SVG and `export_fab_package`. Every tool
+returned; ERC reported the circuit's two real power-pin errors, `list_unrouted`
+agreed with DRC's unconnected count, and schematic parity was clean.

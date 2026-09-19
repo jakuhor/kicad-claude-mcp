@@ -284,3 +284,156 @@ class TestOnARealBoard:
                     reference=first["reference"], pad=first["pad"])
         assert res["position_mm"] == first["position_mm"]
         assert res["net"] == first["net"]
+
+
+# ===== KiCAD 10 names its nets, and drops the net table =================== #
+#
+# Board format 20260206 writes `(net "GND")` on pads, zones, tracks and vias,
+# and no top-level `(net N "name")` table at all. Every fixture above is an
+# older board that still has the table, so these tests carry the new shape.
+
+
+_K10_BOARD = """(kicad_pcb
+\t(version 20260206)
+\t(generator "pcbnew")
+\t(layers
+\t\t(0 "F.Cu" signal)
+\t\t(2 "B.Cu" signal)
+\t\t(44 "Edge.Cuts" user)
+\t)
+\t(footprint "L:R"
+\t\t(layer "F.Cu")
+\t\t(uuid "11111111-1111-1111-1111-111111111111")
+\t\t(at 100 100)
+\t\t(property "Reference" "R1"
+\t\t\t(at 0 0 0)
+\t\t\t(layer "F.SilkS")
+\t\t\t(uuid "11111111-1111-1111-1111-111111111112")
+\t\t)
+\t\t(pad "1" smd rect
+\t\t\t(at 0 0)
+\t\t\t(size 1 1)
+\t\t\t(layers "F.Cu")
+\t\t\t(net "SIG")
+\t\t\t(uuid "11111111-1111-1111-1111-111111111113")
+\t\t)
+\t)
+\t(footprint "L:R"
+\t\t(layer "F.Cu")
+\t\t(uuid "22222222-2222-2222-2222-222222222221")
+\t\t(at 110 100)
+\t\t(property "Reference" "R2"
+\t\t\t(at 0 0 0)
+\t\t\t(layer "F.SilkS")
+\t\t\t(uuid "22222222-2222-2222-2222-222222222222")
+\t\t)
+\t\t(pad "1" smd rect
+\t\t\t(at 0 0)
+\t\t\t(size 1 1)
+\t\t\t(layers "F.Cu")
+\t\t\t(net "SIG")
+\t\t\t(uuid "22222222-2222-2222-2222-222222222223")
+\t\t)
+\t)
+)
+"""
+
+
+@pytest.fixture
+def k10_board(tmp_path):
+    path = tmp_path / "k10.kicad_pcb"
+    path.write_text(_K10_BOARD, encoding="utf-8")
+    return path
+
+
+class TestKicad10NamedNets:
+    def test_list_nets_finds_nets_without_a_table(self, k10_board):
+        from kicad_claude.adapters import pcb_editor as ed
+
+        tree = sch_io.parse_file(k10_board)
+        assert ed.has_net_table(tree) is False
+        assert ed.list_nets(tree) == [{"index": None, "name": "SIG"}]
+        assert ed.net_exists(tree, "SIG") is True
+        assert ed.net_exists(tree, "GND") is False
+
+    def test_pads_report_their_net(self, k10_board):
+        pads = pn.list_pads(sch_io.parse_file(k10_board))
+        assert [p["net_name"] for p in pads] == ["SIG", "SIG"]
+
+    def test_two_unjoined_pads_read_as_one_missing_link(self, k10_board):
+        res = pn.list_unrouted(sch_io.parse_file(k10_board))
+        assert res["count"] == 1
+        assert res["unrouted"][0]["net"] == "SIG"
+
+    def test_a_track_on_the_net_routes_it(self, k10_board):
+        from kicad_claude.adapters import pcb_editor as ed
+
+        tree = sch_io.parse_file(k10_board)
+        node = ed.add_track(tree, 100, 100, 110, 100, width_mm=0.25,
+                            layer="F.Cu", net="SIG")
+        # The net is written the way this board spells nets: by name.
+        assert sch_io.find_child(node, "net")[1] == "SIG"
+        assert pn.list_unrouted(tree)["count"] == 0
+
+    def test_a_track_on_an_unknown_net_is_refused(self, k10_board):
+        from kicad_claude.adapters import pcb_editor as ed
+
+        tree = sch_io.parse_file(k10_board)
+        with pytest.raises(KeyError, match="not found on this board"):
+            ed.add_track(tree, 100, 100, 110, 100, net="NOPE")
+
+    def test_zone_is_written_by_name_and_never_on_net_0(self, k10_board):
+        from kicad_claude.adapters import pcb_editor as ed
+
+        tree = sch_io.parse_file(k10_board)
+        zone = ed.add_zone(
+            tree, net_name="SIG", layer="B.Cu",
+            polygon_mcp=[(90, 90), (120, 90), (120, 120), (90, 120)],
+        )
+        net_node = sch_io.find_child(zone, "net")
+        assert net_node[1] == "SIG"
+        assert sch_io.find_child(zone, "net_name") is None
+        assert ed.net_of(zone) == "SIG"
+
+
+class TestLegacyNetTableStillWorks:
+    """Boards written before KiCAD 10 keep their index-based net table."""
+
+    @pytest.fixture
+    def legacy_board(self, tmp_path):
+        text = (_K10_BOARD
+                .replace('(version 20260206)', '(version 20250513)')
+                .replace('(net "SIG")', '(net 1 "SIG")')
+                .replace('(generator "pcbnew")',
+                         '(generator "pcbnew")\n\t(net 0 "")\n\t(net 1 "SIG")'))
+        path = tmp_path / "legacy.kicad_pcb"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_table_is_read_and_indices_resolve(self, legacy_board):
+        from kicad_claude.adapters import pcb_editor as ed
+
+        tree = sch_io.parse_file(legacy_board)
+        assert ed.has_net_table(tree) is True
+        assert ed.list_nets(tree) == [{"index": 1, "name": "SIG"}]
+        assert ed.find_net_index(tree, "SIG") == 1
+
+    def test_track_by_name_is_written_as_an_index(self, legacy_board):
+        from kicad_claude.adapters import pcb_editor as ed
+
+        tree = sch_io.parse_file(legacy_board)
+        node = ed.add_track(tree, 100, 100, 110, 100, net="SIG")
+        assert sch_io.find_child(node, "net")[1] == 1
+        assert pn.list_unrouted(tree)["count"] == 0
+
+    def test_zone_on_a_new_net_allocates_a_table_entry(self, legacy_board):
+        from kicad_claude.adapters import pcb_editor as ed
+
+        tree = sch_io.parse_file(legacy_board)
+        zone = ed.add_zone(
+            tree, net_name="GND", layer="B.Cu",
+            polygon_mcp=[(90, 90), (120, 90), (120, 120), (90, 120)],
+        )
+        assert ed.find_net_index(tree, "GND") == 2
+        assert sch_io.find_child(zone, "net")[1] == 2
+        assert sch_io.find_child(zone, "net_name")[1] == "GND"

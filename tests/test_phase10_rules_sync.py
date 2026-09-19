@@ -348,3 +348,155 @@ def test_acceptance_full_flow_routes_real_track(tmp_path: Path):
     assert len(segments) >= 1, "Freerouting did not produce any track segments"
 
     state.clear_active()
+
+
+# ===== Component sync: place, copy fields, delete ========================= #
+
+
+class TestComponentSync:
+    """`update_pcb_from_schematic` used to do the netlist and nothing else.
+
+    These cover the component side, which runs without kicad-cli.
+    """
+
+    @pytest.fixture
+    def project(self, tmp_path: Path):
+        cached = kicad_libs.load_cache()
+        if cached is None:
+            pytest.skip("library index not built")
+        state.clear_active()
+        lib_tools._index = cached
+        write_blank_project(tmp_path / "s", "s")
+        state.set_active(tmp_path / "s", "s")
+        yield tmp_path / "s"
+        state.clear_active()
+
+    def _mcp(self):
+        from mcp.server.fastmcp import FastMCP
+        from kicad_claude.tools import library, pcb, schematic
+
+        mcp = FastMCP("t")
+        for mod in (library, pcb, schematic):
+            mod.register(mcp)
+        return mcp
+
+    def _build_schematic(self, mcp):
+        def call(_tool, **kw):
+            return mcp._tool_manager.get_tool(_tool).fn(**kw)
+
+        call("add_symbol", lib_id="Device:R", reference="R1", value="10k",
+             x_mm=100, y_mm=100)
+        call("set_symbol_property", reference="R1", name="Footprint",
+             value="Resistor_SMD:R_0603_1608Metric", create=True)
+        call("set_symbol_property", reference="R1", name="MPN",
+             value="RC0603FR-0710KL", create=True)
+        call("add_symbol", lib_id="Device:C", reference="C1", value="100n",
+             x_mm=120, y_mm=100)
+        call("set_symbol_property", reference="C1", name="Footprint",
+             value="Capacitor_SMD:C_0603_1608Metric", create=True)
+        call("set_board_outline", width_mm=40, height_mm=30)
+
+    def test_missing_footprints_are_placed_from_the_symbol_field(self, project):
+        from kicad_claude.tools import pcb as pcb_tools
+        from kicad_claude.tools import sync_components as sc
+
+        mcp = self._mcp()
+        self._build_schematic(mcp)
+
+        pcb_path = project / "s.kicad_pcb"
+        tree = sch_io.parse_file(pcb_path)
+        components = sc.collect_schematic_components([project / "s.kicad_sch"])
+        assert set(components) == {"R1", "C1"}
+
+        res = sc.place_missing_footprints(tree, components,
+                                          pcb_tools._resolve_footprint)
+        placed = {p["reference"] for p in res["placed"]}
+        assert placed == {"R1", "C1"}
+        assert res["no_footprint"] == [] and res["unresolved"] == []
+        # Below the outline, so they never land on top of the board.
+        assert all(p["position_mm"][1] > 40 for p in res["placed"])
+        # Running it again places nothing: the board already has them.
+        assert sc.place_missing_footprints(
+            tree, components, pcb_tools._resolve_footprint)["placed"] == []
+
+    def test_a_symbol_without_a_footprint_field_is_reported(self, project):
+        from kicad_claude.tools import pcb as pcb_tools
+        from kicad_claude.tools import sync_components as sc
+
+        mcp = self._mcp()
+        self._build_schematic(mcp)
+        mcp._tool_manager.get_tool("add_symbol").fn(
+            lib_id="Device:R", reference="R9", value="0R", x_mm=140, y_mm=100)
+
+        tree = sch_io.parse_file(project / "s.kicad_pcb")
+        components = sc.collect_schematic_components([project / "s.kicad_sch"])
+        res = sc.place_missing_footprints(tree, components,
+                                          pcb_tools._resolve_footprint)
+        assert res["no_footprint"] == ["R9"]
+        assert {p["reference"] for p in res["placed"]} == {"R1", "C1"}
+
+    def test_an_unknown_footprint_library_does_not_stop_the_others(self, project):
+        from kicad_claude.tools import pcb as pcb_tools
+        from kicad_claude.tools import sync_components as sc
+
+        mcp = self._mcp()
+        self._build_schematic(mcp)
+        mcp._tool_manager.get_tool("set_symbol_property").fn(
+            reference="C1", name="Footprint", value="NoSuchLib:NoSuchPart")
+
+        tree = sch_io.parse_file(project / "s.kicad_pcb")
+        components = sc.collect_schematic_components([project / "s.kicad_sch"])
+        res = sc.place_missing_footprints(tree, components,
+                                          pcb_tools._resolve_footprint)
+        assert [p["reference"] for p in res["placed"]] == ["R1"]
+        assert [u["reference"] for u in res["unresolved"]] == ["C1"]
+
+    def test_symbol_fields_land_on_the_footprint(self, project):
+        from kicad_claude.adapters import pcb_editor as ped
+        from kicad_claude.tools import pcb as pcb_tools
+        from kicad_claude.tools import sync_components as sc
+
+        mcp = self._mcp()
+        self._build_schematic(mcp)
+
+        tree = sch_io.parse_file(project / "s.kicad_pcb")
+        components = sc.collect_schematic_components([project / "s.kicad_sch"])
+        sc.place_missing_footprints(tree, components, pcb_tools._resolve_footprint)
+        changed = sc.sync_footprint_fields(tree, components)
+
+        r1 = ped.find_footprint_by_reference(tree, "R1")
+        assert ped._footprint_property(r1, "MPN") == "RC0603FR-0710KL"
+        assert ped._footprint_property(r1, "Value") == "10k"
+        assert any(c["reference"] == "R1" and "MPN" in c["fields"] for c in changed)
+        # Idempotent: a second pass has nothing left to write.
+        assert sc.sync_footprint_fields(tree, components) == []
+
+    def test_orphans_are_listed_and_only_removed_on_request(self, project):
+        from kicad_claude.adapters import pcb_editor as ped
+        from kicad_claude.tools import pcb as pcb_tools
+        from kicad_claude.tools import sync_components as sc
+
+        mcp = self._mcp()
+        self._build_schematic(mcp)
+        tree = sch_io.parse_file(project / "s.kicad_pcb")
+        components = sc.collect_schematic_components([project / "s.kicad_sch"])
+        sc.place_missing_footprints(tree, components, pcb_tools._resolve_footprint)
+
+        # A mounting hole is on the board and in no schematic — it must stay
+        # unless removal was asked for.
+        del components["C1"]
+        assert sc.list_orphan_footprints(tree, components) == ["C1"]
+        assert ped.find_footprint_by_reference(tree, "C1") is not None
+
+        assert sc.remove_orphan_footprints(tree, components) == ["C1"]
+        assert ped.find_footprint_by_reference(tree, "C1") is None
+
+    def test_power_symbols_are_not_components(self, project):
+        from kicad_claude.tools import sync_components as sc
+
+        mcp = self._mcp()
+        self._build_schematic(mcp)
+        mcp._tool_manager.get_tool("add_power_symbol").fn(
+            net="GND", x_mm=100, y_mm=140)
+        components = sc.collect_schematic_components([project / "s.kicad_sch"])
+        assert all(not ref.startswith("#") for ref in components)

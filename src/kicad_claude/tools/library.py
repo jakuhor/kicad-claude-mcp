@@ -11,9 +11,12 @@ Tools:
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
+from kicad_claude import state
+from kicad_claude.adapters import sch_io
 from kicad_claude.indexer.kicad_libs import (
     build_index,
     cache_path,
@@ -22,6 +25,7 @@ from kicad_claude.indexer.kicad_libs import (
     save_cache,
 )
 from kicad_claude.indexer.search import search_footprints, search_symbols
+from kicad_claude.utils.kicad_paths import find_footprint_lib_dirs, find_symbol_lib_dirs
 from kicad_claude.utils.kicad_strings import normalize_name
 
 logger = logging.getLogger("kicad-claude.tools.library")
@@ -29,6 +33,86 @@ logger = logging.getLogger("kicad-claude.tools.library")
 # In-process memoization of the loaded index. The on-disk cache is the source
 # of truth; this avoids re-reading the multi-MB JSON on every tool call.
 _index: dict[str, Any] | None = None
+
+
+def _lib_table_dirs(table_path: Path, project_dir: Path, suffix: str) -> list[Path]:
+    """Directories named by a `sym-lib-table` / `fp-lib-table`.
+
+    A symbol library's uri is the `.kicad_sym` file and a footprint library's
+    is the `.pretty` folder; the indexer walks *directories*, so the parent is
+    returned in both cases. `${KIPRJMOD}` is the project directory.
+    """
+    if not table_path.is_file():
+        return []
+    try:
+        table = sch_io.parse_file(table_path)
+    except Exception:  # noqa: BLE001 — a malformed table must not break indexing
+        logger.warning("malformed %s; ignoring", table_path)
+        return []
+
+    out: list[Path] = []
+    for lib in sch_io.find_children(table, "lib"):
+        uri_node = sch_io.find_child(lib, "uri")
+        if not uri_node or len(uri_node) < 2:
+            continue
+        uri = str(uri_node[1])
+        if "${" in uri and "KIPRJMOD" not in uri:
+            continue  # some other env var; the indexer cannot resolve it
+        uri = uri.replace("${KIPRJMOD}", str(project_dir)).replace("$(KIPRJMOD)", str(project_dir))
+        p = Path(uri)
+        if p.suffix.lower() != suffix:
+            continue
+        if p.parent.is_dir():
+            out.append(p.parent)
+    return out
+
+
+def _project_lib_dirs() -> tuple[list[Path], list[Path]]:
+    """(symbol dirs, footprint dirs) of the active project, if there is one.
+
+    `create_symbol`, `create_footprint` and `import_vendor_zip` write into
+    `<project>/lib` and register the library in the project's lib-table. Those
+    libraries are not in any global directory, so they are picked up here —
+    otherwise the server could not place a symbol it had just created.
+    """
+    proj = state.get_active_or_none()
+    if proj is None:
+        return [], []
+    sym_dirs: list[Path] = []
+    fp_dirs: list[Path] = []
+    lib_dir = proj.path / "lib"
+    if lib_dir.is_dir():
+        sym_dirs.append(lib_dir)
+        fp_dirs.append(lib_dir)
+    sym_dirs += _lib_table_dirs(proj.path / "sym-lib-table", proj.path, ".kicad_sym")
+    fp_dirs += _lib_table_dirs(proj.path / "fp-lib-table", proj.path, ".pretty")
+    # Deduplicate, keeping order.
+    return list(dict.fromkeys(sym_dirs)), list(dict.fromkeys(fp_dirs))
+
+
+def _with_project_libs(idx: dict[str, Any]) -> dict[str, Any]:
+    """Overlay the active project's own libraries on the global index.
+
+    Read fresh on every call rather than cached: a project library is small,
+    and it changes under the server's own hands.
+    """
+    sym_dirs, fp_dirs = _project_lib_dirs()
+    if not sym_dirs and not fp_dirs:
+        return idx
+    extra = build_index(symbol_dirs=sym_dirs, footprint_dirs=fp_dirs)
+    if not extra["symbols"] and not extra["footprints"]:
+        return idx
+    return {
+        **idx,
+        "symbols": {**idx.get("symbols", {}), **extra["symbols"]},
+        "footprints": {**idx.get("footprints", {}), **extra["footprints"]},
+        "symbol_dirs": list(dict.fromkeys(
+            [str(d) for d in sym_dirs] + list(idx.get("symbol_dirs", []))
+        )),
+        "footprint_dirs": list(dict.fromkeys(
+            [str(d) for d in fp_dirs] + list(idx.get("footprint_dirs", []))
+        )),
+    }
 
 
 def _ensure_index() -> dict[str, Any]:
@@ -39,7 +123,7 @@ def _ensure_index() -> dict[str, Any]:
             raise RuntimeError(
                 "Library index not built. Call `index_libraries` first."
             )
-    return _index
+    return _with_project_libs(_index)
 
 
 def _invalidate() -> None:
@@ -92,19 +176,36 @@ def register(mcp) -> None:
         `~/.cache/kicad-claude/index.json`.
 
         Subsequent calls return the cached summary instantly.
+
+        The active project's own libraries (`<project>/lib` and whatever its
+        `sym-lib-table` / `fp-lib-table` names) are read on every lookup, not
+        cached, so a symbol created by `create_symbol` can be placed at once.
+
+        Refuses to save an index that found no symbol at all, rather than
+        replacing a good cache with an empty one: that reads as "every library
+        is gone" and is usually a path problem, not an empty machine.
         """
         global _index
         if not force:
             cached = load_cache()
             if cached is not None:
                 _index = cached
-                return _summary(cached, from_cache=True)
+                return _summary(_with_project_libs(cached), from_cache=True)
 
         logger.info("building library index from scratch")
         idx = build_index()
+        if not idx.get("symbols") and not idx.get("footprints"):
+            searched = [str(d) for d in (find_symbol_lib_dirs() + find_footprint_lib_dirs())]
+            raise RuntimeError(
+                "no KiCAD libraries found, so the index was not written "
+                f"(the previous cache is untouched). Searched: {searched or 'nothing'}. "
+                "Set KICAD_LIBRARY_PATH to the directories holding .kicad_sym "
+                "files and .pretty folders, separated by "
+                f"{os.pathsep!r}."
+            )
         save_cache(idx)
         _index = idx
-        return _summary(idx, from_cache=False)
+        return _summary(_with_project_libs(idx), from_cache=False)
 
     @mcp.tool()
     def list_libraries() -> dict:

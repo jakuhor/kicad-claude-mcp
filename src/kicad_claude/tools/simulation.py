@@ -135,20 +135,17 @@ def register(mcp) -> None:
         if signal_nets.strip():
             net_filter = {n.strip() for n in signal_nets.split(",") if n.strip()}
 
-        idx_to_name = {n["index"]: n["name"] for n in pcb_ed.list_nets(tree)}
         skip_nets = {"GND", "+5V", "+3V3", "+3.3V", "+12V", "+VBUS", "VCC", "VDD",
                      "AGND", "DGND", "VSS", "0V"}
 
         segments: list[dict] = []
         for seg in sch_io.find_children(tree, "segment"):
-            net_node = sch_io.find_child(seg, "net")
             start = sch_io.find_child(seg, "start")
             end = sch_io.find_child(seg, "end")
             layer = sch_io.find_child(seg, "layer")
-            if not (net_node and start and end and layer):
+            net_name = pcb_ed.net_of(seg)
+            if not (net_name and start and end and layer):
                 continue
-            net_idx = int(net_node[1])
-            net_name = idx_to_name.get(net_idx, f"<net{net_idx}>")
             if net_filter and net_name not in net_filter:
                 continue
             if not net_filter and net_name in skip_nets:

@@ -32,6 +32,7 @@ from kicad_claude.adapters.sch_io import (
     find_children,
     is_call,
 )
+from kicad_claude.adapters import pcb_editor
 from kicad_claude.adapters.sch_netlist import _Union, _on_segment
 from kicad_claude.utils.geometry import round_mm
 from kicad_claude.utils.kicad_strings import normalize_name
@@ -98,17 +99,20 @@ def pad_to_board_xy(fx: float, fy: float, angle_deg: float, px: float, py: float
     return _pt(fx + px * ca + py * sa, fy - px * sa + py * ca)
 
 
-def _net_of(node: list) -> tuple[int, str]:
-    """Read a `(net N "name")` child. Older files omit the number."""
-    net_node = find_child(node, "net")
-    if not net_node or len(net_node) < 2:
-        return 0, ""
-    first = net_node[1]
-    if isinstance(first, int):
-        name = str(net_node[2]) if len(net_node) > 2 else ""
-        return first, normalize_name(name)
-    # `(net "VCC")` — a name with no number.
-    return 0, normalize_name(str(first))
+def _net_of(node: list, tree: list | None = None) -> tuple[int, str]:
+    """Read the net of a pad / track / via / zone as (number, name).
+
+    KiCAD 10 writes `(net "GND")` with no number, so the *name* is what
+    identifies a net here — the number is reported for display only and is 0
+    whenever the file does not give one. On an older board the tracks carry
+    `(net 6)` and only the board's net table names it, so `tree` is passed
+    wherever it is available. An item with no name at all belongs to the
+    unconnected net.
+    """
+    index, name = pcb_editor.read_net_node(node)
+    if not name:
+        name = pcb_editor.net_of(node, tree)
+    return (index or 0), name
 
 
 def _pad_radius(pad: list) -> float:
@@ -147,7 +151,7 @@ def list_pads(tree: list) -> list[dict]:
                 continue
             number = str(pad[1])
             pad_type = str(pad[2]) if len(pad) > 2 else ""
-            net, net_name = _net_of(pad)
+            net, net_name = _net_of(pad, tree)
             pat = find_child(pad, "at")
             px = float(pat[1]) if pat and len(pat) > 1 else 0.0
             py = float(pat[2]) if pat and len(pat) > 2 else 0.0
@@ -205,13 +209,14 @@ def _tracks(tree: list) -> list[dict]:
             continue
         layer_node = find_child(node, "layer")
         width_node = find_child(node, "width")
-        net, _name = _net_of(node)
+        net, net_name = _net_of(node, tree)
         out.append(
             {
                 "start": _pt(start[1], start[2]),
                 "end": _pt(end[1], end[2]),
                 "layer": str(layer_node[1]) if layer_node and len(layer_node) > 1 else "",
                 "net": net,
+                "net_name": net_name,
                 "width_mm": float(width_node[1]) if width_node and len(width_node) > 1 else 0.25,
             }
         )
@@ -234,7 +239,7 @@ def _vias(tree: list, board_layers: list[str]) -> list[dict]:
             span = board_layers[min(lo, hi): max(lo, hi) + 1]
         else:
             span = list(board_layers)
-        net, _name = _net_of(node)
+        net, net_name = _net_of(node, tree)
         size = find_child(node, "size")
         radius = float(size[1]) / 2.0 if size and len(size) > 1 else 0.3
         out.append(
@@ -242,6 +247,7 @@ def _vias(tree: list, board_layers: list[str]) -> list[dict]:
                 "point": _pt(at[1], at[2]),
                 "layers": span,
                 "net": net,
+                "net_name": net_name,
                 "radius_mm": radius,
             }
         )
@@ -257,7 +263,7 @@ def _filled_zones(tree: list) -> tuple[list[dict], bool, int]:
         if not is_call(node, "zone"):
             continue
         total += 1
-        net, _name = _net_of(node)
+        net, net_name = _net_of(node, tree)
         polys = []
         for fp in find_children(node, "filled_polygon"):
             layer_node = find_child(fp, "layer")
@@ -269,6 +275,7 @@ def _filled_zones(tree: list) -> tuple[list[dict], bool, int]:
                         "layer": str(layer_node[1]) if layer_node and len(layer_node) > 1 else "",
                         "points": [_pt(p[1], p[2]) for p in xy],
                         "net": net,
+                        "net_name": net_name,
                     }
                 )
         if not polys:
@@ -376,9 +383,9 @@ def build_connectivity(tree: list) -> dict:
 
     # A track ending on another track's middle is a T, and joins it. KiCAD has
     # no junction marker on a PCB: overlapping copper of one net is one node.
-    by_layer_net: dict[tuple[str, int], list[dict]] = {}
+    by_layer_net: dict[tuple[str, str], list[dict]] = {}
     for track in tracks:
-        by_layer_net.setdefault((track["layer"], track["net"]), []).append(track)
+        by_layer_net.setdefault((track["layer"], track["net_name"]), []).append(track)
     for group in by_layer_net.values():
         for i, track in enumerate(group):
             for end in (track["start"], track["end"]):
@@ -397,7 +404,7 @@ def build_connectivity(tree: list) -> dict:
             uf.union(keys[0], k)
         # A via lands mid-track as often as at an end.
         for track in tracks:
-            if track["layer"] in via["layers"] and track["net"] == via["net"]:
+            if track["layer"] in via["layers"] and track["net_name"] == via["net_name"]:
                 if _on_segment(via["point"], track["start"], track["end"]):
                     uf.union(("cu", track["layer"], track["start"]),
                              ("cu", track["layer"], via["point"]))
@@ -405,14 +412,14 @@ def build_connectivity(tree: list) -> dict:
     # Copper that lands in a filled plane. On a 4-layer board an SMD pad
     # reaches the inner GND plane only this way: pad -> via -> zone.
     for zone in zones:
-        zone_key = ("zone", zone["layer"], zone["net"])
+        zone_key = ("zone", zone["layer"], zone["net_name"])
         for via in vias:
-            if via["net"] != zone["net"] or zone["layer"] not in via["layers"]:
+            if via["net_name"] != zone["net_name"] or zone["layer"] not in via["layers"]:
                 continue
             if _zone_touches_point(via["point"], via["radius_mm"], zone["points"]):
                 uf.union(zone_key, ("cu", zone["layer"], via["point"]))
         for track in tracks:
-            if track["net"] != zone["net"] or track["layer"] != zone["layer"]:
+            if track["net_name"] != zone["net_name"] or track["layer"] != zone["layer"]:
                 continue
             for end in (track["start"], track["end"]):
                 if _zone_touches_point(end, 0.0, zone["points"]):
@@ -423,32 +430,32 @@ def build_connectivity(tree: list) -> dict:
     for i, pad in enumerate(pads):
         pad_key = ("pad", i)
         uf.add(pad_key)
-        if pad["net"] == 0:
+        if not pad["net_name"]:
             continue
         for track in tracks:
-            if track["net"] != pad["net"]:
+            if track["net_name"] != pad["net_name"]:
                 continue
             if _touches(pad, track):
                 uf.union(pad_key, ("cu", track["layer"], track["start"]))
         for via in vias:
-            if via["net"] != pad["net"]:
+            if via["net_name"] != pad["net_name"]:
                 continue
             if math.hypot(via["point"][0] - pad["point"][0],
                           via["point"][1] - pad["point"][1]) <= pad["radius_mm"] + 1e-4:
                 uf.union(pad_key, ("cu", via["layers"][0], via["point"]))
         for zone in zones:
-            if zone["net"] != pad["net"] or zone["layer"] not in pad["layers"]:
+            if zone["net_name"] != pad["net_name"] or zone["layer"] not in pad["layers"]:
                 continue
             if _zone_touches_pad(pad, zone["points"]):
-                uf.union(pad_key, ("zone", zone["layer"], zone["net"]))
+                uf.union(pad_key, ("zone", zone["layer"], zone["net_name"]))
 
     # Collect pads per net, grouped by what they are joined to.
-    by_net: dict[int, dict] = {}
+    by_net: dict[str, dict] = {}
     for i, pad in enumerate(pads):
-        if pad["net"] == 0:
+        if not pad["net_name"]:
             continue
         entry = by_net.setdefault(
-            pad["net"], {"net": pad["net"], "name": pad["net_name"], "groups": {}}
+            pad["net_name"], {"net": pad["net"], "name": pad["net_name"], "groups": {}}
         )
         root = uf.find(("pad", i))
         entry["groups"].setdefault(root, []).append(pad)

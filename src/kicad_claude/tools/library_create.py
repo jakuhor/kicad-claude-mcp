@@ -33,6 +33,7 @@ def register(mcp) -> None:
         datasheet: str = "~",
         description: str = "",
         keywords: str = "",
+        fields: dict | None = None,
     ) -> dict:
         """Create a new schematic symbol in `<project>/lib/<lib_name>.kicad_sym`.
 
@@ -45,8 +46,14 @@ def register(mcp) -> None:
           - `type` (input/output/passive/power_in/power_out/bidirectional/...)
           - `shape` (default "line")
 
-        After running, call `index_libraries(force=True)` to make this
-        symbol searchable via `search_symbol`.
+        `fields` adds any other property to the library symbol itself —
+        `{"MPN": "RC0603FR-0710KL", "Manufacturer": "Yageo"}`. A house part
+        carries its order codes in the library, so every placement inherits
+        them; `set_symbol_property` only changes one placed instance.
+
+        The active project's libraries are indexed on every lookup, so the new
+        symbol can be placed with `add_symbol` right away. Call
+        `index_libraries(force=True)` only to refresh the global libraries.
         """
         proj = state.get_active()
         if not pins:
@@ -59,6 +66,7 @@ def register(mcp) -> None:
             reference_prefix=reference_prefix,
             value=value, footprint=footprint, datasheet=datasheet,
             description=description, keywords=keywords,
+            fields=dict(fields) if fields else None,
         )
 
     @mcp.tool()

@@ -50,6 +50,31 @@ PAD_SHAPES = frozenset({
 # Symbol creation
 # --------------------------------------------------------------------------- #
 
+def _check_keys(entry: Any, required: tuple[str, ...], *, what: str,
+                known: tuple[str, ...]) -> None:
+    """Validate one pin / pad dict before it reaches the node builders.
+
+    A missing key used to surface as a bare `KeyError: 'x_mm'`, which names
+    neither the offending entry nor what the caller should have written.
+    """
+    if not isinstance(entry, dict):
+        raise ValueError(f"{what} must be a dict, got {type(entry).__name__}")
+    missing = [k for k in required if k not in entry]
+    if missing:
+        raise ValueError(
+            f"{what} is missing {', '.join(missing)}; "
+            f"a {what.split('[')[0][:-1]} takes {{{', '.join(known)}}} "
+            f"(required: {', '.join(required)})"
+        )
+    unknown = [k for k in entry if k not in known]
+    if unknown:
+        raise ValueError(
+            f"{what} has unknown key(s) {', '.join(sorted(unknown))}; "
+            f"accepted: {', '.join(known)}"
+        )
+
+
+
 
 def _build_pin_node(
     *,
@@ -105,6 +130,7 @@ def build_symbol_node(
     datasheet: str = "~",
     description: str = "",
     keywords: str = "",
+    fields: dict[str, str] | None = None,
 ) -> list:
     """Build a complete (symbol "Lib:Name" ...) tree.
 
@@ -131,7 +157,10 @@ def build_symbol_node(
     ]
 
     pin_nodes: list[list] = []
-    for pin in pins:
+    for i, pin in enumerate(pins):
+        _check_keys(pin, ("number", "x_mm", "y_mm"), what=f"pins[{i}]",
+                    known=("number", "name", "x_mm", "y_mm", "length_mm",
+                           "angle_deg", "angle", "type", "shape"))
         pin_nodes.append(_build_pin_node(
             number=pin["number"],
             name=pin.get("name", "~"),
@@ -160,6 +189,15 @@ def build_symbol_node(
     ]
     if keywords:
         symbol.append(_build_property_node("ki_keywords", keywords, hide=True))
+    # A house library's part number belongs to the library symbol, not to each
+    # placed instance, so any extra field is written here too.
+    for name, field_value in (fields or {}).items():
+        if name in ("Reference", "Value", "Footprint", "Datasheet",
+                    "Description", "ki_keywords"):
+            raise ValueError(
+                f"field {name!r} has its own argument; pass it there, not in `fields`"
+            )
+        symbol.append(_build_property_node(str(name), str(field_value), hide=True))
     symbol.append(sub_symbol)
     return symbol
 
@@ -214,6 +252,7 @@ def create_symbol(
     datasheet: str = "~",
     description: str = "",
     keywords: str = "",
+    fields: dict[str, str] | None = None,
 ) -> dict:
     """Top-level: write the symbol into <project>/lib/<lib_name>.kicad_sym
     and register the lib in sym-lib-table.
@@ -229,7 +268,7 @@ def create_symbol(
         body_width_mm=body_width_mm, body_height_mm=body_height_mm,
         reference_prefix=reference_prefix,
         value=value, footprint=footprint, datasheet=datasheet,
-        description=description, keywords=keywords,
+        description=description, keywords=keywords, fields=fields,
     )
     append_symbol_to_lib(lib_path, node)
     table_path = vendor_import.update_sym_lib_table(project_dir, lib_name)
@@ -238,6 +277,7 @@ def create_symbol(
         "lib_path": str(lib_path),
         "sym_lib_table": str(table_path),
         "pin_count": len(pins),
+        "fields": sorted(fields or {}),
     }
 
 
@@ -339,7 +379,12 @@ def build_footprint_node(
 ) -> list:
     """Build a footprint node (top-level (footprint ...)) for writing to .kicad_mod."""
     pad_nodes: list[list] = []
-    for pad in pads:
+    for i, pad in enumerate(pads):
+        _check_keys(pad, ("x_mm", "y_mm", "size_x_mm", "size_y_mm"),
+                    what=f"pads[{i}]",
+                    known=("number", "type", "shape", "x_mm", "y_mm",
+                           "size_x_mm", "size_y_mm", "drill_mm", "layers",
+                           "rotation_deg"))
         pad_nodes.append(_build_pad_node(
             number=pad.get("number", "1"),
             pad_type=pad.get("type", "smd"),

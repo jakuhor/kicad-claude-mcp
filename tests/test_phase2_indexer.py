@@ -303,3 +303,107 @@ class TestSearchBraceDecoding:
         assert hits
         for hit in hits:
             assert "{" not in hit["lib_id"]
+
+
+# ----- Library discovery on Windows --------------------------------------- #
+
+
+class TestWindowsInstallDiscovery:
+    """The installer's directories are `10.0`, `7.0` — not `10`, `7`."""
+
+    def test_dotted_version_directories_are_found(self, tmp_path, monkeypatch):
+        from kicad_claude.utils import kicad_paths
+
+        for version in ("9.0", "10.0"):
+            (tmp_path / "KiCad" / version / "share" / "kicad" / "symbols").mkdir(parents=True)
+        monkeypatch.setenv("ProgramFiles", str(tmp_path))
+        monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+
+        dirs = kicad_paths._windows_share_dirs("symbols")
+        existing = [d for d in dirs if d.is_dir()]
+        assert existing
+        # Newest install first, so KiCAD 10 wins over KiCAD 9.
+        assert existing[0] == tmp_path / "KiCad" / "10.0" / "share" / "kicad" / "symbols"
+
+
+class TestEmptyIndexIsRefused:
+    """An index that found nothing must not replace a good cache."""
+
+    def test_force_reindex_with_no_libraries_raises(self, tmp_path, monkeypatch):
+        from mcp.server.fastmcp import FastMCP
+
+        saved: list = []
+        monkeypatch.setattr(lib_tools, "build_index",
+                            lambda *a, **k: {"symbols": {}, "footprints": {},
+                                             "symbol_dirs": [], "footprint_dirs": []})
+        monkeypatch.setattr(lib_tools, "save_cache", lambda idx: saved.append(idx))
+        monkeypatch.setattr(lib_tools, "find_symbol_lib_dirs", lambda: [])
+        monkeypatch.setattr(lib_tools, "find_footprint_lib_dirs", lambda: [])
+        mcp = FastMCP("test")
+        lib_tools.register(mcp)
+
+        with pytest.raises(RuntimeError, match="no KiCAD libraries found"):
+            _call(mcp, "index_libraries", force=True)
+        assert saved == [], "the cache must be left alone"
+
+
+# ----- Project-local libraries -------------------------------------------- #
+
+
+class TestProjectLibrariesAreIndexed:
+    """A library the server just wrote is usable without a global re-index."""
+
+    @pytest.fixture
+    def project_with_lib(self, tmp_path, monkeypatch):
+        from kicad_claude import state
+        from kicad_claude.templates.blank import write_blank_project
+
+        state.clear_active()
+        write_blank_project(tmp_path / "p", "p")
+        state.set_active(tmp_path / "p", "p")
+        lib_dir = tmp_path / "p" / "lib"
+        lib_dir.mkdir()
+        shutil.copy(FIXTURES / "MiniLib.kicad_sym", lib_dir / "HouseLib.kicad_sym")
+        # An empty global index: everything found must come from the project.
+        monkeypatch.setattr(lib_tools, "_index",
+                            {"symbols": {}, "footprints": {},
+                             "symbol_dirs": [], "footprint_dirs": []})
+        yield tmp_path / "p"
+        state.clear_active()
+
+    def test_project_symbols_reach_the_index(self, project_with_lib):
+        idx = lib_tools._ensure_index()
+        assert "HouseLib:Resistor" in idx["symbols"]
+        assert str(project_with_lib / "lib") in idx["symbol_dirs"]
+
+    def test_lib_table_entries_are_followed(self, tmp_path, monkeypatch):
+        from kicad_claude import state
+        from kicad_claude.adapters import vendor_import
+        from kicad_claude.templates.blank import write_blank_project
+
+        state.clear_active()
+        write_blank_project(tmp_path / "q", "q")
+        state.set_active(tmp_path / "q", "q")
+        try:
+            elsewhere = tmp_path / "q" / "vendor"
+            elsewhere.mkdir()
+            shutil.copy(FIXTURES / "MiniLib.kicad_sym", elsewhere / "Vendor.kicad_sym")
+            table = vendor_import._read_lib_table(tmp_path / "q" / "sym-lib-table",
+                                                  "sym_lib_table")
+            vendor_import._add_lib_entry(
+                table, name="Vendor", uri="${KIPRJMOD}/vendor/Vendor.kicad_sym")
+            from kicad_claude.adapters import sch_io
+
+            sch_io.write_file(tmp_path / "q" / "sym-lib-table", table)
+
+            sym_dirs, _ = lib_tools._project_lib_dirs()
+            assert elsewhere in sym_dirs
+        finally:
+            state.clear_active()
+
+    def test_no_active_project_means_no_overlay(self, monkeypatch):
+        from kicad_claude import state
+
+        state.clear_active()
+        idx = {"symbols": {"A:B": {}}, "footprints": {}, "symbol_dirs": []}
+        assert lib_tools._with_project_libs(idx) is idx

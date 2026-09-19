@@ -510,3 +510,72 @@ def test_acceptance_custom_symbol_and_footprint_parse(tmp_path: Path):
     )
     assert r2.returncode == 0
     state.clear_active()
+
+
+# ===== Library fields and input validation ================================ #
+
+
+def test_create_symbol_carries_extra_fields(tmp_path: Path):
+    """A house part's order codes belong to the library symbol."""
+    from kicad_claude.adapters import library_create as lc
+    from kicad_claude.adapters import sch_io
+
+    res = lc.create_symbol(
+        tmp_path / "p",
+        lib_name="House", symbol_name="WIDGET",
+        pins=[{"number": "1", "name": "A", "x_mm": -5.08, "y_mm": 0, "angle_deg": 180}],
+        fields={"MPN": "RC0603FR-0710KL", "Manufacturer": "Yageo"},
+    )
+    assert res["fields"] == ["MPN", "Manufacturer"]
+    tree = sch_io.parse_file(Path(res["lib_path"]))
+    symbol = sch_io.find_children(tree, "symbol")[0]
+    assert sch_io.get_property(symbol, "MPN") == "RC0603FR-0710KL"
+    assert sch_io.get_property(symbol, "Manufacturer") == "Yageo"
+
+
+def test_create_symbol_refuses_a_field_that_has_its_own_argument(tmp_path: Path):
+    from kicad_claude.adapters import library_create as lc
+
+    with pytest.raises(ValueError, match="has its own argument"):
+        lc.create_symbol(
+            tmp_path / "p",
+            lib_name="House", symbol_name="W",
+            pins=[{"number": "1", "name": "A", "x_mm": -5.08, "y_mm": 0}],
+            fields={"Footprint": "L:F"},
+        )
+
+
+def test_a_malformed_pin_names_itself_and_the_schema():
+    from kicad_claude.adapters import library_create as lc
+
+    with pytest.raises(ValueError) as excinfo:
+        lc.build_symbol_node(
+            qualified_lib_id="L:X",
+            pins=[{"number": "1", "name": "VIN", "side": "left"}],
+        )
+    message = str(excinfo.value)
+    assert "pins[0]" in message
+    assert "x_mm" in message and "y_mm" in message
+
+
+def test_a_malformed_pad_names_itself_and_the_schema():
+    from kicad_claude.adapters import library_create as lc
+
+    with pytest.raises(ValueError) as excinfo:
+        lc.build_footprint_node(
+            qualified_lib_id="L:X",
+            pads=[{"number": "1", "x_mm": 0.0, "y_mm": 0.0}],
+        )
+    assert "pads[0]" in str(excinfo.value)
+    assert "size_x_mm" in str(excinfo.value)
+
+
+def test_an_unknown_pin_key_is_rejected_rather_than_ignored():
+    """A typo used to be swallowed, leaving the pin silently at the default."""
+    from kicad_claude.adapters import library_create as lc
+
+    with pytest.raises(ValueError, match="unknown key"):
+        lc.build_symbol_node(
+            qualified_lib_id="L:X",
+            pins=[{"number": "1", "x_mm": 0.0, "y_mm": 0.0, "pin_type": "power_in"}],
+        )

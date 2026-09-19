@@ -1712,3 +1712,57 @@ class TestFieldsAutoplaced:
         origin = sch_io.find_child(s, "at")
         ref_at = _field_at(s, "Reference")
         assert [ref_at[1], ref_at[2]] != [origin[1], origin[2]]
+
+
+# ===== Removing off-grid items ============================================ #
+
+
+def test_remove_wire_finds_an_off_grid_wire_with_default_snapping(blank_project):
+    """A wire drawn to a pin sits off the 1.27 mm grid.
+
+    `remove_wire` snapped the coordinates before looking, so the wire could
+    not be removed without knowing to pass `snap_to_grid=False`.
+    """
+    sch_path = blank_project["sch"]
+    tree = sch_io.parse_file(sch_path)
+    ed.add_wire(tree, 200.0, 140.0, 210.0, 140.0)
+    sch_io.write_file(sch_path, tree)
+
+    mcp = _mcp_with_sch_tools()
+    res = mcp._tool_manager.get_tool("remove_wire").fn(
+        x1_mm=200.0, y1_mm=140.0, x2_mm=210.0, y2_mm=140.0
+    )
+    assert res["removed"] == "wire"
+    assert sch_io.find_children(sch_io.parse_file(sch_path), "wire") == []
+
+
+def test_remove_wire_still_finds_a_wire_placed_on_the_grid(blank_project):
+    """The snapped point stays a fallback, for coordinates given roughly."""
+    sch_path = blank_project["sch"]
+    mcp = _mcp_with_sch_tools()
+    mcp._tool_manager.get_tool("add_wire").fn(
+        x1_mm=100.0, y1_mm=100.0, x2_mm=120.0, y2_mm=100.0)
+    placed = sch_io.find_children(sch_io.parse_file(sch_path), "wire")
+    assert placed, "the wire was snapped somewhere"
+
+    res = mcp._tool_manager.get_tool("remove_wire").fn(
+        x1_mm=100.0, y1_mm=100.0, x2_mm=120.0, y2_mm=100.0)
+    assert res["removed"] == "wire"
+    assert sch_io.find_children(sch_io.parse_file(sch_path), "wire") == []
+
+
+def test_remove_wire_error_lists_every_point_tried(blank_project):
+    mcp = _mcp_with_sch_tools()
+    with pytest.raises(KeyError, match="points tried"):
+        mcp._tool_manager.get_tool("remove_wire").fn(
+            x1_mm=200.0, y1_mm=140.0, x2_mm=210.0, y2_mm=140.0)
+
+
+def test_remove_junction_finds_an_off_grid_junction(blank_project):
+    sch_path = blank_project["sch"]
+    mcp = _mcp_with_sch_tools()
+    mcp._tool_manager.get_tool("add_junction").fn(
+        x_mm=200.0, y_mm=140.0, snap_to_grid=False)
+    res = mcp._tool_manager.get_tool("remove_junction").fn(x_mm=200.0, y_mm=140.0)
+    assert res["removed"] == "junction"
+    assert sch_io.find_children(sch_io.parse_file(sch_path), "junction") == []

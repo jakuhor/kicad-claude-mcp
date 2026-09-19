@@ -16,6 +16,41 @@ from pathlib import Path
 _KICAD_VERSIONS = ("10", "9", "8", "7")
 
 
+def _windows_share_dirs(leaf: str) -> list[Path]:
+    """`<Program Files>/KiCad/<version>/share/kicad/<leaf>`, newest version first.
+
+    The installer names its directories `10.0`, `7.0` — with the minor number —
+    so the bare `_KICAD_VERSIONS` names find nothing on a stock install. The
+    real directories are listed, exactly as `_platform_default_cli_paths` does
+    for `kicad-cli`, and the bare names are kept as a fallback.
+    """
+    roots = [
+        Path(r)
+        for r in (
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles(x86)"),
+            r"C:\Program Files",
+        )
+        if r
+    ]
+    out: list[Path] = []
+    for root in roots:
+        kicad = root / "KiCad"
+        for version_dir in sorted(
+            (d for d in _safe_iterdir(kicad) if d.is_dir()),
+            key=lambda d: _version_key(d.name),
+            reverse=True,
+        ):
+            p = version_dir / "share" / "kicad" / leaf
+            if p not in out:
+                out.append(p)
+        for v in _KICAD_VERSIONS:
+            p = kicad / v / "share" / "kicad" / leaf
+            if p not in out:
+                out.append(p)
+    return out
+
+
 def _platform_default_symbol_dirs() -> list[Path]:
     """Default install locations for `.kicad_sym` libraries by OS."""
     sys_name = platform.system()
@@ -26,10 +61,7 @@ def _platform_default_symbol_dirs() -> list[Path]:
     if sys_name == "Linux":
         return [Path("/usr/share/kicad/symbols")]
     if sys_name == "Windows":
-        return [
-            Path(rf"C:\Program Files\KiCad\{v}\share\kicad\symbols")
-            for v in _KICAD_VERSIONS
-        ]
+        return _windows_share_dirs("symbols")
     return []
 
 
@@ -42,10 +74,7 @@ def _platform_default_footprint_dirs() -> list[Path]:
     if sys_name == "Linux":
         return [Path("/usr/share/kicad/footprints")]
     if sys_name == "Windows":
-        return [
-            Path(rf"C:\Program Files\KiCad\{v}\share\kicad\footprints")
-            for v in _KICAD_VERSIONS
-        ]
+        return _windows_share_dirs("footprints")
     return []
 
 

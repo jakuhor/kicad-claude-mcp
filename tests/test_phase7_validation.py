@@ -197,3 +197,97 @@ def test_validation_tools_on_voltage_divider(tmp_path):
     assert "unconnected_items" in drc
 
     state.clear_active()
+
+
+# ===== Unit: KiCAD 10 nests ERC violations per sheet ====================== #
+
+
+_SAMPLE_ERC_KICAD10 = {
+    "$schema": "https://schemas.kicad.org/erc.v1.json",
+    "source": "demo.kicad_sch",
+    "kicad_version": "10.0.6",
+    "date": "2026-09-19T01:20:41",
+    "coordinate_units": "mm",
+    "sheets": [
+        {
+            "path": "/",
+            "uuid_path": "/e6bc0734-e9a2-438f-bb3f-01c8968cc9d3",
+            "violations": [
+                {
+                    "type": "power_pin_not_driven",
+                    "severity": "error",
+                    "description": "Input Power pin not driven by any Output Power pins",
+                    "items": [
+                        {"description": "On U1 pin 1", "uuid": "u-1",
+                         "pos": {"x": 92.71, "y": 97.79}}
+                    ],
+                },
+                {
+                    "type": "unconnected_wire_endpoint",
+                    "severity": "warning",
+                    "description": "Unconnected wire endpoint",
+                    "items": [],
+                },
+            ],
+        },
+        {
+            "path": "/power/",
+            "uuid_path": "/aaaa/bbbb",
+            "violations": [
+                {"type": "wire_dangling", "severity": "error",
+                 "description": "Wires not connected to anything", "items": []},
+            ],
+        },
+    ],
+}
+
+
+def test_shape_erc_reads_kicad10_per_sheet_violations(tmp_path: Path):
+    raw = tmp_path / "erc.json"
+    raw.write_text(json.dumps(_SAMPLE_ERC_KICAD10))
+    shaped = kicad_cli._shape_erc(_SAMPLE_ERC_KICAD10, raw)
+    assert shaped["errors"] == 2
+    assert shaped["warnings"] == 1
+    assert shaped["total_violations"] == 3
+    # Each violation says which sheet it came from.
+    assert {v["sheet"] for v in shaped["violations"]} == {"/", "/power/"}
+    # And the per-sheet breakdown adds up.
+    assert [s["total_violations"] for s in shaped["sheets"]] == [2, 1]
+    assert shaped["sheets"][0]["sheet"] == "/"
+
+
+def test_shape_erc_still_reads_a_flat_report(tmp_path: Path):
+    """A pre-KiCAD-10 report keeps working."""
+    raw = tmp_path / "erc.json"
+    raw.write_text(json.dumps(_SAMPLE_ERC))
+    shaped = kicad_cli._shape_erc(_SAMPLE_ERC, raw)
+    assert shaped["total_violations"] == 3
+    assert shaped["sheets"] == []
+
+
+@pytest.mark.slow
+def test_run_erc_reports_a_dangling_wire(tmp_path: Path):
+    """The acceptance gate for the shaping: a real violation must be counted.
+
+    A report that is parsed wrongly reads as a clean schematic, which is the
+    one failure mode that cannot be noticed by eye.
+    """
+    if not _can_run_cli():
+        pytest.skip("kicad-cli not available")
+    state.clear_active()
+    files = write_blank_project(tmp_path / "d", "d")
+    state.set_active(tmp_path / "d", "d")
+    try:
+        from kicad_claude.adapters import sch_editor, sch_io
+
+        tree = sch_io.parse_file(files["sch"])
+        sch_editor.add_wire(tree, 100.0, 100.0, 110.0, 100.0)
+        sch_io.write_file(files["sch"], tree)
+
+        res = kicad_cli.run_erc(files["sch"])
+        types = {v["type"] for v in res["violations"]}
+        assert res["total_violations"] >= 1
+        assert "wire_dangling" in types
+        assert res["errors"] + res["warnings"] == res["total_violations"]
+    finally:
+        state.clear_active()

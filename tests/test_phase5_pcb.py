@@ -355,3 +355,32 @@ def test_mutated_float_uses_kicad_formatting(tmp_path: Path):
     assert float(node[1]) == 1.6
     node[1] = 0.8
     assert "(thickness 0.8)" in sch_io.dumps(tree)
+
+
+def test_place_footprints_grid_can_arrange_already_placed_parts(tmp_path: Path):
+    """`update_pcb_from_schematic` places new parts below the outline, not at (0,0)."""
+    from kicad_claude.adapters import pcb_editor as ed
+    from kicad_claude.adapters import sch_io
+    from kicad_claude.templates.blank import write_blank_project
+
+    files = write_blank_project(tmp_path / "g", "g")
+    tree = sch_io.parse_file(files["pcb"])
+    fp_def = [
+        sch_io.sym("footprint"), "L:R",
+        [sch_io.sym("property"), "Reference", "REF**",
+         [sch_io.sym("at"), 0, 0, 0]],
+        [sch_io.sym("property"), "Value", "V",
+         [sch_io.sym("at"), 0, 0, 0]],
+    ]
+    for i, ref in enumerate(("R1", "R2")):
+        ed.add_footprint(tree, qualified_lib_id="L:R", reference=ref, value="1k",
+                         x_mm=60 + i * 5, y_mm=60, fp_def_node=fp_def)
+
+    assert ed.place_footprints_grid(tree)["placed"] == 0
+    res = ed.place_footprints_grid(tree, spacing_mm=10, columns=2,
+                                   origin_mcp=(20.0, 20.0), only_unplaced=False)
+    assert res["placed"] == 2
+    positions = {f["reference"]: f["position_mm"]
+                 for f in ed.list_footprints_summary(tree)}
+    assert positions["R1"] == [20.0, 20.0]
+    assert positions["R2"] == [30.0, 20.0]
