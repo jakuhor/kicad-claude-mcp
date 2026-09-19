@@ -1,11 +1,14 @@
 """Phase 4 + 11 — external sourcing tools.
 
 Tools:
-    check_availability        — DigiKey + Mouser stock/price lookup by MPN
+    check_availability        — distributor stock/price lookup by MPN
     find_or_fetch_symbol      — local index → KiCAD official → manual SnapEDA fallback
     import_vendor_zip         — extract a vendor ZIP into the active project's lib/
     list_vendor_parts         — list ZIPs available under ./vendor_parts/
-    enrich_bom_with_sourcing  — augment a KiCAD BOM CSV with DigiKey/Mouser data
+    enrich_bom_with_sourcing  — augment a KiCAD BOM CSV with distributor data
+
+Supported sources: mouser (default), digikey, tme, farnell. Every tool that
+talks to a distributor takes a `sources` string, e.g. "mouser,tme".
 """
 
 from __future__ import annotations
@@ -15,12 +18,76 @@ import logging
 from pathlib import Path
 
 from kicad_claude import state
-from kicad_claude.adapters import digikey, kicad_cli, mouser, snapeda, vendor_import
+# farnell / mouser / tme are reached through `_adapter()` by name, so ruff
+# cannot see the use — hence the noqa.
+from kicad_claude.adapters import (
+    digikey,
+    farnell,  # noqa: F401
+    kicad_cli,
+    mouser,  # noqa: F401
+    snapeda,
+    tme,  # noqa: F401
+    vendor_import,
+)
 from kicad_claude.tools import library as lib_tools
 
 logger = logging.getLogger("kicad-claude.tools.sourcing")
 
 VENDOR_PARTS_DIR_NAME = "vendor_parts"
+
+#: Every distributor the sourcing tools can query, in report order.
+SOURCE_NAMES = ("digikey", "mouser", "tme", "farnell")
+
+#: Default when the caller does not name any source. Mouser needs only a
+#: single API key, so it is the one source that works out of the box.
+DEFAULT_SOURCES = "mouser"
+
+#: Column prefix used by `enrich_bom_with_sourcing`.
+SOURCE_PREFIX = {"digikey": "dk", "mouser": "mo", "tme": "tme", "farnell": "fn"}
+
+_ERROR_ATTR = {
+    "digikey": "DigiKeyError",
+    "mouser": "MouserError",
+    "tme": "TMEError",
+    "farnell": "FarnellError",
+}
+
+
+def _adapter(name: str):
+    """Return the adapter module by source name.
+
+    Looked up through `globals()` rather than captured at import time so
+    tests can monkeypatch a single adapter.
+    """
+    return globals()[name]
+
+
+def _source_error(name: str) -> type[Exception]:
+    return getattr(_adapter(name), _ERROR_ATTR[name])
+
+
+def _search_source(name: str, query: str, limit: int = 3) -> list[dict]:
+    """Query one distributor. DigiKey has no part-number endpoint in V4."""
+    mod = _adapter(name)
+    if name == "digikey":
+        return mod.search_keyword(query, limit=limit)
+    return mod.search_part(query)[:limit]
+
+
+def _parse_sources(sources: str) -> list[str]:
+    """Split and validate a comma-separated source list."""
+    names = [s.strip().lower() for s in (sources or "").split(",") if s.strip()]
+    if not names:
+        raise ValueError(
+            f"No sources given. Pick from {', '.join(SOURCE_NAMES)}."
+        )
+    unknown = [n for n in names if n not in SOURCE_NAMES]
+    if unknown:
+        raise ValueError(
+            f"Unknown source(s) {unknown}. Pick from {', '.join(SOURCE_NAMES)}."
+        )
+    # Keep SOURCE_NAMES order so output columns are stable.
+    return [n for n in SOURCE_NAMES if n in names]
 
 
 def _project_root_for_vendor_parts() -> Path:
@@ -42,32 +109,33 @@ def register(mcp) -> None:
     """Register Phase 4 tools on the FastMCP instance."""
 
     @mcp.tool()
-    def check_availability(mpn: str) -> dict:
-        """Look up `mpn` on DigiKey and Mouser. Returns stock/price/links from each.
+    def check_availability(mpn: str, sources: str = DEFAULT_SOURCES) -> dict:
+        """Look up `mpn` at each distributor in `sources`. Stock/price/links.
 
-        Either source may fail (auth, network, no match) — failures are
-        captured per-source so the caller still sees what worked.
+        `sources` is a comma-separated list of: digikey, mouser, tme, farnell.
+        The default is "mouser"; the others are opt-in because each needs its
+        own credentials.
+
+        Any source may fail (auth, network, no match) — failures are captured
+        per-source so the caller still sees what worked. A source that was not
+        requested stays `None`.
         """
-        out: dict = {"mpn": mpn, "digikey": None, "mouser": None, "errors": {}}
+        names = _parse_sources(sources)
+        out: dict = {"mpn": mpn, "sources": names, "errors": {}}
+        for name in SOURCE_NAMES:
+            out[name] = None
 
-        try:
-            dk = digikey.search_keyword(mpn, limit=3)
+        for name in names:
+            try:
+                hits = _search_source(name, mpn, limit=3)
+            except _source_error(name) as e:
+                out["errors"][name] = str(e)
+                continue
             # Prefer an exact MPN match if present, else the first result.
             exact = next(
-                (r for r in dk if (r.get("mpn") or "").upper() == mpn.upper()), None
+                (r for r in hits if (r.get("mpn") or "").upper() == mpn.upper()), None
             )
-            out["digikey"] = exact or (dk[0] if dk else None)
-        except digikey.DigiKeyError as e:
-            out["errors"]["digikey"] = str(e)
-
-        try:
-            mo = mouser.search_part(mpn)
-            exact = next(
-                (r for r in mo if (r.get("mpn") or "").upper() == mpn.upper()), None
-            )
-            out["mouser"] = exact or (mo[0] if mo else None)
-        except mouser.MouserError as e:
-            out["errors"]["mouser"] = str(e)
+            out[name] = exact or (hits[0] if hits else None)
 
         return out
 
@@ -158,17 +226,21 @@ def register(mcp) -> None:
         bom_path: str | None = None,
         output_path: str | None = None,
         sourcing_field: str = "Value",
-        sources: str = "digikey,mouser",
+        sources: str = DEFAULT_SOURCES,
         max_rows: int = 200,
     ) -> dict:
-        """Augment a KiCAD BOM CSV with live DigiKey + Mouser stock and price.
+        """Augment a KiCAD BOM CSV with live distributor stock and price.
+
+        `sources` is a comma-separated list of: digikey, mouser, tme, farnell.
+        The default is "mouser"; the others are opt-in.
 
         For each unique value in `sourcing_field` (default "Value", but pass
-        "MPN" if your schematic carries that custom field), this queries
-        DigiKey and/or Mouser and appends columns:
+        "MPN" if your schematic carries that custom field), this queries every
+        requested source and appends six columns per source, prefixed
+        dk_ (digikey), mo_ (mouser), tme_ (tme) or fn_ (farnell):
 
-            dk_mpn, dk_manufacturer, dk_stock, dk_price, dk_currency, dk_url
-            mo_mpn, mo_manufacturer, mo_stock, mo_price, mo_currency, mo_url
+            <prefix>_mpn, <prefix>_manufacturer, <prefix>_stock,
+            <prefix>_price, <prefix>_currency, <prefix>_url
 
         Empty values for components that aren't real parts (e.g. "10k") are
         normal — the API returns no match and the columns stay blank.
@@ -196,9 +268,7 @@ def register(mcp) -> None:
         )
         out.parent.mkdir(parents=True, exist_ok=True)
 
-        srcs = [s.strip() for s in sources.split(",") if s.strip()]
-        use_dk = "digikey" in srcs
-        use_mo = "mouser" in srcs
+        names = _parse_sources(sources)
 
         # Read BOM (KiCAD writes UTF-8 with default delimiter ',')
         with bom.open(encoding="utf-8", newline="") as f:
@@ -214,25 +284,16 @@ def register(mcp) -> None:
             )
 
         # Cache lookups by query so we don't hit the API multiple times for
-        # the same value.
-        dk_cache: dict[str, dict] = {}
-        mo_cache: dict[str, dict] = {}
+        # the same value. One cache per source.
+        caches: dict[str, dict[str, dict]] = {name: {} for name in names}
         errors: dict[str, str] = {}
 
-        new_columns = []
-        if use_dk:
-            new_columns += [
-                "dk_mpn", "dk_manufacturer", "dk_stock",
-                "dk_price", "dk_currency", "dk_url",
-            ]
-        if use_mo:
-            new_columns += [
-                "mo_mpn", "mo_manufacturer", "mo_stock",
-                "mo_price", "mo_currency", "mo_url",
-            ]
-        for col in new_columns:
-            if col not in fieldnames:
-                fieldnames.append(col)
+        for name in names:
+            prefix = SOURCE_PREFIX[name]
+            for suffix in ("mpn", "manufacturer", "stock", "price", "currency", "url"):
+                col = f"{prefix}_{suffix}"
+                if col not in fieldnames:
+                    fieldnames.append(col)
 
         api_calls = 0
         for row in rows[:max_rows]:
@@ -240,40 +301,25 @@ def register(mcp) -> None:
             if not query:
                 continue
 
-            if use_dk and query not in dk_cache:
-                try:
-                    results = digikey.search_keyword(query, limit=1)
-                    dk_cache[query] = results[0] if results else {}
-                    api_calls += 1
-                except digikey.DigiKeyError as e:
-                    errors.setdefault("digikey", str(e))
-                    dk_cache[query] = {}
+            for name in names:
+                cache = caches[name]
+                if query not in cache:
+                    try:
+                        results = _search_source(name, query, limit=1)
+                        cache[query] = results[0] if results else {}
+                        api_calls += 1
+                    except _source_error(name) as e:
+                        errors.setdefault(name, str(e))
+                        cache[query] = {}
 
-            if use_mo and query not in mo_cache:
-                try:
-                    results = mouser.search_part(query)
-                    mo_cache[query] = results[0] if results else {}
-                    api_calls += 1
-                except mouser.MouserError as e:
-                    errors.setdefault("mouser", str(e))
-                    mo_cache[query] = {}
-
-            if use_dk:
-                dk = dk_cache.get(query, {})
-                row["dk_mpn"] = dk.get("mpn", "")
-                row["dk_manufacturer"] = dk.get("manufacturer", "")
-                row["dk_stock"] = dk.get("stock", "")
-                row["dk_price"] = dk.get("unit_price", "")
-                row["dk_currency"] = dk.get("currency", "")
-                row["dk_url"] = dk.get("product_url", "")
-            if use_mo:
-                mo = mo_cache.get(query, {})
-                row["mo_mpn"] = mo.get("mpn", "")
-                row["mo_manufacturer"] = mo.get("manufacturer", "")
-                row["mo_stock"] = mo.get("stock", "")
-                row["mo_price"] = mo.get("unit_price", "")
-                row["mo_currency"] = mo.get("currency", "")
-                row["mo_url"] = mo.get("product_url", "")
+                hit = cache.get(query, {})
+                prefix = SOURCE_PREFIX[name]
+                row[f"{prefix}_mpn"] = hit.get("mpn", "")
+                row[f"{prefix}_manufacturer"] = hit.get("manufacturer", "")
+                row[f"{prefix}_stock"] = hit.get("stock", "")
+                row[f"{prefix}_price"] = hit.get("unit_price", "")
+                row[f"{prefix}_currency"] = hit.get("currency", "")
+                row[f"{prefix}_url"] = hit.get("product_url", "")
 
         # Write the enriched CSV
         with out.open("w", encoding="utf-8", newline="") as f:
@@ -283,18 +329,21 @@ def register(mcp) -> None:
                 writer.writerow(row)
 
         # Summary stats
-        dk_hits = sum(1 for v in dk_cache.values() if v)
-        mo_hits = sum(1 for v in mo_cache.values() if v)
-        return {
+        result: dict = {
             "input_bom": str(bom),
             "output_path": str(out),
             "row_count": len(rows),
-            "unique_queries": max(len(dk_cache), len(mo_cache)),
-            "digikey_hits": dk_hits if use_dk else None,
-            "mouser_hits": mo_hits if use_mo else None,
+            "sources": names,
+            "unique_queries": max((len(c) for c in caches.values()), default=0),
             "api_calls": api_calls,
             "errors": errors,
         }
+        for name in SOURCE_NAMES:
+            cache = caches.get(name)
+            result[f"{name}_hits"] = (
+                sum(1 for v in cache.values() if v) if cache is not None else None
+            )
+        return result
 
     @mcp.tool()
     def list_vendor_parts() -> dict:

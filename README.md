@@ -147,7 +147,7 @@ section, exposed under its own name. Drop it if you only run one.
 ### Library management
 
 - **22,000+ KiCAD official symbols indexed** — `index_libraries`, `search_symbol`, `search_footprint`, `get_symbol_details`
-- **External sourcing**: `find_or_fetch_symbol`, `import_vendor_zip` (SnapEDA / Ultra Librarian), `check_availability` (DigiKey + Mouser)
+- **External sourcing**: `find_or_fetch_symbol`, `import_vendor_zip` (SnapEDA / Ultra Librarian), `check_availability` (Mouser, DigiKey, TME, Farnell)
 - **Custom footprints**: `create_footprint` with auto-courtyard and silk outline
 
 ### PCB layout
@@ -177,7 +177,7 @@ section, exposed under its own name. Drop it if you only run one.
 - **3D STEP export** — `export_step_3d` for Fusion 360 / SolidWorks / FreeCAD
 - **3D render** — `render_pcb_3d` (PNG, configurable side / quality / rotation)
 - **SVG per layer** — for documentation
-- **BOM enriched in real-time** — `enrich_bom_with_sourcing` queries DigiKey + Mouser per unique value, appends MPN / stock / price / URL columns
+- **BOM enriched in real-time** — `enrich_bom_with_sourcing` queries Mouser, DigiKey, TME and/or Farnell per unique value, appends MPN / stock / price / URL columns per source
 - **Panelization** — `panelize_board_grid` duplicates the board in a grid with mouse bites for batch fabrication
 
 ### Engineering analysis
@@ -233,7 +233,7 @@ autoroute_pcb     passes=20
 run_erc                                                    # 0 errors
 run_drc           refill_zones=True  schematic_parity=True  # 0 errors
 export_fab_package  include_render=True
-enrich_bom_with_sourcing  sources="digikey,mouser"
+enrich_bom_with_sourcing  sources="mouser,digikey,tme,farnell"
 ```
 
 ---

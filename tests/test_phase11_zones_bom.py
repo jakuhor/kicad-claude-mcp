@@ -234,6 +234,7 @@ def test_enrich_bom_with_offline_stubs(blank_project, tmp_path, monkeypatch):
         mcp, "enrich_bom_with_sourcing",
         bom_path=str(bom),
         output_path=str(tmp_path / "out.csv"),
+        sources="digikey,mouser",
     )
     assert res["row_count"] == 2
     assert res["digikey_hits"] == 2
