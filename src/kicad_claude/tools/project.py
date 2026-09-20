@@ -68,7 +68,30 @@ def _summarize(proj: state.ActiveProject) -> dict:
         "symbols": sum(1 for _ in ed.iter_instance_symbols(sch_tree)),
         "footprints": sum(1 for _ in pcb_ed.iter_footprints(pcb_tree)),
         "nets": len(pcb_ed.list_nets(pcb_tree)),
+        "formats": {
+            "sch_version": _format_version(sch_tree),
+            "pcb_version": _format_version(pcb_tree),
+            # Which spelling this board uses for a net. KiCAD 10 dropped the
+            # numbered table; saying so here stops a reader concluding that a
+            # board whose pads carry `(net "GND")` has lost its nets.
+            "pcb_net_storage": (
+                "indexed table + (net <index> \"<name>\") — board format 9 and earlier"
+                if pcb_ed.has_net_table(pcb_tree)
+                else "name on each item, (net \"<name>\"), no net table — KiCAD 10"
+            ),
+        },
     }
+
+
+def _format_version(tree: list) -> int | None:
+    """The file's `(version N)` — the format KiCAD wrote, not the app version."""
+    node = sch_io.find_child(tree, "version")
+    if node is None or len(node) < 2:
+        return None
+    try:
+        return int(node[1])
+    except (TypeError, ValueError):
+        return None
 
 
 def _component_dict(sym: list) -> dict:
@@ -130,7 +153,10 @@ def register(mcp) -> None:
     def get_project_state() -> dict:
         """Return a summary of the currently active KiCAD project.
 
-        Includes paths and counts of symbols, footprints, nets.
+        Includes paths, counts of symbols, footprints and nets, and `formats`:
+        the `(version …)` each file declares plus how this board spells a net.
+        KiCAD 10 (`pcb_version` 20260206) names the net on every pad, track,
+        via and zone and writes no net table.
         """
         return _summarize(state.get_active())
 

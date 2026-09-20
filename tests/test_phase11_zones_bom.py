@@ -71,8 +71,10 @@ def test_add_zone_appends_node_with_polygon(blank_project):
     z = zones[0]
     layer_node = sch_io.find_child(z, "layer")
     assert layer_node[1] == "F.Cu"
-    net_name = sch_io.find_child(z, "net_name")
-    assert net_name[1] == "GND"
+    # KiCAD 10 spelling: the net is named on the zone, with no index and no
+    # legacy `(net_name "GND")` companion.
+    assert sch_io.find_child(z, "net")[1] == "GND"
+    assert sch_io.find_child(z, "net_name") is None
 
 
 def test_add_zone_rejects_under_3_vertices(blank_project):

@@ -507,7 +507,15 @@ def register(mcp) -> None:
 
     @mcp.tool()
     def list_nets() -> dict:
-        """List every net declared at the PCB top level."""
+        """List every net on the PCB, with its table index when it has one.
+
+        KiCAD 10 (board format `20260206`) stores a net as its **name** on each
+        pad, track, via and zone — `(net "GND")` — and writes no top-level net
+        table, so `index` is None. The numbered `(net 5 "GND")` form plus a
+        `(net 5 "GND")` table is board format 9 and earlier; both are read, the
+        current one is written. A KiCAD 10 board that an older parser reports as
+        having no nets is not broken.
+        """
         tree, _ = _load_active_pcb()
         return {"nets": ed.list_nets(tree)}
 

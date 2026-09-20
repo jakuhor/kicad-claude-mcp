@@ -78,6 +78,5 @@
 			(back yes)
 		)
 	)
-	(net 0 "")
 	(embedded_fonts no)
 )

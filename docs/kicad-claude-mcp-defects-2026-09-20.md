@@ -294,8 +294,22 @@ and keeps the reference.
 This *is* the KiCad 10 format. Upgrading a stock demo board with
 `kicad-cli pcb upgrade` (format `20250513` → `20260206`) rewrites every
 `(net <index> "<name>")` on a pad as `(net "<name>")` and drops the top-level
-net table entirely — 0 `(net N "…")` lines remain. The numbered form belongs to
-board format 9 and earlier. The server keeps reading either.
+net table entirely — 0 `(net N "…")` lines remain. `pcbnew.SaveBoard` from
+KiCAD 10.0.6 writes the same `(net "GND")` the server writes. The numbered form
+belongs to board format 9 and earlier. The server keeps reading either.
+
+Made discoverable rather than changed, so the next reader does not re-derive it:
+the `list_nets` docstring states which spelling KiCAD 10 uses, and
+`get_project_state` now returns `formats` — `sch_version`, `pcb_version` and
+`pcb_net_storage` — so the format is in a tool response, not only in prose.
+
+One real defect surfaced while documenting this: the blank template carried a
+stale `(net 0 "")`, which `has_net_table` counted as a legacy table, so every
+zone and track written on a fresh project took the index branch and emitted the
+pre-KiCAD-10 `(net 0) (net_name "GND")` spelling. `has_net_table` now ignores
+the unconnected-net placeholder and the template line is gone — KiCAD drops it
+on its own first save. A fresh board now gets `(net "GND")` on both zone and
+track, DRC 0 errors.
 
 **5. `update_pcb_from_schematic` timeout — fixed.**
 `timeout_seconds` now defaults to 0, meaning "scale with the design":

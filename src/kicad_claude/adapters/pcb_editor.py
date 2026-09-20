@@ -739,8 +739,14 @@ def _net_table(tree: list) -> list[dict]:
 
 
 def has_net_table(tree: list) -> bool:
-    """True when the board still carries a top-level net table."""
-    return bool(_net_table(tree))
+    """True when the board declares real nets in a top-level table.
+
+    A lone `(net 0 "")` does not count: that is the unconnected-net
+    placeholder, which older templates carry and which KiCAD 10 drops on its
+    first save. Treating it as a table made every write on a fresh project take
+    the index branch and emit the pre-KiCAD-10 spelling.
+    """
+    return any(e["index"] != 0 or e["name"] for e in _net_table(tree))
 
 
 def list_nets(tree: list) -> list[dict]:

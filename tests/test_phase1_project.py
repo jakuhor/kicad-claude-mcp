@@ -48,7 +48,9 @@ def test_blank_pcb_loads_with_kicad_skip(tmp_path: Path):
     files = write_blank_project(tmp_path, "p")
     pcb = PCB(str(files["pcb"]))
     assert len(getattr(pcb, "footprint", [])) == 0
-    assert len(pcb.net) == 1  # default unconnected net
+    # KiCAD 10 writes no net table at all, not even the unconnected `(net 0 "")`
+    # that older templates carried, so there is no `net` attribute to read.
+    assert not hasattr(pcb, "net")
 
 
 def test_two_calls_generate_unique_sch_uuids(tmp_path: Path):
@@ -231,3 +233,13 @@ def test_summary_counts_a_populated_board(tmp_path: Path):
     assert res["footprints"] == 1
     assert res["nets"] == 1
     assert res["symbols"] == 0
+
+
+def test_project_state_reports_the_file_formats(tmp_path: Path):
+    """The net spelling is in the response, so no reader has to guess it."""
+    mcp = _make_mcp()
+    _call(mcp, "create_project", path=str(tmp_path / "fmt"), name="fmt")
+    formats = _call(mcp, "get_project_state")["formats"]
+    assert formats["sch_version"] == 20260306
+    assert formats["pcb_version"] == 20260206
+    assert "no net table" in formats["pcb_net_storage"]
