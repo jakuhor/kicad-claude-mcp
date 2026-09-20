@@ -112,6 +112,13 @@ def register(mcp) -> None:
           - Power: track_width 0.5 mm, clearance 0.25 mm
           - Signal: track_width 0.2 mm, clearance 0.15 mm
           - USB_DP: diff_pair_width 0.15 mm, diff_pair_gap 0.15 mm
+
+        `clearance_mm` also applies pad-to-pad *inside* a single footprint, so
+        0.4 mm on a power class reports a violation on every QFN and SOT-583
+        whose lands sit 0.2–0.3 mm apart. To widen only the spacing between
+        rails, leave the class clearance at the board minimum and add an
+        `add_drc_rule` with a condition such as
+        `A.Type == 'Track' && B.Type == 'Track'`.
         """
         proj = state.get_active()
         pro = ps.load_pro(proj.pro_path)

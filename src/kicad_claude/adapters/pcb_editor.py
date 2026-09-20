@@ -149,8 +149,34 @@ def _footprint_property(fp: list, name: str) -> str | None:
     return get_property(fp, name)
 
 
+def get_fp_text(fp: list, kind: str) -> str | None:
+    """Value of a legacy `(fp_text reference|value "X" …)` child, if present.
+
+    KiCAD 7 replaced these with `(property "Reference" …)`, but a `.pretty`
+    library written before that still uses them and KiCAD still loads it.
+    """
+    for node in find_children(fp, "fp_text"):
+        if len(node) > 2 and str(node[1]) == kind and isinstance(node[2], str):
+            return node[2]
+    return None
+
+
+def _set_fp_text(children: list, kind: str, value: str) -> bool:
+    """Set every `(fp_text <kind> …)` in `children`. Returns True if any changed."""
+    changed = False
+    for node in children:
+        if is_call(node, "fp_text") and len(node) > 2 and str(node[1]) == kind:
+            node[2] = value
+            changed = True
+    return changed
+
+
 def get_footprint_reference(fp: list) -> str | None:
-    return _footprint_property(fp, "Reference")
+    """The footprint's reference: the property, else the legacy `fp_text`."""
+    ref = _footprint_property(fp, "Reference")
+    if ref is not None:
+        return ref
+    return get_fp_text(fp, "reference")
 
 
 def find_footprint_by_reference(tree: list, reference: str) -> list | None:
@@ -256,6 +282,50 @@ def fetch_footprint_def(mod_path: Path) -> list:
     return data
 
 
+def get_footprint_rotation(fp: list) -> int:
+    """The footprint's own `(at x y rot)` angle, 0 when it carries none."""
+    at = find_child(fp, "at")
+    if at is None or len(at) < 4:
+        return 0
+    try:
+        return int(round(float(at[3]))) % 360
+    except (TypeError, ValueError):
+        return 0
+
+
+def rotate_footprint_pads(fp: list, delta_deg: float) -> int:
+    """Add `delta_deg` to every pad's `(at x y [angle])`. Returns pads touched.
+
+    A pad's angle in a `.kicad_pcb` is **absolute**, not relative to the
+    footprint: KiCAD writes `footprint_angle + pad_local_angle`. Rotating only
+    the footprint's own `(at …)` therefore rotates the pad *positions* while
+    leaving the pad *bodies* in their original orientation, which silently
+    shorts neighbouring lands on any fine-pitch part.
+    """
+    delta = float(delta_deg) % 360
+    touched = 0
+    for pad in find_children(fp, "pad"):
+        at = find_child(pad, "at")
+        if at is None:
+            continue
+        current = 0.0
+        if len(at) >= 4:
+            try:
+                current = float(at[3])
+            except (TypeError, ValueError):
+                current = 0.0
+        new = (current + delta) % 360
+        if delta == 0 and len(at) < 4:
+            continue  # nothing to write: an absent angle already means 0
+        new_val = int(new) if float(new).is_integer() else round_mm(new)
+        if len(at) >= 4:
+            at[3] = new_val
+        else:
+            at.append(new_val)
+        touched += 1
+    return touched
+
+
 def _strip_top_fields(fp: list, names: set[str]) -> list:
     """Return children of `fp` (skipping head + name) with given heads removed."""
     return [c for c in fp[2:] if head_of(c) not in names]
@@ -292,12 +362,23 @@ def _build_placed_footprint(
             elif c[i] == "Value":
                 c[i + 1] = value
 
+    # A library footprint in the KiCAD 6 format carries `(fp_text reference
+    # "REF**" …)` instead of a `(property "Reference" …)`. Written unchanged it
+    # lands on the board as an unnamed part that no sync can match, so the
+    # legacy nodes are set too.
+    _set_fp_text(core, "reference", reference)
+    _set_fp_text(core, "value", value)
+
     header: list[Any] = [
         [sym("layer"), layer],
         [sym("uuid"), str(uuid.uuid4())],
         [sym("at"), round_mm(x_k), round_mm(y_k), rotation_deg],
     ]
-    return [sym("footprint"), qualified_lib_id, *header, *core]
+    placed_node = [sym("footprint"), qualified_lib_id, *header, *core]
+    # Pad angles are absolute — see `rotate_footprint_pads`.
+    if rotation_deg:
+        rotate_footprint_pads(placed_node, rotation_deg)
+    return placed_node
 
 
 def add_footprint(
@@ -351,6 +432,14 @@ def set_footprint_property(fp: list, name: str, value: str) -> bool:
             prop[i + 1] = value
             return True
 
+    # No property — a KiCAD 6 footprint spells Reference/Value as `fp_text`.
+    # Write there rather than adding a second, conflicting field.
+    legacy = {"Reference": "reference", "Value": "value"}.get(name)
+    if legacy is not None and get_fp_text(fp, legacy) is not None:
+        if get_fp_text(fp, legacy) == value:
+            return False
+        return _set_fp_text(fp, legacy, value)
+
     node = [
         sym("property"),
         name,
@@ -396,6 +485,7 @@ def move_footprint(
         raise ValueError(f"layer must be 'F.Cu' or 'B.Cu' (got {layer!r})")
 
     xk, yk = pcb_to_file_xy(x_mm, y_mm)
+    old_rot = get_footprint_rotation(fp)
     at = find_child(fp, "at")
     if at is None:
         # Insert one at the right position (after layer/uuid). Fallback: just append.
@@ -404,12 +494,15 @@ def move_footprint(
     else:
         at[1] = round_mm(xk)
         at[2] = round_mm(yk)
-        if rotation is not None:
-            rot = normalize_rotation(rotation)
-            if len(at) >= 4:
-                at[3] = rot
-            else:
-                at.append(rot)
+    if rotation is not None:
+        rot = normalize_rotation(rotation)
+        if len(at) >= 4:
+            at[3] = rot
+        else:
+            at.append(rot)
+        # Pad angles are absolute, so they must follow the footprint —
+        # otherwise the pad positions rotate and the pad bodies do not.
+        rotate_footprint_pads(fp, rot - old_rot)
 
     if layer is not None:
         layer_node = find_child(fp, "layer")

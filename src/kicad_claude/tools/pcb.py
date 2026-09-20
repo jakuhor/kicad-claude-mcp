@@ -32,6 +32,7 @@ from kicad_claude.adapters import safe_write
 from kicad_claude.adapters import sch_io
 from kicad_claude.templates.blank import write_blank_pcb
 from kicad_claude.tools import library as lib_tools
+from kicad_claude.utils.kicad_strings import normalize_name
 
 logger = logging.getLogger("kicad-claude.tools.pcb")
 
@@ -513,7 +514,7 @@ def register(mcp) -> None:
     # ----- Copper connectivity (derived, read-only) ----------------------- #
 
     @mcp.tool()
-    def list_unrouted() -> dict:
+    def list_unrouted(summary: bool = False, max_items: int = 0, net: str = "") -> dict:
         """Connections the board still needs, longest first — the ratsnest.
 
         A `.kicad_pcb` says which net each pad belongs to but not whether copper
@@ -524,9 +525,38 @@ def register(mcp) -> None:
         `zones_filled` is False when some zone carries no fill data. An unfilled
         ground pour connects nothing, so treat the result as pessimistic and
         re-run after `run_drc(refill_zones=True)`.
+
+        An unrouted board has hundreds of these, which is a lot of JSON to
+        answer "how many?". `summary=True` returns only `count` and
+        `by_net`; `max_items` caps the list (0 = all) and `omitted` says how
+        many were dropped; `net` restricts the result to one net.
         """
         tree, _ = _load_active_pcb()
-        return pcb_netlist.list_unrouted(tree)
+        result = pcb_netlist.list_unrouted(tree)
+        items = result["unrouted"]
+        if net:
+            wanted = normalize_name(net)
+            items = [i for i in items if normalize_name(i["net"]) == wanted]
+            result["net"] = net
+            result["count"] = len(items)
+
+        by_net: dict[str, int] = {}
+        for item in items:
+            by_net[item["net"]] = by_net.get(item["net"], 0) + 1
+        result["by_net"] = sorted(
+            [{"net": n, "missing_links": c} for n, c in by_net.items()],
+            key=lambda d: (-d["missing_links"], d["net"]),
+        )
+
+        if summary:
+            result["unrouted"] = []
+            result["omitted"] = len(items)
+        elif max_items and len(items) > max_items:
+            result["unrouted"] = items[:max_items]
+            result["omitted"] = len(items) - max_items
+        else:
+            result["unrouted"] = items
+        return result
 
     @mcp.tool()
     def get_pad_position(reference: str, pad: str) -> dict:

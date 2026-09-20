@@ -500,3 +500,49 @@ class TestComponentSync:
             net="GND", x_mm=100, y_mm=140)
         components = sc.collect_schematic_components([project / "s.kicad_sch"])
         assert all(not ref.startswith("#") for ref in components)
+
+
+# ===== Defects report 2026-09-20 =========================================== #
+
+
+def test_jlcpcb_4l_preset_allows_02mm_thermal_vias():
+    """#8 — the stock 4-layer preset rejected 0.2 mm vias in KiCAD footprints."""
+    rules = ps.FAB_PRESETS["jlcpcb_4l"]["rules"]
+    assert rules["min_via_drill"] <= 0.2
+    assert rules["min_through_hole_diameter"] <= 0.2
+    assert rules["min_clearance"] <= 0.127
+    assert rules["min_track_width"] <= 0.127
+
+
+def test_netlist_timeout_scales_with_component_count():
+    """#5 — a fixed 90 s could not cover a 189-part board."""
+    from kicad_claude.tools.sync import _netlist_timeout
+
+    assert _netlist_timeout(5) == 180.0          # floor for a small board
+    assert _netlist_timeout(189) >= 550.0        # the board from the report
+    assert _netlist_timeout(400) > _netlist_timeout(189)
+
+
+def test_timeout_result_says_what_was_completed():
+    from kicad_claude.adapters.kicad_python import KicadPythonError
+    from kicad_claude.tools.sync import _timeout_result
+
+    res = _timeout_result(KicadPythonError("pcbnew script timed out after 90.0s"), 90.0, 189)
+    assert res["timed_out"] is True
+    assert res["stage"] == "netlist"
+    assert "nets" in res["completed"].lower()
+    assert "timeout_seconds" in res
+
+
+def test_aisler_presets_match_the_published_process():
+    """AISLER: 0.2/0.15 mm and 0.3 mm drill on 2L, 0.125 mm and 0.25 mm on 4L."""
+    two = ps.FAB_PRESETS["aisler_2l"]["rules"]
+    assert (two["min_track_width"], two["min_clearance"]) == (0.2, 0.15)
+    assert two["min_via_drill"] == 0.3
+
+    four = ps.FAB_PRESETS["aisler_4l"]["rules"]
+    assert (four["min_track_width"], four["min_clearance"]) == (0.125, 0.125)
+    assert four["min_via_drill"] == 0.25
+
+    for name in ("aisler_2l", "aisler_4l"):
+        assert ps.FAB_PRESETS[name]["rules"]["allow_microvias"] is False

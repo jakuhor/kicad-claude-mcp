@@ -25,6 +25,7 @@ from kicad_claude.indexer.kicad_libs import (
     save_cache,
 )
 from kicad_claude.indexer.search import search_footprints, search_symbols
+from kicad_claude.utils import kicad_config
 from kicad_claude.utils.kicad_paths import find_footprint_lib_dirs, find_symbol_lib_dirs
 from kicad_claude.utils.kicad_strings import normalize_name
 
@@ -40,7 +41,9 @@ def _lib_table_dirs(table_path: Path, project_dir: Path, suffix: str) -> list[Pa
 
     A symbol library's uri is the `.kicad_sym` file and a footprint library's
     is the `.pretty` folder; the indexer walks *directories*, so the parent is
-    returned in both cases. `${KIPRJMOD}` is the project directory.
+    returned in both cases. `${KIPRJMOD}` is the project directory; every other
+    path variable is resolved the way KiCAD resolves it, from
+    `kicad_common.json` and the environment.
     """
     if not table_path.is_file():
         return []
@@ -50,16 +53,16 @@ def _lib_table_dirs(table_path: Path, project_dir: Path, suffix: str) -> list[Pa
         logger.warning("malformed %s; ignoring", table_path)
         return []
 
+    variables = {**kicad_config.path_vars(), "KIPRJMOD": str(project_dir)}
     out: list[Path] = []
     for lib in sch_io.find_children(table, "lib"):
         uri_node = sch_io.find_child(lib, "uri")
         if not uri_node or len(uri_node) < 2:
             continue
-        uri = str(uri_node[1])
-        if "${" in uri and "KIPRJMOD" not in uri:
-            continue  # some other env var; the indexer cannot resolve it
-        uri = uri.replace("${KIPRJMOD}", str(project_dir)).replace("$(KIPRJMOD)", str(project_dir))
-        p = Path(uri)
+        expanded = kicad_config.expand_uri(str(uri_node[1]), variables)
+        if expanded is None:
+            continue  # a path variable nothing defines; there is no dir to walk
+        p = Path(expanded)
         if p.suffix.lower() != suffix:
             continue
         if p.parent.is_dir():

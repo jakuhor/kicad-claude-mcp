@@ -384,3 +384,126 @@ def test_place_footprints_grid_can_arrange_already_placed_parts(tmp_path: Path):
                  for f in ed.list_footprints_summary(tree)}
     assert positions["R1"] == [20.0, 20.0]
     assert positions["R2"] == [30.0, 20.0]
+
+
+# ===== Pad angles follow the footprint (defects report 2026-09-20, #1) ===== #
+
+
+def _extra_fp_def(name: str) -> list:
+    return ed.fetch_footprint_def(FIXTURES / "ExtraFP.pretty" / f"{name}.kicad_mod")
+
+
+def _pad_angles(fp: list) -> list[float]:
+    out = []
+    for pad in sch_io.find_children(fp, "pad"):
+        at = sch_io.find_child(pad, "at")
+        out.append(float(at[3]) if len(at) >= 4 else 0.0)
+    return out
+
+
+def test_move_footprint_rotates_pads_with_the_footprint(blank_project):
+    """A pad's angle is absolute, so rotating the footprint must rotate it too."""
+    tree = sch_io.parse_file(blank_project["pcb"])
+    ed.add_footprint(
+        tree, qualified_lib_id="ExtraFP:Pads_2P", reference="U1", value="v",
+        x_mm=10, y_mm=10, fp_def_node=_extra_fp_def("Pads_2P"),
+    )
+    fp = ed.find_footprint_by_reference(tree, "U1")
+    assert _pad_angles(fp) == [0.0, 45.0]
+
+    ed.move_footprint(tree, "U1", x_mm=10, y_mm=10, rotation=90)
+    assert _pad_angles(fp) == [90.0, 135.0]
+
+    # Rotating back takes the pads with it — the delta, not the absolute value.
+    ed.move_footprint(tree, "U1", x_mm=10, y_mm=10, rotation=0)
+    assert _pad_angles(fp) == [0.0, 45.0]
+
+
+def test_move_footprint_without_rotation_leaves_pads_alone(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    ed.add_footprint(
+        tree, qualified_lib_id="ExtraFP:Pads_2P", reference="U1", value="v",
+        x_mm=10, y_mm=10, rotation=90, fp_def_node=_extra_fp_def("Pads_2P"),
+    )
+    fp = ed.find_footprint_by_reference(tree, "U1")
+    assert _pad_angles(fp) == [90.0, 135.0]  # applied at placement time
+    ed.move_footprint(tree, "U1", x_mm=40, y_mm=20)
+    assert _pad_angles(fp) == [90.0, 135.0]
+
+
+# ===== KiCad 6 footprints keep their reference (defects report #3) ========= #
+
+
+def test_legacy_fp_text_footprint_gets_its_reference(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    ed.add_footprint(
+        tree, qualified_lib_id="ExtraFP:Legacy_2P", reference="L9", value="100uH",
+        x_mm=10, y_mm=10, fp_def_node=_extra_fp_def("Legacy_2P"),
+    )
+    fp = ed.find_footprint_by_reference(tree, "L9")
+    assert fp is not None
+    assert ed.get_fp_text(fp, "reference") == "L9"
+    assert ed.get_fp_text(fp, "value") == "100uH"
+    assert ed.all_footprint_references(tree) == ["L9"]
+
+
+def test_set_footprint_property_writes_legacy_fp_text(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    ed.add_footprint(
+        tree, qualified_lib_id="ExtraFP:Legacy_2P", reference="L9", value="100uH",
+        x_mm=10, y_mm=10, fp_def_node=_extra_fp_def("Legacy_2P"),
+    )
+    fp = ed.find_footprint_by_reference(tree, "L9")
+    assert ed.set_footprint_property(fp, "Value", "220uH") is True
+    assert ed.get_fp_text(fp, "value") == "220uH"
+    # No second, conflicting field was added.
+    assert sch_io.get_property(fp, "Value") is None
+    assert ed.set_footprint_property(fp, "Value", "220uH") is False
+
+
+@pytest.mark.slow
+def test_acceptance_rotating_a_real_footprint_keeps_drc_clean(tmp_path):
+    """#1 — a rotated USB-C used to short its own lands (54 extra violations).
+
+    The check is rotation invariance: the same footprint must produce the same
+    DRC errors at 0° and at 90°. The handful it produces at 0° belong to the
+    library footprint against the blank project's default rules.
+    """
+    from kicad_claude.adapters import kicad_cli
+
+    cli = find_kicad_cli()
+    fp_dirs = find_footprint_lib_dirs()
+    if not cli or not fp_dirs:
+        pytest.skip("kicad-cli or footprint libs not available")
+    mod = next(
+        (d / "Connector_USB.pretty" /
+         "USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal.kicad_mod"
+         for d in fp_dirs
+         if (d / "Connector_USB.pretty").is_dir()),
+        None,
+    )
+    if mod is None or not mod.is_file():
+        pytest.skip("Connector_USB library not available")
+
+    counts = {}
+    for rotation in (0, 90):
+        files = write_blank_project(tmp_path / f"rot{rotation}", "rot")
+        tree = sch_io.parse_file(files["pcb"])
+        ed.set_board_outline(tree, 40, 40)
+        ed.add_footprint(
+            tree,
+            qualified_lib_id=(
+                "Connector_USB:"
+                "USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal"
+            ),
+            reference="J1", value="USB_C", x_mm=20, y_mm=20,
+            fp_def_node=ed.fetch_footprint_def(mod),
+        )
+        ed.move_footprint(tree, "J1", x_mm=20, y_mm=20, rotation=rotation)
+        sch_io.write_file(files["pcb"], tree)
+        report = kicad_cli.run_drc(files["pcb"], schematic_parity=False)
+        counts[rotation] = report["errors"]
+        types = {v["type"] for v in report["violations"]}
+        assert "shorting_items" not in types
+
+    assert counts[90] == counts[0]

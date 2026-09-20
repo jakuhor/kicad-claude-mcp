@@ -37,6 +37,35 @@ def _all_schematic_paths() -> list[Path]:
     return paths
 
 
+def _netlist_timeout(component_count: int) -> float:
+    """Timeout for the netlist stage, scaled with the design.
+
+    KiCAD's `pcbnew` netlist update is roughly linear in the number of parts:
+    189 footprints / 90 nets takes two to four minutes, which the old fixed
+    90 s default could never cover.
+    """
+    return max(180.0, 120.0 + 2.5 * component_count)
+
+
+def _timeout_result(error: Exception, timeout: float, component_count: int) -> dict:
+    """What the update managed before the netlist stage ran out of time."""
+    return {
+        "timed_out": True,
+        "error": str(error),
+        "stage": "netlist",
+        "completed": (
+            "footprints placed and saved; pad nets NOT assigned "
+            "(the netlist stage did not finish)"
+        ),
+        "timeout_seconds": timeout,
+        "schematic_components": component_count,
+        "hint": (
+            "Re-run with a larger timeout_seconds — the placement step is "
+            f"idempotent, so nothing is duplicated. Try {int(timeout * 2)}."
+        ),
+    }
+
+
 def register(mcp) -> None:
     """Register Phase 10 sync tools."""
 
@@ -59,7 +88,7 @@ def register(mcp) -> None:
         place_missing: bool = True,
         sync_fields: bool = True,
         remove_extra: bool = False,
-        timeout_seconds: float = 90.0,
+        timeout_seconds: float = 0.0,
     ) -> dict:
         """Bring the active PCB in line with the schematic — KiCAD's own update.
 
@@ -85,6 +114,13 @@ def register(mcp) -> None:
 
         After this, Freerouting can actually route the board (pads have
         net assignments).
+
+        `timeout_seconds` defaults to 0, which means "scale with the board":
+        120 s plus 2.5 s per schematic symbol (a 189-part board gets ~590 s).
+        The netlist stage runs KiCAD's own Python on the whole board and takes
+        minutes on a mid-size design. When it does time out, the footprints are
+        already placed and saved; the response says so in `stage` and
+        `timed_out` instead of only raising.
         """
         proj = state.get_active()
 
@@ -111,17 +147,28 @@ def register(mcp) -> None:
         if placement["placed"] or fields_changed or (remove_extra and orphans):
             backup = safe_write.save_tree(tree=tree, path=pcb_path)
 
+        # A fixed 90 s cannot cover both a 10-part board and a 200-part one.
+        timeout = float(timeout_seconds) if timeout_seconds else _netlist_timeout(
+            len(components)
+        )
+
         # 1) Export the netlist as kicadxml (different format than DSN)
         netlist_xml = proj.path / "fab" / f"{proj.name}-netlist.xml"
         netlist_xml.parent.mkdir(parents=True, exist_ok=True)
         kicad_cli.export_netlist(
-            proj.sch_path, netlist_xml, fmt="kicadxml", timeout=timeout_seconds
+            proj.sch_path, netlist_xml, fmt="kicadxml", timeout=timeout
         )
 
         # 2) Apply via pcbnew Python
-        result = kicad_python.apply_netlist(
-            state.get_active_board_path(), netlist_xml, timeout=timeout_seconds
-        )
+        try:
+            result = kicad_python.apply_netlist(
+                state.get_active_board_path(), netlist_xml, timeout=timeout
+            )
+            result["timed_out"] = False
+        except kicad_python.KicadPythonError as e:
+            if "timed out" not in str(e):
+                raise
+            result = _timeout_result(e, timeout, len(components))
 
         # 3) Surface the artifacts and whatever could not be done automatically
         result["netlist_path"] = str(netlist_xml)
@@ -136,6 +183,8 @@ def register(mcp) -> None:
             result["backup"] = str(backup)
 
         hints: list[str] = []
+        if result.get("timed_out"):
+            hints.append(result.pop("hint"))
         if result.get("missing_in_pcb"):
             hints.append(
                 "Some schematic references are still not on the PCB: "

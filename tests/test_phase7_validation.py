@@ -291,3 +291,57 @@ def test_run_erc_reports_a_dangling_wire(tmp_path: Path):
         assert res["errors"] + res["warnings"] == res["total_violations"]
     finally:
         state.clear_active()
+
+
+# ===== DRC result size control (defects report 2026-09-20, #7) ============= #
+
+
+def _fake_drc_report() -> dict:
+    return {
+        "kind": "drc",
+        "errors": 2,
+        "warnings": 1,
+        "total_violations": 3,
+        "violations": [
+            {"type": "shorting_items", "severity": "error", "description": "", "items": []},
+            {"type": "shorting_items", "severity": "error", "description": "", "items": []},
+            {"type": "silk_overlap", "severity": "warning", "description": "", "items": []},
+        ],
+        "unconnected_items": [
+            {"type": "unconnected_items", "severity": "error", "description": "", "items": []},
+        ],
+        "schematic_parity": [],
+        "raw_path": "board.drc.json",
+    }
+
+
+def test_drc_summary_keeps_counts_and_drops_entries():
+    from kicad_claude.tools.validation import _condense_drc
+
+    res = _condense_drc(_fake_drc_report(), summary=True, max_violations=0)
+    assert res["violations"] == []
+    assert res["violations_omitted"] == 3
+    assert res["violations_by_type"] == [
+        {"type": "shorting_items", "severity": "error", "count": 2},
+        {"type": "silk_overlap", "severity": "warning", "count": 1},
+    ]
+    assert res["unconnected_items_by_type"][0]["count"] == 1
+    assert res["total_violations"] == 3
+    assert res["raw_path"] == "board.drc.json"
+
+
+def test_drc_max_violations_caps_each_list():
+    from kicad_claude.tools.validation import _condense_drc
+
+    res = _condense_drc(_fake_drc_report(), summary=False, max_violations=2)
+    assert len(res["violations"]) == 2
+    assert res["violations_omitted"] == 1
+    assert "unconnected_items_omitted" not in res  # shorter than the cap
+
+
+def test_drc_default_call_returns_everything():
+    from kicad_claude.tools.validation import _condense_drc
+
+    res = _condense_drc(_fake_drc_report(), summary=False, max_violations=0)
+    assert len(res["violations"]) == 3
+    assert "violations_omitted" not in res

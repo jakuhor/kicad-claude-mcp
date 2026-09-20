@@ -7,6 +7,8 @@ be skipped with `pytest -m "not slow"`.
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
 from pathlib import Path
 
@@ -407,3 +409,74 @@ class TestProjectLibrariesAreIndexed:
         state.clear_active()
         idx = {"symbols": {"A:B": {}}, "footprints": {}, "symbol_dirs": []}
         assert lib_tools._with_project_libs(idx) is idx
+
+
+# ===== Global lib tables (defects report 2026-09-20, #6) =================== #
+
+
+def _write_global_config(root: Path, lib_dir: Path, var_name: str = "KICAD_MY") -> Path:
+    """A KiCAD config dir holding a global fp-lib-table + sym-lib-table."""
+    cfg = root / "kicad" / "10.0"
+    cfg.mkdir(parents=True)
+    (cfg / "kicad_common.json").write_text(
+        json.dumps({"environment": {"vars": {var_name: str(lib_dir)}}}),
+        encoding="utf-8",
+    )
+    (cfg / "fp-lib-table").write_text(
+        "(fp_lib_table\n  (version 7)\n"
+        f'  (lib (name "mylib")(type "KiCad")(uri "${{{var_name}}}/mylib.pretty")'
+        '(options "")(descr ""))\n)\n',
+        encoding="utf-8",
+    )
+    (cfg / "sym-lib-table").write_text(
+        "(sym_lib_table\n  (version 7)\n"
+        f'  (lib (name "mylib")(type "KiCad")(uri "${{{var_name}}}/mylib.kicad_sym")'
+        '(options "")(descr ""))\n)\n',
+        encoding="utf-8",
+    )
+    return cfg
+
+
+def test_global_lib_table_dirs_expand_path_variables(tmp_path: Path, monkeypatch):
+    from kicad_claude.utils import kicad_config
+
+    lib_dir = tmp_path / "kicad-library"
+    (lib_dir / "mylib.pretty").mkdir(parents=True)
+    (lib_dir / "mylib.kicad_sym").write_text("(kicad_symbol_lib)\n", encoding="utf-8")
+    _write_global_config(tmp_path / "cfg", lib_dir)
+    monkeypatch.setattr(kicad_config, "_config_roots", lambda: [tmp_path / "cfg" / "kicad"])
+
+    assert kicad_config.global_lib_table_dirs("footprint") == [lib_dir]
+    assert kicad_config.global_lib_table_dirs("symbol") == [lib_dir]
+
+
+def test_global_lib_table_skips_unresolvable_variables(tmp_path: Path, monkeypatch):
+    from kicad_claude.utils import kicad_config
+
+    lib_dir = tmp_path / "kicad-library"
+    (lib_dir / "mylib.pretty").mkdir(parents=True)
+    cfg = _write_global_config(tmp_path / "cfg", lib_dir)
+    (cfg / "kicad_common.json").write_text("{}", encoding="utf-8")  # var undefined
+    monkeypatch.setattr(kicad_config, "_config_roots", lambda: [tmp_path / "cfg" / "kicad"])
+    monkeypatch.delenv("KICAD_MY", raising=False)
+
+    assert kicad_config.global_lib_table_dirs("footprint") == []
+
+
+def test_lib_dirs_are_filtered_by_what_they_hold(tmp_path: Path, monkeypatch):
+    """#6b — one KICAD_LIBRARY_PATH used to be reported as both dir lists."""
+    from kicad_claude.utils import kicad_paths
+
+    sym_dir = tmp_path / "syms"
+    fp_dir = tmp_path / "fps"
+    sym_dir.mkdir()
+    fp_dir.mkdir()
+    (sym_dir / "a.kicad_sym").write_text("(kicad_symbol_lib)\n", encoding="utf-8")
+    (fp_dir / "a.pretty").mkdir()
+    monkeypatch.setenv("KICAD_LIBRARY_PATH", os.pathsep.join([str(sym_dir), str(fp_dir)]))
+    monkeypatch.setattr(kicad_paths, "_global_table_dirs", lambda kind: [])
+    monkeypatch.setattr(kicad_paths, "_platform_default_symbol_dirs", lambda: [])
+    monkeypatch.setattr(kicad_paths, "_platform_default_footprint_dirs", lambda: [])
+
+    assert kicad_paths.find_symbol_lib_dirs() == [sym_dir.resolve()]
+    assert kicad_paths.find_footprint_lib_dirs() == [fp_dir.resolve()]

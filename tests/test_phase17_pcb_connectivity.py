@@ -437,3 +437,55 @@ class TestLegacyNetTableStillWorks:
         assert ed.find_net_index(tree, "GND") == 2
         assert sch_io.find_child(zone, "net")[1] == 2
         assert sch_io.find_child(zone, "net_name")[1] == "GND"
+
+
+# ===== Result size control (defects report 2026-09-20, #7) ================= #
+
+
+def _fake_ratsnest(_tree):
+    """Three missing links on two nets, in the shape `list_unrouted` returns."""
+    def link(net, ref, dist):
+        return {
+            "net": net, "net_number": 1,
+            "from": {"ref": ref, "pad": "1", "position_mm": [0.0, 0.0]},
+            "to": {"ref": ref, "pad": "2", "position_mm": [float(dist), 0.0]},
+            "distance_mm": float(dist),
+        }
+
+    return {
+        "count": 3,
+        "unrouted": [link("GND", "U1", 30), link("GND", "U2", 20), link("VBUS", "U3", 10)],
+        "zones_filled": True,
+        "unfilled_zones": 0,
+    }
+
+
+class TestUnroutedSummary:
+    @pytest.fixture(autouse=True)
+    def _fake(self, monkeypatch, blank_project):
+        monkeypatch.setattr(pcb_tools.pcb_netlist, "list_unrouted", _fake_ratsnest)
+
+    def test_summary_drops_the_list_but_keeps_the_counts(self):
+        res = _call(_make_mcp(), "list_unrouted", summary=True)
+        assert res["count"] == 3
+        assert res["unrouted"] == []
+        assert res["omitted"] == 3
+        assert res["by_net"] == [
+            {"net": "GND", "missing_links": 2},
+            {"net": "VBUS", "missing_links": 1},
+        ]
+
+    def test_max_items_caps_the_list_longest_first(self):
+        res = _call(_make_mcp(), "list_unrouted", max_items=1)
+        assert [i["distance_mm"] for i in res["unrouted"]] == [30.0]
+        assert res["omitted"] == 2
+
+    def test_net_filter_restricts_the_result(self):
+        res = _call(_make_mcp(), "list_unrouted", net="VBUS")
+        assert res["count"] == 1
+        assert [i["net"] for i in res["unrouted"]] == ["VBUS"]
+
+    def test_default_call_is_unchanged(self):
+        res = _call(_make_mcp(), "list_unrouted")
+        assert len(res["unrouted"]) == 3
+        assert "omitted" not in res

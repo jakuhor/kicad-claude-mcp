@@ -94,28 +94,51 @@ def _from_env(prefix: str) -> list[Path]:
 def find_symbol_lib_dirs(extra: list[Path] | None = None) -> list[Path]:
     """Return existing directories that may contain `.kicad_sym` files.
 
-    Search order: explicit `extra` arg → env vars → platform defaults.
-    Filtered to existing directories. Duplicates removed (first wins).
+    Search order: explicit `extra` arg → env vars → KiCAD's own global
+    `sym-lib-table` → platform defaults. Filtered to existing directories that
+    actually hold symbol libraries, so a `KICAD_LIBRARY_PATH` naming both kinds
+    of directory does not get reported as symbol *and* footprint directories.
+    Duplicates removed (first wins).
     """
     candidates: list[Path] = []
     if extra:
         candidates.extend(extra)
     candidates.extend(_from_env("SYMBOL_DIR"))
+    candidates.extend(_global_table_dirs("symbol"))
     candidates.extend(_platform_default_symbol_dirs())
-    return _dedup_existing(candidates)
+    return _dedup_existing(candidates, contains="*.kicad_sym")
 
 
 def find_footprint_lib_dirs(extra: list[Path] | None = None) -> list[Path]:
-    """Return existing directories that may contain `*.pretty/` libraries."""
+    """Return existing directories that may contain `*.pretty/` libraries.
+
+    Same search order and content filter as `find_symbol_lib_dirs`.
+    """
     candidates: list[Path] = []
     if extra:
         candidates.extend(extra)
     candidates.extend(_from_env("FOOTPRINT_DIR"))
+    candidates.extend(_global_table_dirs("footprint"))
     candidates.extend(_platform_default_footprint_dirs())
-    return _dedup_existing(candidates)
+    return _dedup_existing(candidates, contains="*.pretty")
 
 
-def _dedup_existing(paths: list[Path]) -> list[Path]:
+def _global_table_dirs(kind: str) -> list[Path]:
+    """Directories from KiCAD's global lib table; never fatal when unreadable."""
+    from kicad_claude.utils import kicad_config  # local: kicad_config imports this
+
+    try:
+        return kicad_config.global_lib_table_dirs(kind)
+    except Exception:  # noqa: BLE001 — a broken user config must not stop indexing
+        return []
+
+
+def _dedup_existing(paths: list[Path], contains: str | None = None) -> list[Path]:
+    """Existing directories, first occurrence wins.
+
+    `contains` is a glob a directory must match at least once to be kept —
+    `*.kicad_sym` for symbol libraries, `*.pretty` for footprint ones.
+    """
     seen: set[Path] = set()
     out: list[Path] = []
     for p in paths:
@@ -123,6 +146,8 @@ def _dedup_existing(paths: list[Path]) -> list[Path]:
         if rp in seen or not rp.is_dir():
             continue
         seen.add(rp)
+        if contains is not None and next(rp.glob(contains), None) is None:
+            continue
         out.append(rp)
     return out
 
