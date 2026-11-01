@@ -266,6 +266,33 @@ def test_check_availability_rejects_unknown_source(monkeypatch):
         _call(mcp, "check_availability", mpn="LM358N", sources="rs-online")
 
 
+@pytest.mark.parametrize("raw, expected", [
+    ("0,420 €", 0.42),
+    ("$0.45", 0.45),
+    ("12,50 Kč", 12.5),
+    ("1 234,50 Kč", 1234.5),
+    ("1\xa0234,50\xa0Kč", 1234.5),
+    ("$1,234.56", 1234.56),
+    ("1.234,56 €", 1234.56),
+    ("", None),
+    ("N/A", None),
+])
+def test_mouser_parse_price_handles_locales(raw, expected):
+    from kicad_claude.adapters import mouser
+    assert mouser._parse_price(raw) == expected
+
+
+def test_mouser_summarize_part_keeps_czk_price():
+    from kicad_claude.adapters import mouser
+    part = mouser._summarize_part({
+        "ManufacturerPartNumber": "LM358N",
+        "AvailabilityInStock": "1 200",
+        "PriceBreaks": [{"Quantity": 1, "Price": "11,90 Kč", "Currency": "CZK"}],
+    })
+    assert part["unit_price"] == 11.9
+    assert part["currency"] == "CZK"
+
+
 def test_parse_sources_orders_and_deduplicates():
     assert sourcing_tools._parse_sources("farnell, TME ,mouser") == [
         "mouser", "tme", "farnell"
