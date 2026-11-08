@@ -76,24 +76,70 @@ def register(mcp) -> None:
         }
 
     @mcp.tool()
-    def apply_fab_preset(preset: str) -> dict:
+    def apply_fab_preset(preset: str, mode: str = "", dry_run: bool = False) -> dict:
         """Apply a bundled fab preset (e.g. 'jlcpcb_2l_default') to the active project.
 
         Run `list_fab_presets` to see the catalogue.
+
+        A preset can be *looser* than rules the project already sets (e.g.
+        `jlcpcb_4l` 0.127 mm clearance on a board designed to 0.15 mm), and
+        overwriting would silently weaken DRC. So when the project sets any
+        rule to a value different from the preset, nothing is written until
+        the caller picks `mode` — ask the user which they want:
+
+          - `project`  — keep the project's rules; only fill rules it leaves unset.
+          - `preset`   — take the fab preset's value for every rule it defines.
+          - `stricter` — per rule, the tighter of the two (larger `min_*`,
+                         `allow_*` False wins). DRC then proves the board meets
+                         both its own constraints and the fab's.
+
+        Without conflicts (fresh project, or values equal) the preset is
+        applied directly and `mode` is not needed. `dry_run=True` returns the
+        comparison and the resolved values without writing.
+
+        Response: `comparison` — one row per rule with `project`, `preset`,
+        `stricter`, `conflict`, `preset_is` (looser / stricter / equal /
+        unset_in_project); `decision_required` when a mode is needed;
+        `rules_applied` — the values written.
         """
         if preset not in ps.FAB_PRESETS:
             raise KeyError(
                 f"unknown preset {preset!r}. Available: {sorted(ps.FAB_PRESETS)}"
             )
+        if mode and mode not in ps.PRESET_MODES:
+            raise ValueError(f"mode must be one of {list(ps.PRESET_MODES)} or empty, got {mode!r}")
         proj = state.get_active()
         pro = ps.load_pro(proj.pro_path)
-        ps.update_design_rules(pro, **ps.FAB_PRESETS[preset]["rules"])
-        ps.save_pro(proj.pro_path, pro)
-        return {
+        current = dict(ps.get_design_rules(pro))
+        rows = ps.compare_preset(current, ps.FAB_PRESETS[preset]["rules"])
+        conflicts = [r for r in rows if r["conflict"]]
+        result = {
             "preset": preset,
             "description": ps.FAB_PRESETS[preset]["description"],
-            "rules_applied": ps.FAB_PRESETS[preset]["rules"],
+            "comparison": rows,
+            "conflicts": len(conflicts),
+            "preset_looser_on": [r["rule"] for r in conflicts if r["preset_is"] == "looser"],
         }
+        if conflicts and not mode:
+            result.update({
+                "decision_required": True,
+                "written": False,
+                "message": (
+                    f"The project already sets {len(conflicts)} rule(s) differently from "
+                    f"'{preset}'. Ask the user which to follow, then call again with "
+                    "mode='project' (keep project rules), mode='preset' (use the fab "
+                    "preset) or mode='stricter' (stricter value wins per rule)."
+                ),
+            })
+            return result
+        resolved = ps.resolve_preset(rows, mode or "preset")
+        result["mode"] = mode or "preset"  # no conflicts: modes coincide
+        result["rules_applied"] = resolved
+        result["written"] = not dry_run
+        if not dry_run:
+            ps.update_design_rules(pro, **resolved)
+            ps.save_pro(proj.pro_path, pro)
+        return result
 
     @mcp.tool()
     def add_net_class(

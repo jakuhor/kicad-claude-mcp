@@ -1249,7 +1249,7 @@ class TestRenameLabel:
         self, blank_project, tmp_path, monkeypatch
     ):
         mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
-        _call(mcp, "add_label", net_name="+6V", x_mm=50.8, y_mm=50.8)
+        _call(mcp, "add_label", net="+6V", x_mm=50.8, y_mm=50.8)
         res = _call(mcp, "rename_label", old_name="+6V", new_name="+5V")
         assert res["renamed"]["label"] == 1
         tree = sch_io.parse_file(blank_project["sch"])
@@ -1264,7 +1264,7 @@ class TestRenameLabel:
 class TestMoveItem:
     def test_move_a_label(self, blank_project, tmp_path, monkeypatch):
         mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
-        _call(mcp, "add_label", net_name="NET1", x_mm=50.8, y_mm=50.8)
+        _call(mcp, "add_label", net="NET1", x_mm=50.8, y_mm=50.8)
         tree = sch_io.parse_file(blank_project["sch"])
         lbl = [n for n in tree[1:] if sch_io.head_of(n) == "label"][0]
         res = _call(mcp, "move_item", uuid=ed.get_uuid(lbl), x_mm=76.2, y_mm=63.5)
@@ -1332,7 +1332,7 @@ def test_text_label_and_move_edits_still_pass_erc(tmp_path, monkeypatch):
         _call(mcp, "add_text", x_mm=50.8, y_mm=25.4,
               text='Rev A notes:\n- check EMI\n- "quoted" and \\ backslash')
         _call(mcp, "add_wire", x1_mm=50.8, y1_mm=50.8, x2_mm=76.2, y2_mm=50.8)
-        _call(mcp, "add_label", net_name="+6V", x_mm=50.8, y_mm=50.8)
+        _call(mcp, "add_label", net="+6V", x_mm=50.8, y_mm=50.8)
         _call(mcp, "rename_label", old_name="+6V", new_name="+5V")
         tree = sch_io.parse_file(files["sch"])
         wire = [n for n in tree[1:] if sch_io.head_of(n) == "wire"][0]
@@ -1852,3 +1852,195 @@ class TestAddPowerSymbolPrefix:
             for i, net in enumerate(["GND", "+3V3", "PWR_FLAG", "PWR_FLAG", "GND"])
         ]
         assert got == ["#PWR0001", "#PWR0002", "#FLG0001", "#FLG0002", "#PWR0003"]
+
+
+def test_add_symbol_footprint_and_fields(blank_project, tmp_path, monkeypatch):
+    """open_points_3 Q5: footprint and extra fields in the same call."""
+    mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+    res = _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+                value="10k", x_mm=100, y_mm=100,
+                footprint="Resistor_SMD:R_0805_2012Metric",  # overrides lib default
+                fields={"MPN": "RC0603FR-0710KL", "Manufacturer": "Yageo"})
+    assert res["footprint"] == "Resistor_SMD:R_0805_2012Metric"
+    assert res["fields"] == ["MPN", "Manufacturer"]  # sorted()
+    tree = sch_io.parse_file(blank_project["sch"])
+    s = ed.find_symbol_by_reference(tree, "R1")
+    assert ed.get_symbol_property(s, "Footprint") == "Resistor_SMD:R_0805_2012Metric"
+    assert ed.get_symbol_property(s, "MPN") == "RC0603FR-0710KL"
+    assert ed.get_symbol_property(s, "Manufacturer") == "Yageo"
+
+    res = _call(mcp, "add_symbol", lib_id="MiniLib:ESP32_Demo", reference="U1",
+                value="ESP32", x_mm=150, y_mm=150)  # library has no footprint
+    assert any("no footprint" in w for w in res.get("warnings", []))
+
+    with pytest.raises(ValueError):
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R3",
+              value="1k", x_mm=140, y_mm=100, fields={"Value": "2k"})
+
+
+def test_move_symbol_carries_fields(blank_project, tmp_path, monkeypatch):
+    """open_points_3 Q6: fields follow a move and a rotation, landing where
+    add_symbol would have put them at the new pose."""
+    mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+
+    def fields(ref):
+        tree = sch_io.parse_file(blank_project["sch"])
+        s = ed.find_symbol_by_reference(tree, ref)
+        out = {}
+        for p in sch_io.find_children(s, "property"):
+            at = sch_io.find_child(p, "at")
+            out[p[1]] = (at[1], at[2], at[3])
+        return out
+
+    # Reference: placed fresh at the target pose.
+    _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R9",
+          value="10k", x_mm=49.53, y_mm=59.69, rotation=90)
+    want = fields("R9")
+
+    _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+          value="10k", x_mm=100.33, y_mm=100.33)
+    _call(mcp, "move_symbol", reference="R1", x_mm=49.53, y_mm=59.69, rotation=90)
+    got = fields("R1")
+    for name in ("Reference", "Value", "Footprint"):
+        assert got[name][0] == pytest.approx(want[name][0], abs=1e-3), name
+        assert got[name][1] == pytest.approx(want[name][1], abs=1e-3), name
+        assert got[name][2] == want[name][2], name
+
+    # Pure translation keeps every field's offset and angle.
+    before = fields("R1")
+    _call(mcp, "move_symbol", reference="R1", x_mm=49.53 + 12.7, y_mm=59.69)
+    after = fields("R1")
+    for name, (x, y, a) in before.items():
+        assert after[name] == (pytest.approx(x + 12.7, abs=1e-3), pytest.approx(y, abs=1e-3), a)
+
+
+def test_set_field_position(blank_project, tmp_path, monkeypatch):
+    mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+    _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+          value="10k", x_mm=100.33, y_mm=100.33)
+    res = _call(mcp, "set_field_position", reference="R1", field="Value",
+                x_mm=105.0, y_mm=98.0, angle=270, visible=False)
+    assert res["now"] == {"x_mm": 105.0, "y_mm": 98.0, "angle": 90, "visible": False}
+    res = _call(mcp, "set_field_position", reference="R1", field="Value", visible=True)
+    assert res["now"]["visible"] is True and res["now"]["x_mm"] == 105.0
+    res = _call(mcp, "set_field_position", reference="R1", field="Footprint", visible=True)
+    assert res["previous"]["visible"] is False and res["now"]["visible"] is True
+    with pytest.raises(KeyError):
+        _call(mcp, "set_field_position", reference="R1", field="Nope", angle=0)
+    with pytest.raises(ValueError):
+        _call(mcp, "set_field_position", reference="R1", field="Value", x_mm=1.0)
+    tree = sch_io.parse_file(blank_project["sch"])  # still parses
+    assert ed.find_symbol_by_reference(tree, "R1") is not None
+
+
+def test_power_symbol_reference_is_hidden():
+    """open_points_3 Q9: field visibility comes from the library part, and a
+    `#` reference is never shown."""
+    lib = sexpdata.loads('''(symbol "GND" (power)
+      (property "Reference" "#PWR" (at 0 -6.35 0) (effects (font (size 1.27 1.27)) (hide yes)))
+      (property "Value" "GND" (at 0 -3.81 0) (effects (font (size 1.27 1.27))))
+      (symbol "GND_0_1" (pin power_in line (at 0 0 270) (length 0) (name "~") (number "1"))))''')
+    offsets = ed.library_field_offsets(lib)
+    assert offsets["Reference"]["hidden"] is True
+    assert offsets["Value"]["hidden"] is False
+    inst = ed.build_symbol_instance(
+        qualified_lib_id="power:GND", reference="#PWR01", value="GND",
+        x_mcp=50.8, y_mcp=50.8, rotation_deg=0, pin_numbers=["1"],
+        project_name="p", instance_path="/x", field_offsets=offsets)
+    props = {p[1]: p for p in sch_io.find_children(inst, "property")}
+    assert ed._field_hidden(props["Reference"])
+    assert not ed._field_hidden(props["Value"])
+    # Even without library offsets, a `#` designator is hidden.
+    inst = ed.build_symbol_instance(
+        qualified_lib_id="power:GND", reference="#FLG01", value="PWR_FLAG",
+        x_mcp=50.8, y_mcp=50.8, rotation_deg=0, pin_numbers=["1"],
+        project_name="p", instance_path="/x")
+    props = {p[1]: p for p in sch_io.find_children(inst, "property")}
+    assert ed._field_hidden(props["Reference"])
+
+
+_MINI_POWER_LIB = """(kicad_symbol_lib (version 20251024) (generator "test")
+  (symbol "GND" (power) (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
+    (property "Reference" "#PWR" (at 0 -6.35 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Value" "GND" (at 0 -3.81 0) (effects (font (size 1.27 1.27))))
+    (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Description" "ground" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (symbol "GND_1_1" (pin power_in line (at 0 0 270) (length 0) (name "~") (number "1"))))
+  (symbol "VCC" (power) (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
+    (property "Reference" "#PWR" (at 0 -3.81 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Value" "VCC" (at 0 3.556 0) (effects (font (size 1.27 1.27))))
+    (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Description" "vcc" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+    (symbol "VCC_1_1" (pin power_in line (at 0 0 90) (length 0) (name "~") (number "1"))))
+)
+"""
+
+
+def test_add_power_symbol_custom_net(blank_project, tmp_path, monkeypatch):
+    """open_points_3 Q10: a net with no stock power symbol."""
+    from mcp.server.fastmcp import FastMCP
+
+    sym_dir = tmp_path / "psyms"
+    sym_dir.mkdir()
+    (sym_dir / "power.kicad_sym").write_text(_MINI_POWER_LIB, encoding="utf-8")
+    idx = kicad_libs.build_index(symbol_dirs=[sym_dir], footprint_dirs=[])
+    monkeypatch.setattr(lib_tools, "load_cache", lambda: idx)
+    monkeypatch.setattr(lib_tools, "_index", None)
+    mcp = FastMCP("t")
+    sch_tools.register(mcp)
+    lib_tools.register(mcp)
+
+    r = _call(mcp, "add_power_symbol", net="GND", x_mm=50.8, y_mm=50.8)
+    assert r["lib_id"] == "power:GND" and r["custom_net"] is False and "warnings" not in r
+    r = _call(mcp, "add_power_symbol", net="GND_USB", x_mm=63.5, y_mm=50.8)
+    assert r["lib_id"] == "power:GND" and r["custom_net"] is True
+    assert any("PWR_FLAG" in w for w in r["warnings"])
+    r = _call(mcp, "add_power_symbol", net="+18V", x_mm=76.2, y_mm=50.8)
+    assert r["lib_id"] == "power:VCC"
+    r = _call(mcp, "add_power_symbol", net="-18V", x_mm=88.9, y_mm=50.8, base_symbol="GND")
+    assert r["lib_id"] == "power:GND"
+    with pytest.raises(KeyError):
+        _call(mcp, "add_power_symbol", net="X", x_mm=0, y_mm=0, base_symbol="power:NOPE")
+
+    tree = sch_io.parse_file(blank_project["sch"])
+    values = sorted(ed.get_symbol_property(s, "Value")
+                    for s in sch_io.find_children(tree, "symbol"))
+    assert values == ["+18V", "-18V", "GND", "GND_USB"]
+
+
+def test_strict_args_aliases(blank_project, tmp_path, monkeypatch):
+    """open_points_3 Q12: old spellings work, say so, and unknown ones still fail."""
+    import asyncio
+    from mcp.server.fastmcp.exceptions import ToolError
+    from kicad_claude import strict_args
+
+    mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+    strict_args.install(mcp)
+    mgr = mcp._tool_manager
+
+    def call(name, **kw):
+        return asyncio.run(mgr.call_tool(name, kw))
+
+    r = call("add_label", net_name="VBUS", x_mm=50.8, y_mm=50.8)
+    assert r["net"] == "VBUS"
+    assert r["deprecated_arguments"] == [{"given": "net_name", "use": "net"}]
+    r = call("add_label", net="VIN", x_mm=63.5, y_mm=50.8)
+    assert "deprecated_arguments" not in r
+    r = call("add_wire", start_x_mm=50.8, start_y_mm=50.8, end_x_mm=63.5, end_y_mm=50.8)
+    assert r["to_mm"] == [63.5, 50.8] and len(r["deprecated_arguments"]) == 4
+    with pytest.raises(ToolError, match="both"):
+        call("add_label", net="A", net_name="B", x_mm=0, y_mm=0)
+    with pytest.raises(ToolError, match="unknown argument"):
+        call("add_label", nett="A", x_mm=0, y_mm=0)
+    # Converted (MCP wire) results also carry the notice.
+    out = asyncio.run(mgr.call_tool(
+        "add_label", {"net_name": "X", "x_mm": 76.2, "y_mm": 50.8}, None, True))
+    assert "deprecated_arguments" in str(out)
+
+    # add_no_connect by coordinates
+    r = call("add_no_connect", x_mm=101.6, y_mm=101.6)
+    assert r["position_mm"] == [101.6, 101.6]
+    with pytest.raises(ToolError):
+        call("add_no_connect", reference="R1")

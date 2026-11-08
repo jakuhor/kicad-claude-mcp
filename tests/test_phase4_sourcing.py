@@ -569,3 +569,139 @@ def test_farnell_live_lookup_lm358n():
         pytest.skip(f"Farnell API rejected the request: {e}")
     assert results, "expected at least one result for LM358N"
     assert all(r.get("mpn") for r in results)
+
+
+# ===== open_points_4 R5 — jlcpcb source ==================================== #
+
+_JLC_PAYLOAD = {
+    "code": 200,
+    "data": {"componentPageInfo": {"list": [
+        {"componentCode": "C99999", "componentModelEn": "OTHER-PART",
+         "componentBrandEn": "X", "stockCount": 5, "componentLibraryType": "expand",
+         "preferredComponentFlag": True, "componentPrices": [],
+         "urlSuffix": "X-OTHER/C99999"},
+        {"componentCode": "C51118", "componentModelEn": "AP2112K-3.3TRG1",
+         "componentBrandEn": "Diodes Incorporated", "stockCount": 13262,
+         "componentLibraryType": "base", "preferredComponentFlag": False,
+         "componentSpecificationEn": "SOT-25-5", "describe": "LDO 3.3V",
+         "componentPrices": [{"startNumber": 10, "endNumber": 29, "productPrice": 0.15},
+                             {"startNumber": 1, "endNumber": 9, "productPrice": 0.18}],
+         "dataManualUrl": "https://www.lcsc.com/datasheet/x.pdf",
+         "urlSuffix": "DiodesIncorporated-AP2112K_33TRG1/C51118"},
+    ]}},
+}
+
+
+class _Resp:
+    def __init__(self, payload, status=200):
+        self._p, self.status_code, self.text = payload, status, str(payload)
+
+    def json(self):  # noqa: F811 — httpx.Response API, not the json module
+        return self._p
+
+
+def test_jlcpcb_adapter_summarizes_and_ranks(monkeypatch):
+    from kicad_claude.adapters import jlcpcb
+    seen = {}
+
+    def fake_post(url, **kw):
+        seen["url"], seen["body"] = url, kw["json"]
+        return _Resp(_JLC_PAYLOAD)
+
+    monkeypatch.setattr(jlcpcb.httpx, "post", fake_post)
+    rows = jlcpcb.search_part("AP2112K-3.3TRG1")
+    assert seen["body"]["keyword"] == "AP2112K-3.3TRG1"
+    top = rows[0]
+    assert top["mpn"] == "AP2112K-3.3TRG1" and top["lcsc"] == "C51118"
+    assert top["library_type"] == "basic" and top["unit_price"] == 0.18
+    assert [b["qty"] for b in top["price_breaks"]] == [1, 10]
+    assert top["product_url"].endswith("/C51118") and top["currency"] == "USD"
+    assert rows[1]["library_type"] == "preferred"
+    assert jlcpcb.search_part("C51118")[0]["lcsc"] == "C51118"  # by LCSC number
+
+
+def test_jlcpcb_errors_are_per_source(monkeypatch):
+    from kicad_claude.adapters import jlcpcb
+    monkeypatch.setattr(jlcpcb.httpx, "post", lambda *a, **k: _Resp({}, 503))
+    with pytest.raises(jlcpcb.JLCPCBError):
+        jlcpcb.search_part("X")
+    monkeypatch.setattr(jlcpcb.httpx, "post",
+                        lambda *a, **k: _Resp({"code": 500, "message": "boom"}))
+    with pytest.raises(jlcpcb.JLCPCBError, match="boom"):
+        jlcpcb.search_part("X")
+    assert "jlcpcb" in sourcing_tools.SOURCE_NAMES
+    assert sourcing_tools._parse_sources("jlcpcb,mouser") == ["mouser", "jlcpcb"]
+    assert "jlcpcb" not in sourcing_tools.DEFAULT_SOURCES
+
+
+@pytest.mark.network
+def test_jlcpcb_live_finds_an_rf_module():
+    from kicad_claude.adapters import jlcpcb
+    hit = jlcpcb.search_part("ESP32-C6-MINI-1-N4")[0]
+    assert hit["mpn"] == "ESP32-C6-MINI-1-N4" and hit["lcsc"].startswith("C")
+
+
+# ===== open_points_4 R6 — fetch_datasheet =================================== #
+
+
+def _mock_stream(monkeypatch, routes):
+    import httpx
+    from kicad_claude.adapters import datasheet_fetch
+
+    def handler(request):
+        kind = routes[str(request.url)]
+        if kind == "pdf":
+            return httpx.Response(200, content=b"%PDF-1.7\n" + b"x" * 4000)
+        if kind == "html":
+            return httpx.Response(200, content=b"<html><body>Are you a robot?</body></html>" * 50)
+        if kind == "cert":
+            raise httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate has expired")
+        return httpx.Response(int(kind))
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(datasheet_fetch.httpx, "stream",
+                        lambda method, url, **kw: client.stream(method, url))
+
+
+def test_fetch_first_pdf_falls_back(monkeypatch, tmp_path):
+    from kicad_claude.adapters import datasheet_fetch
+    _mock_stream(monkeypatch, {
+        "https://onsemi.example/a.pdf": "cert",
+        "https://littelfuse.example/b.pdf": "html",
+        "https://mouser.example/c.pdf": "403",
+        "https://farnell.example/ds/SMF24A.pdf": "pdf",
+    })
+    cands = [{"source": "url", "url": "https://onsemi.example/a.pdf"},
+             {"source": "digikey", "url": "https://littelfuse.example/b.pdf"},
+             {"source": "mouser", "url": "https://mouser.example/c.pdf"},
+             {"source": "farnell", "url": "https://farnell.example/ds/SMF24A.pdf"}]
+    r = datasheet_fetch.fetch_first_pdf(cands, "SMF24A", tmp_path)
+    assert r["saved"] and r["source"] == "farnell"
+    assert (tmp_path / "SMF24A.pdf").read_bytes().startswith(b"%PDF")
+    reasons = [a["reason"] for a in r["attempts"]]
+    assert "TLS certificate error" in reasons[0] and "HTML" in reasons[1]
+    assert reasons[2] == "HTTP 403"
+    # Second call keeps the file.
+    r2 = datasheet_fetch.fetch_first_pdf(cands[3:], "SMF24A", tmp_path)
+    assert r2["saved"] is False and r2["existing"] is True
+
+
+def test_fetch_datasheet_tool_orders_sources(monkeypatch, tmp_path):
+    from mcp.server.fastmcp import FastMCP
+    from kicad_claude.adapters import datasheet_fetch
+
+    mcp = FastMCP("t")
+    sourcing_tools.register(mcp)
+    _stub_source(monkeypatch, "mouser", [{"mpn": "P1", "datasheet_url": "https://m.example/p1.pdf"}])
+    _stub_source(monkeypatch, "farnell", [{"mpn": "P1", "datasheet_url": "https://f.example/p1.pdf"}])
+    got = {}
+
+    def fake(cands, mpn, dest, overwrite=False):
+        got["cands"] = cands
+        return {"saved": False, "path": None, "source": None, "url": None, "attempts": []}
+
+    monkeypatch.setattr(datasheet_fetch, "fetch_first_pdf", fake)
+    r = mcp._tool_manager.get_tool("fetch_datasheet").fn(
+        mpn="P1", sources="farnell,mouser", url="https://x.example/p1.pdf", dest_dir=str(tmp_path))
+    assert [c["source"] for c in got["cands"]] == ["url", "farnell", "mouser"]
+    assert "hint" in r

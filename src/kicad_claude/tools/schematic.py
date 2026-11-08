@@ -77,6 +77,20 @@ def _save_with_backup(tree: list, sch_path: Path) -> Path | None:
     return safe_write.save_tree(tree=tree, path=sch_path)
 
 
+def _junction_mid_wire_pins(tree: list, s_node: list) -> list[dict]:
+    """Add a junction under every pin of `s_node` that sits mid-wire.
+
+    KiCAD leaves such a pin unconnected; a pin placed on a wire is meant to
+    join it (open_points_4 R2). Returns `[{pin, position_mm}]` for the report.
+    """
+    added = []
+    for hit in netlist.pins_on_wire_interior(tree, s_node):
+        x, y = hit["point"]
+        ed.add_junction(tree, x, y)
+        added.append({"pin": hit["number"], "position_mm": [x, y]})
+    return added
+
+
 def _root_uuid(proj_sch_path: Path) -> str:
     root = sch_io.parse_file(proj_sch_path)
     u = sch_io.find_child(root, "uuid")
@@ -94,7 +108,7 @@ def _instance_path() -> str:
     proj = state.get_active()
     root_uuid = _root_uuid(proj.sch_path)
     active_filename = state.get_active_sheet_filename()
-    if active_filename is None:
+    if active_filename is None or active_filename == Path(proj.sch_path).name:
         return f"/{root_uuid}"
 
     root_tree = sch_io.parse_file(proj.sch_path)
@@ -188,6 +202,8 @@ def register(mcp) -> None:
         y_mm: float,
         rotation: float = 0,
         snap_to_grid: bool = True,
+        footprint: str = "",
+        fields: dict[str, str] | None = None,
     ) -> dict:
         """Add a symbol from the indexed KiCAD libraries to the active schematic.
 
@@ -198,17 +214,37 @@ def register(mcp) -> None:
             x_mm, y_mm: position in KiCAD coords (Y down, origin top-left)
             rotation: 0/90/180/270 degrees CCW
             snap_to_grid: snap the position to the 1.27 mm grid (default True)
+            footprint: "Lib:Footprint" for the Footprint field. Empty uses the
+                library symbol's default footprint (generic passives have none).
+            fields: extra fields to write in the same pass, e.g.
+                {"MPN": "RC0603FR-0710KL", "Manufacturer": "Yageo",
+                 "Tolerance": "1%"}. Existing fields (Datasheet, Description)
+                are overwritten; new ones are added hidden. Reference, Value
+                and Footprint go through their own arguments.
 
         Returns the placed symbol's identity, with the snapped position.
         Refuses if `reference` already exists.
         """
+        fields = dict(fields or {})
+        reserved = {"Reference", "Value", "Footprint"} & set(fields)
+        if reserved:
+            raise ValueError(
+                f"set {sorted(reserved)} with the reference/value/footprint arguments, "
+                "not in fields"
+            )
         x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
         tree, path = _load_active_schematic()
         lib_path, sym_name, meta = _resolve_lib_symbol(lib_id)
         sym_def = ed.fetch_symbol_def(lib_path, sym_name)
 
+        warnings = []
+        if footprint:
+            known = lib_tools._ensure_index().get("footprints") or {}
+            if known and footprint not in known:
+                warnings.append(f"footprint {footprint!r} is not in the library index")
+
         proj = state.get_active()
-        ed.add_symbol(
+        node = ed.add_symbol(
             tree,
             qualified_lib_id=lib_id,
             reference=reference,
@@ -219,25 +255,40 @@ def register(mcp) -> None:
             sym_def_node=sym_def,
             project_name=proj.name,
             instance_path=_instance_path(),
-            footprint=meta.get("default_footprint", ""),
+            footprint=footprint or meta.get("default_footprint", ""),
             datasheet=meta.get("datasheet", "~"),
             description=meta.get("description", ""),
         )
+        for name, val in fields.items():
+            if ed.get_symbol_property(node, name) is None:
+                ed.add_symbol_property(node, name, str(val))
+            else:
+                ed.set_symbol_property(node, name, str(val))
+        junctions = _junction_mid_wire_pins(tree, node)
         backup = _save_with_backup(tree, path)
         logger.info(
             "added %s (%s) on sheet=%s at (%s, %s)",
             reference, lib_id, state.get_active_sheet_filename() or "root", x_mm, y_mm
         )
-        return {
+        result = {
             "reference": reference,
             "lib_id": lib_id,
             "value": value,
+            "footprint": ed.get_symbol_property(node, "Footprint") or "",
+            "fields": sorted(fields),
             "position_mm": [x_mm, y_mm],
             "rotation": rotation,
             "pin_count": meta.get("pin_count", 0),
             "sheet": state.get_active_sheet_filename() or "root",
             "backup": str(backup) if backup else None,
         }
+        if junctions:
+            result["junctions_added"] = junctions
+        if not result["footprint"] and not reference.startswith("#"):  # #PWR, #FLG: none
+            warnings.append("no footprint set; pass footprint= or set it before PCB sync")
+        if warnings:
+            result["warnings"] = warnings
+        return result
 
     @mcp.tool()
     def remove_symbol(reference: str, remove_connected_wires: bool = False) -> dict:
@@ -442,19 +493,22 @@ def register(mcp) -> None:
 
     @mcp.tool()
     def add_label(
-        net_name: str,
+        net: str,
         x_mm: float,
         y_mm: float,
         orientation: str = "right",
         snap_to_grid: bool = True,
     ) -> dict:
-        """Add a net label at a point. orientation ∈ {right, up, left, down}."""
+        """Add a net label at a point. orientation ∈ {right, up, left, down}.
+
+        `net` is the label text (the old name `net_name` is still accepted).
+        """
         x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
         tree, path = _load_active_schematic()
-        ed.add_label(tree, net_name, x_mm, y_mm, orientation)
+        ed.add_label(tree, net, x_mm, y_mm, orientation)
         backup = _save_with_backup(tree, path)
         return {
-            "net": net_name,
+            "net": net,
             "position_mm": [x_mm, y_mm],
             "orientation": orientation,
             "backup": str(backup) if backup else None,
@@ -462,7 +516,11 @@ def register(mcp) -> None:
 
     @mcp.tool()
     def add_power_symbol(
-        net: str, x_mm: float, y_mm: float, snap_to_grid: bool = True
+        net: str,
+        x_mm: float,
+        y_mm: float,
+        snap_to_grid: bool = True,
+        base_symbol: str = "",
     ) -> dict:
         """Place a power symbol (e.g. +5V, +3V3, GND) from the `power` library.
 
@@ -470,19 +528,40 @@ def register(mcp) -> None:
         rail or ground, `#FLG####` for `PWR_FLAG`. The two are numbered
         independently, as KiCAD numbers them.
 
-        The library symbol id is `power:{net}`; if that doesn't exist in the
-        index, the call fails with a hint listing valid power nets.
+        The library symbol is `power:{net}` when it exists. For a net with no
+        stock symbol (`GND_USB`, `+18V`, `VBUS_+20V`, …) the port is built on
+        `base_symbol` — `power:GND` by default for a ground-like name (GND,
+        AGND, PGND, VSS, 0V, …), `power:VCC` otherwise — with its Value set to
+        `net`. A power port's net is its Value, so this creates the net without
+        a custom library symbol. Pass `base_symbol` (e.g. "power:GNDPWR",
+        "+5V") to choose the graphic; it also overrides an existing
+        `power:{net}`. A new power net needs its own `PWR_FLAG` (or a driving
+        power-output pin) or ERC reports `power_pin_not_driven`.
         """
+        from kicad_claude.adapters.pcb_geometry import is_ground_net
+
         x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
-        candidate = f"power:{net}"
         idx = lib_tools._ensure_index()
+        power_names = sorted(
+            k.split(":", 1)[1] for k in idx["symbols"] if k.startswith("power:")
+        )
+        warnings: list[str] = []
+        if base_symbol:
+            candidate = base_symbol if ":" in base_symbol else f"power:{base_symbol}"
+        elif f"power:{net}" in idx["symbols"]:
+            candidate = f"power:{net}"
+        else:
+            candidate = "power:GND" if is_ground_net(net) else "power:VCC"
         if candidate not in idx["symbols"]:
-            available = sorted(
-                k.split(":", 1)[1] for k in idx["symbols"] if k.startswith("power:")
-            )
             raise KeyError(
-                f"unknown power net {net!r} (looked up {candidate!r}); "
-                f"available: {available[:20]}{'...' if len(available) > 20 else ''}"
+                f"power symbol {candidate!r} not in the library index; "
+                f"available: {power_names[:20]}{'...' if len(power_names) > 20 else ''}"
+            )
+        custom = candidate != f"power:{net}"
+        if custom and net != "PWR_FLAG":
+            warnings.append(
+                f"net {net!r} is drawn with {candidate!r} (Value overridden). "
+                "Add a PWR_FLAG on it unless a power-output pin drives it."
             )
 
         tree, path = _load_active_schematic()
@@ -492,7 +571,7 @@ def register(mcp) -> None:
         # rails want #PWR, and the two are numbered separately.
         ref = _next_virtual_reference(tree, _library_reference_prefix(sym_def))
         proj = state.get_active()
-        ed.add_symbol(
+        node = ed.add_symbol(
             tree,
             qualified_lib_id=candidate,
             reference=ref,
@@ -507,19 +586,44 @@ def register(mcp) -> None:
             datasheet=meta.get("datasheet", "~"),
             description=meta.get("description", ""),
         )
+        junctions = _junction_mid_wire_pins(tree, node)
         backup = _save_with_backup(tree, path)
-        return {
+        result = {
             "net": net,
             "reference": ref,
+            "lib_id": candidate,
+            "custom_net": custom,
             "position_mm": [x_mm, y_mm],
             "backup": str(backup) if backup else None,
         }
+        if junctions:
+            result["junctions_added"] = junctions
+        if warnings:
+            result["warnings"] = warnings
+        return result
 
     @mcp.tool()
-    def add_no_connect(reference: str, pin: str) -> dict:
-        """Mark a pin as no-connect by placing a NC marker at its position."""
+    def add_no_connect(
+        reference: str = "",
+        pin: str = "",
+        x_mm: float | None = None,
+        y_mm: float | None = None,
+    ) -> dict:
+        """Mark a pin as no-connect by placing a NC marker at its position.
+
+        Give `reference` + `pin` (preferred: the marker lands exactly on the
+        pin), or `x_mm` + `y_mm` for a raw sheet point, like the other markers.
+        A point mode marker is snapped to the 1.27 mm grid.
+        """
+        by_pin = bool(reference and pin)
+        by_xy = x_mm is not None and y_mm is not None
+        if by_pin == by_xy:
+            raise ValueError("give either reference + pin, or x_mm + y_mm")
         tree, path = _load_active_schematic()
-        x, y = ed.get_pin_position(tree, reference, pin)
+        if by_pin:
+            x, y = ed.get_pin_position(tree, reference, pin)
+        else:
+            x, y = _snap(x_mm, y_mm, True)
         ed.add_no_connect(tree, x, y)
         backup = _save_with_backup(tree, path)
         return {
@@ -1044,6 +1148,42 @@ def register(mcp) -> None:
         }
 
     @mcp.tool()
+    def set_field_position(
+        reference: str,
+        field: str,
+        x_mm: float | None = None,
+        y_mm: float | None = None,
+        angle: float | None = None,
+        visible: bool | None = None,
+    ) -> dict:
+        """Move, turn, show or hide one field (Reference, Value, MPN, …) of a symbol.
+
+        x_mm / y_mm are absolute sheet coordinates (KiCAD native, Y down) — the
+        same frame as `move_symbol`; give both or neither. `angle` is the
+        field's text angle as KiCAD stores it (0 or 90; KiCAD reads text at
+        those two only, so 180 → 0 and 270 → 90). `visible` shows or hides it.
+        Arguments left as None are unchanged.
+        """
+        if (x_mm is None) != (y_mm is None):
+            raise ValueError("give both x_mm and y_mm, or neither")
+        tree, path = _load_active_schematic()
+        s_node = ed.find_symbol_by_reference(tree, reference)
+        if s_node is None:
+            raise KeyError(f"no symbol with reference {reference!r}")
+        before = ed.get_field_placement(s_node, field)
+        after = ed.set_field_placement(
+            s_node, field, x_mm=x_mm, y_mm=y_mm, angle=angle, visible=visible)
+        backup = _save_with_backup(tree, path)
+        return {
+            "reference": reference,
+            "field": field,
+            "previous": before,
+            "now": after,
+            "sheet": state.get_active_sheet_filename() or "root",
+            "backup": str(backup) if backup else None,
+        }
+
+    @mcp.tool()
     def remove_symbol_property(reference: str, name: str) -> dict:
         """Remove a text property from a placed symbol.
 
@@ -1265,9 +1405,9 @@ def register(mcp) -> None:
             if not sheet:
                 raise RuntimeError(f"sheet {sheet!r} has no Sheetfile")
 
-        state.set_active_sheet(sheet)
+        state.set_active_sheet(sheet)  # the root's own filename maps to root
         return {
-            "active_sheet": sheet,
+            "active_sheet": state.get_active_sheet_filename() or "root",
             "path": str(state.get_active_sheet_path()),
         }
 
@@ -1294,7 +1434,7 @@ def register(mcp) -> None:
 
     @mcp.tool()
     def add_hierarchical_label(
-        net_name: str,
+        net: str,
         x_mm: float,
         y_mm: float,
         shape: str = "input",
@@ -1318,12 +1458,12 @@ def register(mcp) -> None:
         x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
         tree, path = _load_active_schematic()
         ed.add_hierarchical_label(
-            tree, net_name=net_name, x_mm=x_mm, y_mm=y_mm,
+            tree, net_name=net, x_mm=x_mm, y_mm=y_mm,
             shape=shape, orientation=orientation,
         )
         backup = _save_with_backup(tree, path)
         return {
-            "net": net_name,
+            "net": net,
             "shape": shape,
             "orientation": orientation,
             "position_mm": [x_mm, y_mm],

@@ -546,3 +546,66 @@ def test_aisler_presets_match_the_published_process():
 
     for name in ("aisler_2l", "aisler_4l"):
         assert ps.FAB_PRESETS[name]["rules"]["allow_microvias"] is False
+
+
+# ----- open_points_3 Q3: preset vs existing project rules ------------------- #
+
+
+def _project_with_rules(tmp_path, **rules):
+    state.clear_active()
+    files = write_blank_project(tmp_path / "p", "p")
+    pro = json.loads(files["pro"].read_text())
+    pro["board"]["design_settings"]["rules"].update(rules)
+    files["pro"].write_text(json.dumps(pro, indent=2))
+    state.set_active(tmp_path / "p", "p")
+    return files
+
+
+def _rules(files):
+    return json.loads(files["pro"].read_text())["board"]["design_settings"]["rules"]
+
+
+def test_apply_fab_preset_conflict_requires_mode(tmp_path: Path, monkeypatch):
+    files = _project_with_rules(tmp_path, min_clearance=0.15, min_track_width=0.15,
+                                min_hole_to_hole=0.25)
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    before = files["pro"].read_text()
+    res = _call(mcp, "apply_fab_preset", preset="jlcpcb_4l")
+    assert res["decision_required"] is True and res["written"] is False
+    assert sorted(res["preset_looser_on"]) == ["min_clearance", "min_track_width"]
+    row = {r["rule"]: r for r in res["comparison"]}
+    assert row["min_hole_to_hole"]["preset_is"] == "stricter"
+    assert row["min_text_height"]["preset_is"] == "unset_in_project"
+    assert files["pro"].read_text() == before  # nothing written
+    state.clear_active()
+
+
+def test_apply_fab_preset_modes(tmp_path: Path, monkeypatch):
+    files = _project_with_rules(tmp_path, min_clearance=0.15, min_hole_to_hole=0.25,
+                                allow_microvias=True)
+    mcp = _make_mcp(monkeypatch, tmp_path)
+
+    res = _call(mcp, "apply_fab_preset", preset="jlcpcb_4l", mode="stricter", dry_run=True)
+    assert res["written"] is False and res["rules_applied"]["min_clearance"] == 0.15
+    assert _rules(files)["min_clearance"] == 0.15 and "min_text_height" not in _rules(files)
+
+    _call(mcp, "apply_fab_preset", preset="jlcpcb_4l", mode="stricter")
+    r = _rules(files)
+    assert r["min_clearance"] == 0.15          # project stricter, kept
+    assert r["min_hole_to_hole"] == 0.5        # preset stricter, taken
+    assert r["allow_microvias"] is False       # disallow wins
+    assert r["min_text_height"] == 1.0         # unset, filled
+
+    files = _project_with_rules(tmp_path / "b", min_clearance=0.15, min_hole_to_hole=0.25)
+    _call(mcp, "apply_fab_preset", preset="jlcpcb_4l", mode="project")
+    r = _rules(files)
+    assert r["min_clearance"] == 0.15 and r["min_hole_to_hole"] == 0.25
+    assert r["min_text_height"] == 1.0
+
+    files = _project_with_rules(tmp_path / "c", min_clearance=0.15)
+    _call(mcp, "apply_fab_preset", preset="jlcpcb_4l", mode="preset")
+    assert _rules(files)["min_clearance"] == 0.127
+
+    with pytest.raises(ValueError):
+        _call(mcp, "apply_fab_preset", preset="jlcpcb_4l", mode="bogus")
+    state.clear_active()

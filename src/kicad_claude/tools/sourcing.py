@@ -7,7 +7,8 @@ Tools:
     list_vendor_parts         — list ZIPs available under ./vendor_parts/
     enrich_bom_with_sourcing  — augment a KiCAD BOM CSV with distributor data
 
-Supported sources: mouser (default), digikey, tme, farnell. Every tool that
+Supported sources: mouser (default), digikey, tme, farnell, jlcpcb (keyless,
+JLCPCB assembly library: LCSC number, Basic/Preferred/Extended, USD prices). Every tool that
 talks to a distributor takes a `sources` string, e.g. "mouser,tme".
 """
 
@@ -23,6 +24,7 @@ from kicad_claude import state
 from kicad_claude.adapters import (
     digikey,
     farnell,  # noqa: F401
+    jlcpcb,  # noqa: F401
     kicad_cli,
     mouser,  # noqa: F401
     snapeda,
@@ -36,20 +38,25 @@ logger = logging.getLogger("kicad-claude.tools.sourcing")
 VENDOR_PARTS_DIR_NAME = "vendor_parts"
 
 #: Every distributor the sourcing tools can query, in report order.
-SOURCE_NAMES = ("digikey", "mouser", "tme", "farnell")
+SOURCE_NAMES = ("digikey", "mouser", "tme", "farnell", "jlcpcb")
 
 #: Default when the caller does not name any source. Mouser needs only a
 #: single API key, so it is the one source that works out of the box.
 DEFAULT_SOURCES = "mouser"
 
 #: Column prefix used by `enrich_bom_with_sourcing`.
-SOURCE_PREFIX = {"digikey": "dk", "mouser": "mo", "tme": "tme", "farnell": "fn"}
+SOURCE_PREFIX = {"digikey": "dk", "mouser": "mo", "tme": "tme", "farnell": "fn",
+                 "jlcpcb": "jlc"}
+
+#: Extra per-source BOM columns beyond the common six: (column suffix, hit key).
+EXTRA_COLUMNS = {"jlcpcb": (("lcsc", "lcsc"), ("type", "library_type"))}
 
 _ERROR_ATTR = {
     "digikey": "DigiKeyError",
     "mouser": "MouserError",
     "tme": "TMEError",
     "farnell": "FarnellError",
+    "jlcpcb": "JLCPCBError",
 }
 
 
@@ -73,6 +80,30 @@ def _search_source(name: str, query: str, limit: int = 3) -> list[dict]:
         return mod.search_keyword(query, limit=limit)
     return mod.search_part(query)[:limit]
 
+
+
+def datasheet_candidates(mpn: str, sources: str, url: str = "") -> tuple[list[dict], dict]:
+    """Datasheet URLs for `mpn`: `url` first, then each source's
+    `datasheet_url` in the caller's order. Returns (candidates, lookup_errors)."""
+    names = [s.strip().lower() for s in sources.split(",") if s.strip()]
+    unknown = [n for n in names if n not in SOURCE_NAMES]
+    if unknown:
+        raise ValueError(f"Unknown source(s) {unknown}. Pick from {', '.join(SOURCE_NAMES)}.")
+    candidates: list[dict] = []
+    if url:
+        candidates.append({"source": "url", "url": url})
+    lookup_errors: dict[str, str] = {}
+    for name in names:  # caller's order, not SOURCE_NAMES order
+        try:
+            hits = _search_source(name, mpn, limit=3)
+        except _source_error(name) as e:
+            lookup_errors[name] = str(e)
+            continue
+        exact = [h for h in hits if (h.get("mpn") or "").upper() == mpn.upper()]
+        for h in exact or hits[:1]:
+            if h.get("datasheet_url"):
+                candidates.append({"source": name, "url": h["datasheet_url"]})
+    return candidates, lookup_errors
 
 def _parse_sources(sources: str) -> list[str]:
     """Split and validate a comma-separated source list."""
@@ -112,9 +143,12 @@ def register(mcp) -> None:
     def check_availability(mpn: str, sources: str = DEFAULT_SOURCES) -> dict:
         """Look up `mpn` at each distributor in `sources`. Stock/price/links.
 
-        `sources` is a comma-separated list of: digikey, mouser, tme, farnell.
-        The default is "mouser"; the others are opt-in because each needs its
-        own credentials.
+        `sources` is a comma-separated list of: digikey, mouser, tme, farnell,
+        jlcpcb. The default is "mouser"; the others are opt-in. `jlcpcb` needs
+        no key and adds `lcsc` (C-number), `library_type`
+        (basic / preferred / extended — Basic parts carry no JLCPCB feeder
+        fee), `package` and `price_breaks` (USD); it also accepts an LCSC
+        number as `mpn`.
 
         Any source may fail (auth, network, no match) — failures are captured
         per-source so the caller still sees what worked. A source that was not
@@ -206,6 +240,47 @@ def register(mcp) -> None:
         }
 
     @mcp.tool()
+    def fetch_datasheet(
+        mpn: str,
+        sources: str = "digikey,farnell,jlcpcb,mouser",
+        url: str = "",
+        dest_dir: str = "",
+        overwrite: bool = False,
+    ) -> dict:
+        """Download the datasheet PDF for `mpn`, falling back across sources.
+
+        Candidates, in order: `url` (if given), then each source's
+        `datasheet_url` in `sources` order. Mouser is last by default because
+        it blocks automated downloads. A candidate counts only when the body
+        starts with `%PDF` — bot-protection HTML (Littelfuse) is rejected —
+        and TLS verification is never turned off: an expired certificate
+        (onsemi) is reported and the next candidate is tried.
+
+        Saved to `dest_dir`, default `<project>/datasheets/`, under the
+        vendor's file name when the URL ends in `.pdf`, else `<MPN>.pdf`. An
+        existing file is kept unless `overwrite=True`. `attempts` lists every
+        candidate with the reason it failed.
+        """
+        from kicad_claude.adapters import datasheet_fetch
+
+        candidates, lookup_errors = datasheet_candidates(mpn, sources, url)
+
+        if dest_dir:
+            dest = Path(dest_dir).expanduser().resolve()
+        else:
+            proj = state.get_active_or_none()
+            if proj is None:
+                raise RuntimeError("no active project; pass dest_dir")
+            dest = proj.path / "datasheets"
+        result = datasheet_fetch.fetch_first_pdf(candidates, mpn, dest, overwrite=overwrite)
+        result["mpn"] = mpn
+        result["lookup_errors"] = lookup_errors
+        if not result["path"]:
+            result["hint"] = ("No candidate served a PDF. Download it by hand into "
+                              f"{dest} or pass url= with a direct PDF link.")
+        return result
+
+    @mcp.tool()
     def import_vendor_zip(zip_path: str, target_lib: str = "vendor") -> dict:
         """Extract a vendor ZIP into `<active-project>/lib/{target_lib}.*`.
 
@@ -231,13 +306,14 @@ def register(mcp) -> None:
     ) -> dict:
         """Augment a KiCAD BOM CSV with live distributor stock and price.
 
-        `sources` is a comma-separated list of: digikey, mouser, tme, farnell.
-        The default is "mouser"; the others are opt-in.
+        `sources` is a comma-separated list of: digikey, mouser, tme, farnell,
+        jlcpcb. The default is "mouser"; the others are opt-in. `jlcpcb` adds
+        two columns, `jlc_lcsc` and `jlc_type` (basic / preferred / extended).
 
         For each unique value in `sourcing_field` (default "Value", but pass
         "MPN" if your schematic carries that custom field), this queries every
         requested source and appends six columns per source, prefixed
-        dk_ (digikey), mo_ (mouser), tme_ (tme) or fn_ (farnell):
+        dk_ (digikey), mo_ (mouser), tme_ (tme), fn_ (farnell) or jlc_ (jlcpcb):
 
             <prefix>_mpn, <prefix>_manufacturer, <prefix>_stock,
             <prefix>_price, <prefix>_currency, <prefix>_url
@@ -290,7 +366,9 @@ def register(mcp) -> None:
 
         for name in names:
             prefix = SOURCE_PREFIX[name]
-            for suffix in ("mpn", "manufacturer", "stock", "price", "currency", "url"):
+            suffixes = ["mpn", "manufacturer", "stock", "price", "currency", "url"]
+            suffixes += [c for c, _k in EXTRA_COLUMNS.get(name, ())]
+            for suffix in suffixes:
                 col = f"{prefix}_{suffix}"
                 if col not in fieldnames:
                     fieldnames.append(col)
@@ -320,6 +398,8 @@ def register(mcp) -> None:
                 row[f"{prefix}_price"] = hit.get("unit_price", "")
                 row[f"{prefix}_currency"] = hit.get("currency", "")
                 row[f"{prefix}_url"] = hit.get("product_url", "")
+                for col, key in EXTRA_COLUMNS.get(name, ()):
+                    row[f"{prefix}_{col}"] = hit.get(key, "")
 
         # Write the enriched CSV
         with out.open("w", encoding="utf-8", newline="") as f:

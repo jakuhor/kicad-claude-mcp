@@ -97,6 +97,12 @@ def set_active_sheet(filename: str | None) -> None:
     proj = get_active()
     if not (proj.path / filename).is_file():
         raise FileNotFoundError(f"{proj.path / filename} does not exist")
+    # The root schematic by filename is still the root: store None so every
+    # tool takes its root path (instance path `/{root_uuid}`, etc.) instead of
+    # searching the root for a child sheet with its own name.
+    if (proj.path / filename).resolve() == Path(proj.sch_path).resolve():
+        _active_sheet = None
+        return
     _active_sheet = filename
 
 

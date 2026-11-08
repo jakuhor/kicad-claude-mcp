@@ -226,3 +226,60 @@ class TestBackupRetention:
         sch = Path(blank_project["sch"])
         kept = list((sch.parent / ".backups").glob(f"*_{sch.name}"))
         assert len(kept) == safe_write.DEFAULT_KEEP_BACKUPS
+
+
+# ===== open_points_3 Q11 — stale lock diagnosis and opt-in removal ========= #
+
+
+def _write_lock(path: Path, user, host) -> None:
+    import json
+    path.write_text(json.dumps({"username": user, "hostname": host}), encoding="utf-8")
+
+
+class TestStaleLock:
+    def _me(self):
+        import getpass
+        import socket
+        return getpass.getuser(), socket.gethostname()
+
+    def test_own_lock_without_kicad_is_stale(self, blank_project, monkeypatch):
+        monkeypatch.setattr(safe_write, "kicad_gui_running", lambda: False)
+        sch = Path(blank_project["sch"])
+        lock = sch.parent / "~guard.kicad_pro.lck"
+        _write_lock(lock, *self._me())
+        assert safe_write.lock_status(lock)["stale"] is True
+        with pytest.raises(safe_write.ProjectLockedError, match="STALE"):
+            safe_write.check_not_locked(sch)
+
+    def test_running_kicad_or_foreign_owner_is_live(self, blank_project, monkeypatch):
+        sch = Path(blank_project["sch"])
+        lock = sch.parent / "~guard.kicad_pro.lck"
+        user, host = self._me()
+        _write_lock(lock, user, host)
+        monkeypatch.setattr(safe_write, "kicad_gui_running", lambda: True)
+        assert safe_write.lock_status(lock)["stale"] is False
+        monkeypatch.setattr(safe_write, "kicad_gui_running", lambda: False)
+        _write_lock(lock, user, "some-other-host")
+        assert safe_write.lock_status(lock)["stale"] is False
+        lock.write_text("", encoding="utf-8")  # empty / legacy lock: unprovable
+        assert safe_write.lock_status(lock)["stale"] is False
+        monkeypatch.setattr(safe_write, "kicad_gui_running", lambda: None)
+        _write_lock(lock, user, host)  # process check failed: unknown, keep it
+        assert safe_write.lock_status(lock)["stale"] is False
+
+    def test_clear_stale_lock_tool(self, blank_project, monkeypatch):
+        from mcp.server.fastmcp import FastMCP
+        from kicad_claude.tools import project as project_tools
+
+        mcp = FastMCP("t")
+        project_tools.register(mcp)
+        sch = Path(blank_project["sch"])
+        own = sch.parent / "~guard.kicad_sch.lck"
+        foreign = sch.parent / "~guard.kicad_pcb.lck"
+        _write_lock(own, *self._me())
+        _write_lock(foreign, "someone", "elsewhere")
+        monkeypatch.setattr(safe_write, "kicad_gui_running", lambda: False)
+        res = mcp._tool_manager.get_tool("clear_stale_lock").fn()
+        assert [Path(r["path"]).name for r in res["removed"]] == [own.name]
+        assert [Path(k["path"]).name for k in res["kept"]] == [foreign.name]
+        assert not own.exists() and foreign.exists() and res["locked"] is True

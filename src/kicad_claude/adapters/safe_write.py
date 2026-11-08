@@ -53,18 +53,114 @@ def lock_files_for(path: Path) -> list[Path]:
     return candidates
 
 
+# KiCAD GUI executables that hold document locks (kicad-cli takes none).
+_KICAD_GUI_PROCESSES = ("kicad", "eeschema", "pcbnew")
+
+
+def kicad_gui_running() -> bool | None:
+    """True if a KiCAD GUI process runs on this machine, None if unknown.
+
+    KiCAD's lock file records only `username` and `hostname`, no pid
+    (`include/lockfile.h`), so "is the owner still alive?" can only be answered
+    as "is any KiCAD GUI running here?". Deliberately coarse: another open
+    project also counts as running, which errs towards keeping the lock.
+    """
+    import subprocess
+    import sys
+
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True,
+                timeout=10, check=False,
+            ).stdout.lower()
+            names = {line.split(",")[0].strip('"') for line in out.splitlines() if line}
+            return any(f"{p}.exe" in names for p in _KICAD_GUI_PROCESSES)
+        for p in _KICAD_GUI_PROCESSES:
+            r = subprocess.run(["pgrep", "-x", p], capture_output=True, timeout=10,
+                               check=False)
+            if r.returncode == 0:
+                return True
+        return False
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def lock_status(lock: Path) -> dict:
+    """Who holds `lock`, and whether it is provably stale.
+
+    `stale` is True only when the lock was written by this user on this host
+    *and* no KiCAD GUI process is running here. An unreadable or empty lock
+    file (older KiCAD, or written by hand) is never called stale.
+    """
+    import getpass
+    import json
+    import socket
+
+    info: dict = {"path": str(lock), "username": None, "hostname": None}
+    try:
+        rec = json.loads(Path(lock).read_text(encoding="utf-8") or "null")
+        if isinstance(rec, dict):
+            info["username"] = rec.get("username")
+            info["hostname"] = rec.get("hostname")
+    except (OSError, ValueError):
+        pass
+    try:
+        me = getpass.getuser()
+    except Exception:  # noqa: BLE001 — getuser raises a variety of errors
+        me = None
+    host = socket.gethostname()
+    info["same_user"] = bool(info["username"]) and (
+        str(info["username"]).lower() == str(me).lower())
+    info["same_host"] = bool(info["hostname"]) and (
+        str(info["hostname"]).lower() == host.lower())
+    running = kicad_gui_running()
+    info["kicad_running"] = running
+    info["stale"] = bool(info["same_user"] and info["same_host"] and running is False)
+    return info
+
+
 def check_not_locked(path: Path) -> None:
     """Raise `ProjectLockedError` when KiCAD holds `path` or its project open."""
     if _env_flag(IGNORE_LOCK_ENV, False):
         return
     for lock in lock_files_for(path):
         if lock.exists():
+            st = lock_status(lock)
+            if st["stale"]:
+                diag = (f"The lock looks STALE: written by {st['username']} on "
+                        f"{st['hostname']} (this machine) and no KiCAD process is "
+                        f"running. Remove it with the clear_stale_lock tool.")
+            elif st["kicad_running"]:
+                diag = "A KiCAD process is running, so the lock is treated as live."
+            else:
+                diag = (f"Lock owner: {st['username'] or '?'}@{st['hostname'] or '?'} — "
+                        "not provably this session's machine and user, so it is "
+                        "treated as live.")
             raise ProjectLockedError(
                 f"KiCAD has this project open — {lock} exists. Close the board "
                 f"and schematic editors before editing the files, or KiCAD's "
-                f"next save will overwrite these changes. If the lock is stale "
-                f"after a crash, delete it or set {IGNORE_LOCK_ENV}=1."
+                f"next save will overwrite these changes. {diag} To override "
+                f"anyway set {IGNORE_LOCK_ENV}=1."
             )
+
+
+def clear_stale_locks(path: Path) -> dict:
+    """Delete the locks covering `path` that `lock_status` calls stale.
+
+    Live or unprovable locks are reported, never touched.
+    """
+    removed, kept = [], []
+    for lock in lock_files_for(path):
+        if not lock.exists():
+            continue
+        st = lock_status(lock)
+        if st["stale"]:
+            lock.unlink()
+            removed.append(st)
+        else:
+            kept.append(st)
+    return {"removed": removed, "kept": kept}
 
 
 def backup_file(path: Path, keep: int = DEFAULT_KEEP_BACKUPS) -> Path | None:

@@ -175,10 +175,81 @@ def get_symbol_pins(lib_path: Path, symbol_name: str) -> list[dict[str, Any]]:
         return []
     if not _is_call(data, "kicad_symbol_lib"):
         return []
-    for child in data[1:]:
-        if _is_call(child, "symbol") and len(child) >= 2 and child[1] == symbol_name:
-            return _extract_pins(child)
-    return []
+    try:
+        return _extract_pins(flatten_symbol(data, symbol_name))
+    except KeyError:
+        return []
+
+
+# Top-level children of a derived symbol that replace the base's. Properties
+# are merged by name; everything else listed here replaces the base's node.
+_DERIVED_OVERRIDES = ("exclude_from_sim", "in_bom", "on_board", "in_pos_files",
+                      "duplicate_pin_numbers_are_jumpers", "embedded_fonts")
+
+
+def flatten_symbol(lib_data: list, symbol_name: str, _depth: int = 0) -> list:
+    """Return a standalone copy of `symbol_name` with `(extends ...)` resolved.
+
+    Mirrors KiCAD's `LIB_SYMBOL::Flatten`: a derived symbol carries only its
+    own properties (and a few flags) plus `(extends "BASE")`; pins, graphics,
+    units and `pin_names`/`power` come from the base. The base is flattened
+    first (chains are followed), its unit sub-symbols are renamed
+    `BASE_u_s` -> `NAME_u_s`, the derived properties overlay the base's by
+    name, and `extends` is dropped. A non-derived symbol is returned as a deep
+    copy. Raises KeyError when the symbol or its base is not in `lib_data`.
+    """
+    import copy
+
+    if _depth > 16:
+        raise KeyError(f"extends chain too deep at {symbol_name!r}")
+    node = next(
+        (c for c in lib_data[1:]
+         if _is_call(c, "symbol") and len(c) >= 2 and c[1] == symbol_name),
+        None,
+    )
+    if node is None:
+        raise KeyError(f"symbol {symbol_name!r} not in library")
+    ext = next((c for c in node[2:] if _is_call(c, "extends")), None)
+    if ext is None:
+        return copy.deepcopy(node)
+
+    base_name = str(ext[1])
+    flat = flatten_symbol(lib_data, base_name, _depth + 1)
+    flat[1] = symbol_name
+    prefix = f"{base_name}_"
+    for child in flat[2:]:
+        if _is_call(child, "symbol") and isinstance(child[1], str) \
+                and child[1].startswith(prefix):
+            child[1] = f"{symbol_name}_{child[1][len(prefix):]}"
+
+    def _prop_name(p: list) -> str | None:
+        i = property_name_index(p)
+        return str(p[i]) if len(p) > i else None
+
+    for child in node[2:]:
+        if _is_call(child, "extends"):
+            continue
+        child = copy.deepcopy(child)
+        if _is_call(child, "property"):
+            name = _prop_name(child)
+            for i, existing in enumerate(flat):
+                if _is_call(existing, "property") and _prop_name(existing) == name:
+                    flat[i] = child
+                    break
+            else:
+                last = max((i for i, c in enumerate(flat) if _is_call(c, "property")),
+                           default=1)
+                flat.insert(last + 1, child)
+        elif _head(child) in _DERIVED_OVERRIDES:
+            for i, existing in enumerate(flat):
+                if _is_call(existing, _head(child)):
+                    flat[i] = child
+                    break
+            else:
+                flat.append(child)
+        else:
+            flat.append(child)
+    return flat
 
 
 def parse_symbol_lib(path: Path) -> list[dict[str, Any]]:

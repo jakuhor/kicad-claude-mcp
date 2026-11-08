@@ -12,8 +12,11 @@ Connection rules, matching KiCAD's own connectivity:
   - Two wires whose endpoints coincide are connected.
   - A wire ending on another wire's interior (a T) is connected. A wire merely
     crossing another (an X) is not, unless a `(junction ...)` sits there.
-  - A pin connects where it touches a wire endpoint, a junction, or a wire's
-    interior.
+  - A pin connects where it touches a wire endpoint or a junction. A pin on a
+    wire's interior is NOT connected (kicad-cli: `pin_not_connected`,
+    `unconnected-(R1-Pad1)`) unless a junction sits there.
+  - A net takes its name from a global power port only: a power symbol whose
+    pin is `power_in`. `PWR_FLAG` (pin `power_out`) never names a net.
   - Labels name the set they sit on. A `no_connect` marks a pin as deliberately
     unconnected.
 """
@@ -104,6 +107,27 @@ def _on_segment(p: Point, a: Point, b: Point) -> bool:
     return dot <= length_sq + _EPS
 
 
+def pins_on_wire_interior(tree: list, s_node: list) -> list[dict]:
+    """Pins of one placed symbol that sit on a wire's interior with no junction.
+
+    KiCAD does not connect such a pin. Each entry: `number`, `point`.
+    """
+    segments = _wire_segments(tree)
+    junctions = {
+        _pt(find_child(n, "at")[1], find_child(n, "at")[2])
+        for n in tree[1:]
+        if is_call(n, "junction") and find_child(n, "at")
+    }
+    out = []
+    for pin in pins_of_instance(tree, s_node):
+        p = pin["point"]
+        if p in junctions:
+            continue
+        if any(_on_segment(p, a, b) and p not in (a, b) for a, b, _ in segments):
+            out.append({"number": pin["number"], "point": p})
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Pin positions
 # --------------------------------------------------------------------------- #
@@ -164,6 +188,7 @@ def pins_of_instance(tree: list, s_node: list) -> list[dict]:
             {
                 "number": number,
                 "name": normalize_name(name),
+                "type": str(pin_node[1]) if len(pin_node) > 1 else "",
                 "point": _pt(px, py),
             }
         )
@@ -262,11 +287,8 @@ def build_sheet_graph(tree: list) -> dict:
         for pin in pins_of_instance(tree, s_node):
             p = pin["point"]
             uf.add(p)
-            # A pin landing mid-wire connects to that wire.
-            for start, end, _node in segments:
-                if _on_segment(p, start, end):
-                    uf.union(p, start)
-                    break
+            # No mid-wire union: KiCAD connects a pin only at a wire endpoint
+            # or a junction, and both already share this point in `uf`.
             pins.setdefault(p, []).append(
                 {
                     "ref": ref,
@@ -275,7 +297,10 @@ def build_sheet_graph(tree: list) -> dict:
                     "power": is_power,
                 }
             )
-            if is_power and value:
+            # Global power port: power symbol + power_in pin (KiCAD's
+            # IsGlobalPower). PWR_FLAG's pin is power_out — it marks a net as
+            # driven, it does not name it.
+            if is_power and value and pin.get("type") == "power_in":
                 power_names[p] = normalize_name(value)
 
     # Labels.

@@ -489,3 +489,110 @@ class TestUnroutedSummary:
         res = _call(_make_mcp(), "list_unrouted")
         assert len(res["unrouted"]) == 3
         assert "omitted" not in res
+
+
+# ----- open_points_3 Q7: escaped net names survive writes ------------------- #
+
+_ESCAPED_BOARD = """
+(kicad_pcb
+ (footprint "R" (layer "F.Cu") (at 10 10)
+  (property "Reference" "U5")
+  (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "Net-(U5-NR{slash}SS)")))
+)
+"""
+
+
+def test_writes_keep_the_stored_escaped_net_name():
+    import sexpdata
+    from kicad_claude.adapters import pcb_editor as ped
+
+    tree = sexpdata.loads(_ESCAPED_BOARD)
+    assert ped.stored_net_name(tree, "Net-(U5-NR/SS)") == "Net-(U5-NR{slash}SS)"
+    assert ped.stored_net_name(tree, "Net-(U5-NR{slash}SS)") == "Net-(U5-NR{slash}SS)"
+    assert ped.stored_net_name(tree, "nope") is None
+
+    # A caller typing the decoded name must still produce the stored spelling.
+    seg = ped.add_track(tree, 10, 10, 20, 10, net="Net-(U5-NR/SS)")
+    assert sch_io.find_child(seg, "net")[1] == "Net-(U5-NR{slash}SS)"
+    via = ped.add_via(tree, 20, 10, net="Net-(U5-NR/SS)")
+    assert sch_io.find_child(via, "net")[1] == "Net-(U5-NR{slash}SS)"
+    zone = ped.add_zone(tree, net_name="Net-(U5-NR/SS)", layer="F.Cu",
+                        polygon_mcp=[(0, 0), (5, 0), (5, 5)])
+    assert sch_io.find_child(zone, "net")[1] == "Net-(U5-NR{slash}SS)"
+    # Reading back still decodes for display.
+    assert ped.net_of(seg) == "Net-(U5-NR/SS)"
+
+
+def test_netlist_pad_map_keeps_escaped_names(tmp_path):
+    from kicad_claude.adapters import kicad_python
+
+    net = tmp_path / "x.net"
+    net.write_text('''(export (version "E")
+  (nets
+    (net (code "1") (name "Net-(U5-NR{slash}SS)") (class "Default")
+      (node (ref "U5") (pin "3") (pintype "passive"))
+      (node (ref "C29") (pin "1") (pintype "passive")))
+    (net (code "2") (name "/400_symetric_analog/+20V")
+      (node (ref "U5") (pin "1")))))''', encoding="utf-8")
+    m = kicad_python.netlist_pad_map(net)
+    assert m["nets"][0] == {"name": "Net-(U5-NR{slash}SS)",
+                            "nodes": [["U5", "3"], ["C29", "1"]]}
+    assert m["nets"][1]["name"] == "/400_symetric_analog/+20V"
+
+
+@pytest.mark.slow
+def test_update_pcb_keeps_escaped_net_and_fields_scope(tmp_path, monkeypatch):
+    """Q7 + Q8 on a real project: a net whose name needs `{slash}`."""
+    if find_kicad_cli() is None:
+        pytest.skip("kicad-cli not available")
+    from kicad_claude.adapters import kicad_python
+    if kicad_python.find_kicad_python() is None:
+        pytest.skip("KiCAD Python not available")
+    cached = lib_tools.load_cache()
+    if cached is None:
+        pytest.skip("library index not built")
+    from mcp.server.fastmcp import FastMCP
+    from kicad_claude.tools import schematic as sch_tools, sync as sync_tools
+
+    state.clear_active()
+    files = write_blank_project(tmp_path / "p", "p")
+    state.set_active(tmp_path / "p", "p")
+    monkeypatch.setattr(lib_tools, "_index", cached)
+    mcp = FastMCP("t")
+    for m in (sch_tools, lib_tools, pcb_tools, sync_tools):
+        m.register(mcp)
+
+    def call(n, **k):
+        return mcp._tool_manager.get_tool(n).fn(**k)
+
+    call("add_symbol", lib_id="Device:R", reference="R1", value="10k",
+         x_mm=100.33, y_mm=80.01, footprint="Resistor_SMD:R_0603_1608Metric")
+    call("add_symbol", lib_id="Device:R", reference="R2", value="1k",
+         x_mm=120.65, y_mm=80.01, footprint="Resistor_SMD:R_0603_1608Metric")
+    a = call("get_pin_position", reference="R1", pin="2")["position_mm"]
+    b = call("get_pin_position", reference="R2", pin="1")["position_mm"]
+    call("add_wire", x1_mm=a[0], y1_mm=a[1], x2_mm=a[0], y2_mm=a[1] + 5.08)
+    call("add_wire", x1_mm=a[0], y1_mm=a[1] + 5.08, x2_mm=b[0], y2_mm=a[1] + 5.08)
+    call("add_wire", x1_mm=b[0], y1_mm=a[1] + 5.08, x2_mm=b[0], y2_mm=b[1])
+    call("add_label", net="NR/SS", x_mm=a[0], y_mm=a[1] + 5.08)
+    call("set_board_outline", width_mm=40, height_mm=30)
+
+    res = call("update_pcb_from_schematic")
+    assert res["pad_assignments_made"] == 4 and not res["timed_out"]
+    text = files["pcb"].read_text(encoding="utf-8")
+    # A local label on the root sheet becomes `/<name>`; KiCAD escapes the
+    # name's own slash, the sheet-path slash stays bare.
+    assert text.count('(net "/NR{slash}SS")') == 2
+    assert '(net "/NR/SS")' not in text
+
+    # Second run changes nothing and does not rewrite the board.
+    res = call("update_pcb_from_schematic")
+    assert res["pad_nets_changed"] == 0 and res["board_saved"] is False
+
+    # Field-only sync: no netlist stage.
+    call("set_symbol_property", reference="R1", name="Value", value="22k")
+    res = call("update_pcb_from_schematic", scope="fields")
+    assert res["scope"] == "fields" and "netlist_path" not in res
+    assert res["fields_synced"]
+    assert '"22k"' in files["pcb"].read_text(encoding="utf-8")
+    state.clear_active()

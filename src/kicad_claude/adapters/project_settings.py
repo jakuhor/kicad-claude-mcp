@@ -185,6 +185,75 @@ FAB_PRESETS: dict[str, dict] = {
 }
 
 
+PRESET_MODES = ("project", "preset", "stricter")
+
+
+def _stricter(rule: str, a: Any, b: Any) -> Any:
+    """The tighter of two values of one rule.
+
+    `min_*` rules: the larger minimum. `allow_*` flags: False (disallowed) wins.
+    Anything else: keep `a` (the project's value).
+    """
+    if rule.startswith("allow_") and isinstance(a, bool) and isinstance(b, bool):
+        return a and b
+    if rule.startswith("min_") and isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return max(a, b)
+    return a
+
+
+def compare_preset(current: dict, preset_rules: dict) -> list[dict]:
+    """One row per preset rule: project value, preset value, stricter value.
+
+    `conflict` is True when the project sets the rule to a different value.
+    `preset_is` says which way the preset moves it: `looser`, `stricter`,
+    `equal`, `unset_in_project`, or `different` (not orderable).
+    """
+    rows = []
+    for rule, pval in preset_rules.items():
+        if pval is None:
+            continue
+        if rule not in current:
+            rows.append({"rule": rule, "project": None, "preset": pval,
+                         "stricter": pval, "conflict": False,
+                         "preset_is": "unset_in_project"})
+            continue
+        cval = current[rule]
+        strict = _stricter(rule, cval, pval)
+        if cval == pval:
+            way = "equal"
+        elif strict == cval and strict != pval:
+            way = "looser"
+        elif strict == pval and strict != cval:
+            way = "stricter"
+        else:
+            way = "different"
+        rows.append({"rule": rule, "project": cval, "preset": pval,
+                     "stricter": strict, "conflict": cval != pval, "preset_is": way})
+    return rows
+
+
+def resolve_preset(rows: list[dict], mode: str) -> dict:
+    """Rule values to write for a `compare_preset` table under `mode`.
+
+    - `project`:  keep every value the project sets; fill only unset rules.
+    - `preset`:   take the preset's value for every rule it defines.
+    - `stricter`: per rule, the tighter of the two (see `_stricter`).
+    """
+    if mode not in PRESET_MODES:
+        raise ValueError(f"mode must be one of {PRESET_MODES}, got {mode!r}")
+    out = {}
+    for r in rows:
+        if r["project"] is None:
+            out[r["rule"]] = r["preset"]
+        elif mode == "preset":
+            out[r["rule"]] = r["preset"]
+        elif mode == "stricter":
+            out[r["rule"]] = r["stricter"]
+        else:
+            out[r["rule"]] = r["project"]
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Net classes
 # --------------------------------------------------------------------------- #

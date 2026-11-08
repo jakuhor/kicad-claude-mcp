@@ -142,68 +142,80 @@ def estimate_crosstalk_coupling(
 def check_return_path(
     signal_segments: Iterable[dict],
     ground_zone_areas: list[dict],
+    reference_layers: dict[str, list[str]] | None = None,
+    end_clearance_mm: float = 0.0,
 ) -> list[dict]:
     """Heuristic: warn when a high-speed signal traces over a region without GND coverage.
 
     Each segment dict has: net, layer, start (x, y) KiCAD coords, end (x, y).
-    Each ground_zone_areas entry has: layer, polygon (list of (x, y)).
+    Each ground_zone_areas entry has: layer, polygon (list of (x, y)). Pass the
+    *filled* polygons (`pcb_geometry.zone_layer_polygons`) so clearances and
+    splits count as voids; KiCAD's fractured fill polygons work with the
+    even-odd test used here.
 
-    For each signal segment we sample 10 points along it and check whether
-    the GND zone on the OPPOSITE layer (F.Cu signal → B.Cu ground; or any
-    inner-layer reference) covers each sample. Segments with <80% coverage
-    are flagged.
+    `reference_layers` maps a signal layer to the layers that may serve as its
+    reference (normally the adjacent copper layers). When None, ground on any
+    other layer counts.
 
-    This is a coarse check — it doesn't know about reference plane splits
-    inside zones, vias, or signal-to-aggressor coupling. Use to find
-    obvious problems (signal over a void).
+    For each signal segment 11 points along it are tested; segments with
+    <80% coverage are flagged. `end_clearance_mm` keeps the samples that far
+    from both endpoints (via antipads); a segment shorter than twice that is
+    skipped.
+
+    This is a coarse check — it doesn't know about vias or signal-to-aggressor
+    coupling. Use to find obvious problems (signal over a void).
     """
-    def _point_in_polygon(x: float, y: float, poly: list[tuple[float, float]]) -> bool:
-        """Standard ray-cast inside-polygon test."""
-        n = len(poly)
-        if n < 3:
-            return False
-        inside = False
-        j = n - 1
-        for i in range(n):
-            xi, yi = poly[i]
-            xj, yj = poly[j]
-            if ((yi > y) != (yj > y)) and (
-                x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi
-            ):
-                inside = not inside
-            j = i
-        return inside
+    from kicad_claude.adapters.pcb_geometry import point_in_polygon as _point_in_polygon
+
+    def _bbox(poly):
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        return min(xs), min(ys), max(xs), max(ys)
+
+    zones = [dict(z, _bbox=_bbox(z["polygon"])) for z in ground_zone_areas
+             if z.get("layer") and len(z.get("polygon") or []) >= 3]
 
     findings: list[dict] = []
     for seg in signal_segments:
-        # Pick the GND zone that's a reference for this signal.
-        # Simplified rule: if signal on F.Cu → look for GND on B.Cu (or any
-        # inner Cu); else look for any GND zone on a different layer.
         sig_layer = seg.get("layer", "")
-        candidate_zones = [
-            z for z in ground_zone_areas
-            if z.get("layer") and z["layer"] != sig_layer
-        ]
+        if reference_layers is not None:
+            allowed = set(reference_layers.get(sig_layer, []))
+            candidate_zones = [z for z in zones if z["layer"] in allowed]
+            where = "on an adjacent layer (" + ", ".join(sorted(allowed)) + ")"
+        else:
+            candidate_zones = [z for z in zones if z["layer"] != sig_layer]
+            where = "on any other layer"
         if not candidate_zones:
             findings.append({
                 "net": seg.get("net", "?"),
                 "layer": sig_layer,
+                "start": seg.get("start"),
+                "end": seg.get("end"),
                 "coverage_pct": 0,
-                "issue": "no GND reference plane on any other layer",
+                "issue": f"no GND reference plane {where}",
             })
             continue
 
         sx, sy = seg["start"]
         ex, ey = seg["end"]
+        # Samples within `end_clearance_mm` of an endpoint are not tested: a
+        # track ends on a via or pad, and a via's antipad on the plane below
+        # is a hole by design, not a return-path gap.
+        length = math.hypot(ex - sx, ey - sy)
+        t_margin = end_clearance_mm / length if length > 0 else 1.0
+        if t_margin >= 0.5:
+            continue  # too short to judge; it is all via/pad stub
         n_samples = 10
         covered = 0
         for i in range(n_samples + 1):
-            t = i / n_samples
+            t = t_margin + (1 - 2 * t_margin) * i / n_samples
             x = sx + t * (ex - sx)
             y = sy + t * (ey - sy)
             for z in candidate_zones:
-                poly = z.get("polygon") or []
-                if _point_in_polygon(x, y, poly):
+                x0, y0, x1, y1 = z["_bbox"]
+                if not (x0 <= x <= x1 and y0 <= y <= y1):
+                    continue
+                if _point_in_polygon(x, y, z["polygon"]):
                     covered += 1
                     break
         pct = round(100 * covered / (n_samples + 1), 1)
@@ -211,6 +223,8 @@ def check_return_path(
             findings.append({
                 "net": seg.get("net", "?"),
                 "layer": sig_layer,
+                "start": seg.get("start"),
+                "end": seg.get("end"),
                 "coverage_pct": pct,
                 "issue": f"only {pct}% of trace has GND reference below",
             })

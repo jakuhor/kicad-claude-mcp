@@ -22,6 +22,24 @@ from kicad_claude.utils.kicad_strings import normalize_name
 logger = logging.getLogger("kicad-claude.tools.project")
 
 
+def _resolve_sheet_path(proj, sheet: str) -> Path:
+    """A sheet given as "root", a .kicad_sch filename, or a root sheet name."""
+    if sheet.lower() == "root":
+        return Path(proj.sch_path)
+    if sheet.endswith(".kicad_sch"):
+        p = proj.path / sheet
+        if not p.is_file():
+            raise FileNotFoundError(f"{p} does not exist")
+        return p
+    node = ed.find_sheet_by_name(sch_io.parse_file(proj.sch_path), sheet)
+    if node is None:
+        raise KeyError(f"no sheet named {sheet!r} in root")
+    filename = ed.get_sheet_filename(node)
+    if not filename:
+        raise RuntimeError(f"sheet {sheet!r} has no Sheetfile")
+    return proj.path / filename
+
+
 def _resolve_project_dir_and_name(project_path: str) -> tuple[Path, str]:
     """Accept either a project directory or any of its .kicad_* files.
 
@@ -150,6 +168,37 @@ def register(mcp) -> None:
         return {"active": True, **_summarize(proj)}
 
     @mcp.tool()
+    def clear_stale_lock() -> dict:
+        """Remove KiCAD lock files left behind by a crash — only provably stale ones.
+
+        Mutating tools refuse while a `~<file>.lck` exists beside the project.
+        KiCAD's lock records only `username` and `hostname` (no pid), so a lock
+        is called stale only when it was written by this user on this machine
+        **and** no KiCAD GUI (`kicad`, `eeschema`, `pcbnew`) is running here.
+        Those are deleted; every other lock is listed in `kept` with the reason
+        and left alone — close KiCAD, or delete it by hand if you know better.
+        """
+        from kicad_claude.adapters import safe_write
+
+        proj = state.get_active()
+        removed: list = []
+        kept: dict[str, dict] = {}
+        seen: set[str] = set()
+        for f in sorted(proj.path.glob("*.kicad_sch")) + sorted(proj.path.glob("*.kicad_pcb")):
+            res = safe_write.clear_stale_locks(f)
+            for st in res["removed"]:
+                if st["path"] not in seen:
+                    seen.add(st["path"])
+                    removed.append(st)
+            for st in res["kept"]:
+                kept.setdefault(st["path"], st)
+        return {
+            "removed": removed,
+            "kept": list(kept.values()),
+            "locked": bool(kept),
+        }
+
+    @mcp.tool()
     def get_project_state() -> dict:
         """Return a summary of the currently active KiCAD project.
 
@@ -161,20 +210,28 @@ def register(mcp) -> None:
         return _summarize(state.get_active())
 
     @mcp.tool()
-    def list_components(scope: str = "active") -> list[dict]:
+    def list_components(scope: str = "active", sheet: str = "") -> list[dict]:
         """List schematic symbols of the active project.
 
         `scope="active"` (default) lists the active sheet — the one set by
         `set_active_sheet`, root when unset. `scope="all"` walks the whole
         hierarchy.
 
+        `sheet` lists one specific sheet without changing the active one:
+        "root", a filename ("200_USB_PD.kicad_sch") or a sheet name as shown
+        in the root ("200_USB_PD"). It cannot be combined with `scope="all"`.
+
         Each entry: reference, value, lib_id, position_mm [x, y], rotation,
         sheet (filename relative to the project directory).
         """
         if scope not in ("active", "all"):
             raise ValueError(f"scope must be 'active' or 'all' (got {scope!r})")
+        if sheet and scope == "all":
+            raise ValueError("pass either sheet= or scope='all', not both")
         proj = state.get_active()
-        if scope == "active":
+        if sheet:
+            paths = [_resolve_sheet_path(proj, sheet)]
+        elif scope == "active":
             paths = [state.get_active_sheet_path()]
         else:
             paths = ed.hierarchy_sch_paths(proj.sch_path)

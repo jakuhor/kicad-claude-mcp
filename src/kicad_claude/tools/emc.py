@@ -20,91 +20,76 @@ from kicad_claude.adapters import sch_io
 logger = logging.getLogger("kicad-claude.tools.emc")
 
 
-def _board_area_mm2(tree: list) -> float:
-    """Area in mm² of the rectangular board outline (gr_rect on Edge.Cuts)."""
-    poly = ed.get_board_outline_polygon_kicad(tree)
-    if not poly:
-        return 0.0
-    xs = [p[0] for p in poly]
-    ys = [p[1] for p in poly]
-    return (max(xs) - min(xs)) * (max(ys) - min(ys))
-
-
-def _zone_area_mm2(zone_node: list) -> float:
-    """Area in mm² of a (zone ...) — assumes its polygon is convex/simple."""
-    polygon = sch_io.find_child(zone_node, "polygon")
-    if not polygon:
-        return 0.0
-    pts = sch_io.find_child(polygon, "pts")
-    if not pts:
-        return 0.0
-    coords = []
-    for c in pts[1:]:
-        if sch_io.is_call(c, "xy") and len(c) >= 3:
-            coords.append((float(c[1]), float(c[2])))
-    if len(coords) < 3:
-        return 0.0
-    # Shoelace formula
-    n = len(coords)
-    s = 0.0
-    for i in range(n):
-        x1, y1 = coords[i]
-        x2, y2 = coords[(i + 1) % n]
-        s += x1 * y2 - x2 * y1
-    return abs(s) / 2
+def _parse_net_list(nets: str) -> set[str]:
+    return {n.strip() for n in nets.split(",") if n.strip()}
 
 
 def register(mcp) -> None:
     @mcp.tool()
-    def analyze_ground_coverage() -> dict:
-        """Estimate % of each copper layer covered by GND copper zones.
+    def analyze_ground_coverage(ground_nets: str = "") -> dict:
+        """Estimate % of each copper layer covered by ground copper.
 
         Higher is generally better for EMC: a continuous reference plane
         improves signal integrity, reduces radiated emissions, and gives
         return currents a clean path. Aim for >70% on at least one layer
         for any board with high-speed signals.
 
-        Note: this counts the *zone* polygon area, not the actual filled
-        copper after subtracting clearance to pads/tracks. It's a useful
-        upper bound, not the real value (run KiCAD's GUI to see exact).
+        `ground_nets`: comma-separated net names to count. Default: every net
+        whose name reads as a ground (GND, GND_USB, AGND, PGND, VSS, 0V, ...).
+
+        Area source per layer is reported in `area_source`:
+          - `filled` — the zone's filled copper (clearances, thermal reliefs
+            and islands already cut out), as last saved. Refill zones in KiCAD
+            before trusting it after edits.
+          - `outline` — the zone has never been filled, so its outline is
+            used: an upper bound, overlapping outlines are double-counted.
+
+        The board area is the outer Edge.Cuts loop (lines + arcs, gr_rect,
+        gr_poly or gr_circle) minus inner cutout loops.
         """
+        from kicad_claude.adapters import pcb_geometry as geo
+
         tree = sch_io.parse_file(state.get_active_board_path())
-        board_area = _board_area_mm2(tree)
+        board_area = geo.board_area_mm2(tree)
         if board_area <= 0:
             return {
-                "warning": "no rectangular board outline; can't compute coverage",
+                "warning": "no closed Edge.Cuts outline; can't compute coverage",
                 "board_area_mm2": 0,
-                "by_layer": {},
+                "by_layer": [],
             }
 
-        by_layer: dict[str, float] = {}
-        zone_count_per_layer: dict[str, int] = {}
-        for z in sch_io.find_children(tree, "zone"):
-            # KiCAD 10 writes `(net "GND")`; older zones carry `(net_name ...)`.
-            if ed.net_of(z) not in ("GND", "0V", "VSS"):
+        wanted = _parse_net_list(ground_nets)
+
+        def _is_gnd(net: str) -> bool:
+            return net in wanted if wanted else geo.is_ground_net(net)
+
+        area: dict[str, float] = {}
+        nets: dict[str, set[str]] = {}
+        sources: dict[str, set[str]] = {}
+        for zp in geo.zone_layer_polygons(tree, ed.net_of):
+            if not _is_gnd(zp["net"]):
                 continue
-            layer_node = sch_io.find_child(z, "layer")
-            if not layer_node or len(layer_node) < 2:
-                continue
-            layer = layer_node[1]
-            area = _zone_area_mm2(z)
-            by_layer[layer] = by_layer.get(layer, 0.0) + area
-            zone_count_per_layer[layer] = zone_count_per_layer.get(layer, 0) + 1
+            layer = zp["layer"]
+            area[layer] = area.get(layer, 0.0) + geo.polygon_area(zp["polygon"])
+            nets.setdefault(layer, set()).add(zp["net"])
+            sources.setdefault(layer, set()).add("filled" if zp["filled"] else "outline")
 
         report = []
-        for layer, area in sorted(by_layer.items()):
+        for layer, a in sorted(area.items()):
             report.append({
                 "layer": layer,
-                "gnd_zones": zone_count_per_layer.get(layer, 0),
-                "zone_area_mm2": round(area, 1),
-                "coverage_pct_estimated": round(100 * area / board_area, 1),
+                "nets": sorted(nets[layer]),
+                "area_source": "+".join(sorted(sources[layer])),
+                "zone_area_mm2": round(a, 1),
+                "coverage_pct_estimated": round(min(100.0, 100 * a / board_area), 1),
             })
-        # Warnings
         warnings = []
         copper_layers = ed.get_copper_layer_names(tree)
         for cu in copper_layers:
-            if cu not in by_layer:
-                warnings.append(f"no GND zone on {cu}")
+            if cu not in area:
+                warnings.append(f"no ground zone on {cu}")
+        if any("outline" in r["area_source"] for r in report):
+            warnings.append("some zones are unfilled; their outline area is an upper bound")
 
         return {
             "board_area_mm2": round(board_area, 1),

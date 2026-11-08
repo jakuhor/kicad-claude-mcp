@@ -411,3 +411,163 @@ def test_acceptance_spice_netlist_export(tmp_path: Path):
     assert Path(res["netlist_path"]).is_file()
     assert res["size_bytes"] > 0
     state.clear_active()
+
+
+# ===== open_points_3 Q1/Q2: KiCAD 10 zones, rounded outlines ================ #
+
+# A 40 x 30 board with 5 mm corner radii (lines + arcs, as KiCAD draws a
+# rounded rectangle), a 4-layer GND zone in the KiCAD 10 form
+# `(net "GND") (layers ...)` with one filled island per layer, and a GND_USB
+# zone. The In1 fill has a 4 x 4 mm hole at x 18..22 (fractured: a zero-width
+# slit joins the hole to the outer edge, as KiCAD stores it).
+_ROUNDED_BOARD = """
+(kicad_pcb
+ (gr_line (start 15 10) (end 45 10) (layer "Edge.Cuts"))
+ (gr_arc (start 45 10) (mid 48.535534 11.464466) (end 50 15) (layer "Edge.Cuts"))
+ (gr_line (start 50 15) (end 50 35) (layer "Edge.Cuts"))
+ (gr_arc (start 50 35) (mid 48.535534 38.535534) (end 45 40) (layer "Edge.Cuts"))
+ (gr_line (start 45 40) (end 15 40) (layer "Edge.Cuts"))
+ (gr_arc (start 15 40) (mid 11.464466 38.535534) (end 10 35) (layer "Edge.Cuts"))
+ (gr_line (start 10 35) (end 10 15) (layer "Edge.Cuts"))
+ (gr_arc (start 10 15) (mid 11.464466 11.464466) (end 15 10) (layer "Edge.Cuts"))
+ (zone (net "GND") (layers "F.Cu" "In1.Cu" "In2.Cu" "B.Cu") (uuid "a")
+  (polygon (pts (xy 10 10) (xy 40 10) (xy 40 40) (xy 10 40)))
+  (filled_polygon (layer "In1.Cu")
+   (pts (xy 10 10) (xy 40 10) (xy 40 40) (xy 10 40) (xy 10 27)
+        (xy 18 27) (xy 18 23) (xy 22 23) (xy 22 27) (xy 18 27) (xy 10 27)))
+  (filled_polygon (layer "B.Cu")
+   (pts (xy 10 10) (xy 40 10) (xy 40 40) (xy 10 40))))
+ (zone (net "GND_USB") (layers "In1.Cu") (uuid "b")
+  (polygon (pts (xy 40 10) (xy 50 10) (xy 50 40) (xy 40 40))))
+ (zone (net "+5V") (layer "F.Cu") (uuid "c")
+  (polygon (pts (xy 10 10) (xy 50 10) (xy 50 40) (xy 10 40)))
+  (filled_polygon (layer "F.Cu") (pts (xy 10 10) (xy 50 10) (xy 50 40) (xy 10 40))))
+ (zone (net "") (layers "F.Cu") (uuid "d") (keepout (tracks not_allowed))
+  (polygon (pts (xy 0 0) (xy 1 0) (xy 1 1))))
+)
+"""
+
+
+def _rounded_tree():
+    return sexpdata.loads(_ROUNDED_BOARD)
+
+
+def test_outline_loops_chain_lines_and_arcs():
+    from kicad_claude.adapters import pcb_geometry as geo
+    tree = _rounded_tree()
+    loops = geo.board_outline_loops(tree)
+    assert len(loops) == 1
+    expected = 40 * 30 - (4 - math.pi) * 5 ** 2  # rounded rectangle
+    assert geo.polygon_area(loops[0]) == pytest.approx(expected, rel=2e-3)
+    assert pcb_ed.get_board_outline_polygon_kicad(tree) == loops[0]
+
+
+def test_outline_cutout_is_subtracted():
+    from kicad_claude.adapters import pcb_geometry as geo
+    tree = _rounded_tree()
+    tree.append(sexpdata.loads(
+        '(gr_rect (start 20 20) (end 30 30) (layer "Edge.Cuts"))'))
+    expected = 40 * 30 - (4 - math.pi) * 25 - 100
+    assert geo.board_area_mm2(tree) == pytest.approx(expected, rel=2e-3)
+
+
+def test_zone_layer_polygons_reads_kicad10_multilayer_zones():
+    from kicad_claude.adapters import pcb_geometry as geo
+    zones = list(geo.zone_layer_polygons(_rounded_tree(), pcb_ed.net_of))
+    got = sorted((z["net"], z["layer"], z["filled"]) for z in zones)
+    assert got == [
+        ("+5V", "F.Cu", True),
+        ("GND", "B.Cu", True),
+        ("GND", "In1.Cu", True),
+        ("GND_USB", "In1.Cu", False),  # never filled: outline fallback
+    ]  # keepout skipped
+
+
+def test_ground_net_names():
+    from kicad_claude.adapters.pcb_geometry import is_ground_net
+    for n in ("GND", "GND_USB", "AGND", "PGND", "GNDPWR", "VSS", "VSSA", "0V",
+              "/sheet/GND_ISO"):
+        assert is_ground_net(n), n
+    for n in ("+5V", "VCC", "SIGNAL", "LEGEND", "10V", ""):
+        assert not is_ground_net(n), n
+
+
+def test_return_path_sees_fractured_hole_and_adjacency():
+    from kicad_claude.adapters import pcb_geometry as geo
+    gnd = [z for z in geo.zone_layer_polygons(_rounded_tree(), pcb_ed.net_of)
+           if geo.is_ground_net(z["net"])]
+    adj = {"F.Cu": ["In1.Cu"], "In1.Cu": ["F.Cu", "In2.Cu"],
+           "In2.Cu": ["In1.Cu", "B.Cu"], "B.Cu": ["In2.Cu"]}
+    over_hole = {"net": "S", "layer": "F.Cu", "start": (16.0, 25.0), "end": (24.0, 25.0)}
+    clear = {"net": "S", "layer": "F.Cu", "start": (12.0, 15.0), "end": (38.0, 15.0)}
+    f = thermal_emc.check_return_path([over_hole, clear], gnd, reference_layers=adj)
+    assert [x["start"] for x in f] == [(16.0, 25.0)]
+    # F.Cu may not use B.Cu as reference when adjacency is enforced ...
+    only_b = [z for z in gnd if z["layer"] == "B.Cu"]
+    f = thermal_emc.check_return_path([clear], only_b, reference_layers=adj)
+    assert len(f) == 1 and "adjacent" in f[0]["issue"]
+    # ... but may without it.
+    assert thermal_emc.check_return_path([clear], only_b) == []
+
+
+def test_return_path_end_clearance_ignores_via_antipads():
+    # Plane with a 0.8 mm antipad around a via at each end of a 3 mm stub.
+    def antipad(cx):
+        return [(cx - 0.4, 0.4), (cx - 0.4, -0.4), (cx + 0.4, -0.4), (cx + 0.4, 0.4)]
+    plane = [(0, -5), (10, -5), (10, 5), (0, 5), (0, 0.4)]
+    plane += antipad(2.0) + [(2.0 - 0.4, 0.4)] + antipad(5.0) + [(5.0 - 0.4, 0.4), (0, 0.4)]
+    zones = [{"layer": "In1.Cu", "polygon": plane}]
+    seg = [{"net": "S", "layer": "F.Cu", "start": (2.0, 0.0), "end": (5.0, 0.0)}]
+    # Without a margin the samples inside both antipads drag coverage below 80 %.
+    assert len(thermal_emc.check_return_path(seg, zones, end_clearance_mm=0)) == 1
+    assert thermal_emc.check_return_path(seg, zones, end_clearance_mm=0.6) == []
+    # Shorter than 2 x margin: not judged at all, even with no plane.
+    short = [{"net": "S", "layer": "F.Cu", "start": (2.0, 0.0), "end": (3.0, 0.0)}]
+    assert thermal_emc.check_return_path(short, zones, end_clearance_mm=0.6) == []
+
+
+def _project_with_board(tmp_path, board_text: str):
+    files = write_blank_project(tmp_path / "rp", "rp")
+    tree = sch_io.parse_file(files["pcb"])
+    pcb_ed.set_copper_layer_count(tree, 4)
+    for node in sexpdata.loads(board_text)[1:]:
+        tree.append(node)
+    sch_io.write_file(files["pcb"], tree)
+    state.clear_active()
+    state.set_active(tmp_path / "rp", "rp")
+    return files
+
+
+def test_tools_on_rounded_kicad10_board(tmp_path):
+    from mcp.server.fastmcp import FastMCP
+    from kicad_claude.tools import emc, simulation
+    board = _ROUNDED_BOARD.rstrip().rstrip(")") + """
+ (segment (start 16 25) (end 24 25) (width 0.2) (layer "F.Cu") (net "SIG") (uuid "s1"))
+ (segment (start 12 15) (end 38 15) (width 0.2) (layer "F.Cu") (net "SIG") (uuid "s2"))
+ (segment (start 12 18) (end 38 18) (width 0.2) (layer "F.Cu") (net "/sheet/+18V") (uuid "s3"))
+)"""
+    _project_with_board(tmp_path, board)
+    try:
+        mcp = FastMCP("t")
+        emc.register(mcp)
+        simulation.register(mcp)
+
+        def call(n, **k):
+            return mcp._tool_manager.get_tool(n).fn(**k)
+
+        cov = call("analyze_ground_coverage")
+        assert cov["board_area_mm2"] == pytest.approx(1200 - (4 - math.pi) * 25, rel=2e-3)
+        by = {r["layer"]: r for r in cov["by_layer"]}
+        assert by["B.Cu"]["area_source"] == "filled"
+        assert by["In1.Cu"]["nets"] == ["GND", "GND_USB"]
+        assert by["In1.Cu"]["area_source"] == "filled+outline"
+        assert "F.Cu" not in by  # +5V pour is not ground
+
+        rp = call("check_return_path_continuity")
+        assert rp["segments_checked"] == 2  # the +18V rail is skipped
+        assert rp["reference_rule"] == "adjacent copper layer"
+        assert [tuple(f["start"]) for f in rp["findings"]] == [(16.0, 25.0)]
+        assert {(z["net"], z["layer"]) for z in rp["gnd_zones"]} == {
+            ("GND", "In1.Cu"), ("GND", "B.Cu"), ("GND_USB", "In1.Cu")}
+    finally:
+        state.clear_active()

@@ -261,16 +261,18 @@ def fetch_symbol_def(lib_path: Path, symbol_name: str) -> list:
     The returned node is renamed-ready for lib_symbols: the caller should
     set its name to "LibName:SymbolName" before injecting.
     """
-    import copy
+    from kicad_claude.indexer.kicad_libs import flatten_symbol
 
     text = Path(lib_path).read_text(encoding="utf-8", errors="replace")
     data = sexpdata.loads(text)
     if not is_call(data, "kicad_symbol_lib"):
         raise ValueError(f"not a kicad_symbol_lib: {lib_path}")
-    for child in data[1:]:
-        if is_call(child, "symbol") and len(child) >= 2 and child[1] == symbol_name:
-            return copy.deepcopy(child)
-    raise KeyError(f"symbol {symbol_name!r} not found in {lib_path}")
+    # A derived symbol (`extends`) is flattened onto its base, as KiCAD embeds
+    # it in a schematic's lib_symbols: pins and graphics come from the base.
+    try:
+        return flatten_symbol(data, symbol_name)
+    except KeyError:
+        raise KeyError(f"symbol {symbol_name!r} not found in {lib_path}") from None
 
 
 def make_lib_symbol_entry(symbol_def_node: list, qualified_lib_id: str) -> list:
@@ -323,6 +325,9 @@ def library_field_offsets(sym_def_node: list) -> dict[str, dict]:
             "dy": float(at[2]),
             "angle": float(at[3]) if len(at) > 3 else 0.0,
             "justify": [str(x) for x in justify_node[1:]] if justify_node else None,
+            # KiCAD copies field visibility from the library part on placement:
+            # power ports hide their `#PWR` Reference (open_points_3 Q9).
+            "hidden": _field_hidden(prop),
         }
     return out
 
@@ -383,6 +388,10 @@ def build_symbol_instance(
 
     def _prop(name: str, val: str, hide: bool) -> list:
         spec = offsets.get(name)
+        if spec is not None and spec.get("hidden"):
+            hide = True
+        if name == "Reference" and val.startswith("#"):
+            hide = True  # virtual parts (#PWR, #FLG) never show a designator
         if spec is None:
             at = [sym("at"), x_k, y_k, 0]
             justify = None
@@ -515,6 +524,84 @@ def remove_symbol(tree: list, reference: str) -> bool:
     return False
 
 
+def _field_hidden(prop: list) -> bool:
+    """`(hide yes)` on a property, directly (KiCAD 8+) or inside `(effects)`."""
+    for node in (prop, find_child(prop, "effects")):
+        h = find_child(node, "hide") if node else None
+        if h is not None and (len(h) < 2 or str(h[1]) == "yes"):
+            return True
+        if node and any(sch_io.is_symbol(x, "hide") for x in node[1:]):  # legacy bare flag
+            return True
+    return False
+
+
+def _find_field(symbol_node: list, name: str) -> list:
+    for prop in find_children(symbol_node, "property"):
+        i = property_name_index(prop)
+        if len(prop) > i and prop[i] == name:
+            return prop
+    raise KeyError(f"symbol has no field {name!r}")
+
+
+def get_field_placement(symbol_node: list, name: str) -> dict:
+    """`{x_mm, y_mm, angle, visible}` of one field, sheet coordinates."""
+    prop = _find_field(symbol_node, name)
+    at = find_child(prop, "at")
+    x, y = file_to_sch_xy(float(at[1]), float(at[2])) if at and len(at) >= 3 else (None, None)
+    return {
+        "x_mm": x, "y_mm": y,
+        "angle": at[3] if at and len(at) >= 4 else 0,
+        "visible": not _field_hidden(prop),
+    }
+
+
+def set_field_placement(
+    symbol_node: list,
+    name: str,
+    *,
+    x_mm: float | None = None,
+    y_mm: float | None = None,
+    angle: float | None = None,
+    visible: bool | None = None,
+) -> dict:
+    """Change a field's position, text angle and/or visibility in place.
+
+    Hiding writes `(hide yes)` inside `(effects)`, the form `build_symbol_instance`
+    uses; showing removes every hide marker (property-level, effects-level, or
+    the legacy bare `hide` atom).
+    """
+    prop = _find_field(symbol_node, name)
+    at = find_child(prop, "at")
+    if at is None:
+        at = [sym("at"), 0, 0, 0]
+        prop.insert(property_name_index(prop) + 2, at)
+    while len(at) < 4:
+        at.append(0)
+    if x_mm is not None and y_mm is not None:
+        xk, yk = sch_to_file_xy(x_mm, y_mm)
+        at[1], at[2] = round_mm(xk), round_mm(yk)
+    if angle is not None:
+        a = float(angle) % 360
+        if a % 90:
+            raise ValueError(f"field angle must be a multiple of 90, got {angle}")
+        at[3] = int(a % 180)
+    if visible is not None:
+        effects = find_child(prop, "effects")
+        for node in (prop, effects):
+            if not node:
+                continue
+            node[:] = [node[0]] + [
+                c for c in node[1:]
+                if not is_call(c, "hide") and not sch_io.is_symbol(c, "hide")
+            ]
+        if not visible:
+            if effects is None:
+                effects = [sym("effects"), [sym("font"), [sym("size"), 1.27, 1.27]]]
+                prop.append(effects)
+            effects.append([sym("hide"), sym("yes")])
+    return get_field_placement(symbol_node, name)
+
+
 def move_symbol(
     tree: list,
     reference: str,
@@ -522,7 +609,16 @@ def move_symbol(
     y_mm: float,
     rotation: float | None = None,
 ) -> None:
-    """Set absolute position (and optionally rotation) of an existing symbol."""
+    """Set absolute position (and optionally rotation) of an existing symbol.
+
+    Fields (`property` nodes) move with the body. A field's `(at x y angle)` is
+    absolute on the sheet, so each one is carried along: its offset from the
+    symbol origin is taken back into the library frame with the old rotation
+    and placed again with the new one (`place_library_offset`, the transform
+    `add_symbol` uses), and its text angle is re-derived the same way as
+    `text_angle`. The result is what `add_symbol` would have written at the
+    new rotation. Justification is left alone, as on placement.
+    """
     s_node = find_symbol_by_reference(tree, reference)
     if s_node is None:
         raise KeyError(f"no symbol with reference {reference!r}")
@@ -530,10 +626,26 @@ def move_symbol(
     at = find_child(s_node, "at")
     if at is None or len(at) < 4:
         raise ValueError("symbol has malformed (at ...) node")
-    at[1] = round_mm(x_k)
-    at[2] = round_mm(y_k)
+    old_x, old_y, old_rot = float(at[1]), float(at[2]), float(at[3])
+    new_x, new_y = round_mm(x_k), round_mm(y_k)
+    new_rot = normalize_rotation(rotation) if rotation is not None else old_rot
+    at[1] = new_x
+    at[2] = new_y
     if rotation is not None:
-        at[3] = normalize_rotation(rotation)
+        at[3] = new_rot
+
+    for prop in find_children(s_node, "property"):
+        p_at = find_child(prop, "at")
+        if not p_at or len(p_at) < 3:
+            continue
+        sx, sy = float(p_at[1]) - old_x, float(p_at[2]) - old_y
+        # sheet offset (sx, sy) = (rx, -ry) with (rx, ry) = rotate(d, old_rot)
+        dx, dy = rotate_xy(sx, -sy, -old_rot)
+        p_at[1], p_at[2] = place_library_offset(new_x, new_y, new_rot, dx, dy)
+        # Hidden metadata fields keep their angle, as `add_symbol` writes 0 for
+        # them at any rotation.
+        if len(p_at) >= 4 and new_rot != old_rot and not _field_hidden(prop):
+            p_at[3] = int((float(p_at[3]) - old_rot + new_rot) % 180)
 
 
 def add_wire(

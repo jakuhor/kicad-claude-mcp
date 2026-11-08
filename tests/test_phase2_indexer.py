@@ -480,3 +480,32 @@ def test_lib_dirs_are_filtered_by_what_they_hold(tmp_path: Path, monkeypatch):
 
     assert kicad_paths.find_symbol_lib_dirs() == [sym_dir.resolve()]
     assert kicad_paths.find_footprint_lib_dirs() == [fp_dir.resolve()]
+
+
+# ----- open_points_4 R1 / R4 ----------------------------------------------- #
+
+
+def test_flatten_symbol_resolves_extends():
+    import sexpdata
+    data = sexpdata.loads((FIXTURES / "MiniLib.kicad_sym").read_text(encoding="utf-8"))
+    flat = klibs.flatten_symbol(data, "R_Small")
+    assert flat[1] == "R_Small"
+    assert not any(isinstance(c, list) and str(c[0]) == "extends" for c in flat[2:])
+    units = [c[1] for c in flat[2:] if isinstance(c, list) and str(c[0]) == "symbol"]
+    assert units and all(u.startswith("R_Small_") for u in units)
+    props = {c[1]: c[2] for c in flat[2:] if isinstance(c, list) and str(c[0]) == "property"}
+    assert props["Value"] == "R_Small"                                  # derived wins
+    assert props["Footprint"] == "Resistor_SMD:R_0603_1608Metric"       # from base
+    assert len(klibs._extract_pins(flat)) == 2
+    assert len(klibs.get_symbol_pins(FIXTURES / "MiniLib.kicad_sym", "R_Small")) == 2
+    with pytest.raises(KeyError):
+        klibs.flatten_symbol(data, "Nope")
+
+
+def test_search_exact_name_ranks_first(synthetic_index):
+    # "Resistor" is also a substring of "Resistor_Wide" and a keyword of R_Small.
+    results = search_symbols("Resistor", synthetic_index)
+    assert results[0]["lib_id"] == "MiniLib:Resistor" and results[0]["_score"] == 100.0
+    assert results[1]["lib_id"] == "MiniLib:Resistor_Wide"  # prefix tier
+    ids = [r["lib_id"] for r in results]
+    assert len(ids) == len(set(ids))

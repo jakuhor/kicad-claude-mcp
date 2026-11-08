@@ -26,7 +26,7 @@ import sexpdata
 import math
 import re
 
-from kicad_claude.adapters import length_tuning, pcb_layers, sch_io
+from kicad_claude.adapters import length_tuning, pcb_geometry, pcb_layers, sch_io
 from kicad_claude.adapters.sch_io import (
     find_child,
     find_children,
@@ -818,10 +818,43 @@ def net_ref(tree: list, net: int | str | None) -> int | str:
     idx = find_net_index(tree, name)
     if idx is not None:
         return idx
-    if not net_exists(tree, name):
+    stored = stored_net_name(tree, name)
+    if stored is None:
         known = [n["name"] for n in list_nets(tree)]
         raise KeyError(f"net {net!r} not found on this board; known nets: {known}")
-    return name
+    return stored
+
+
+def stored_net_name(tree: list, net_name: str) -> str | None:
+    """The board's own (brace-escaped) spelling of a net, or None if unused.
+
+    Names are compared decoded, but the value returned is the raw string from
+    the file: `Net-(U5-NR{slash}SS)`, never `Net-(U5-NR/SS)`. Writing the
+    decoded form would create a different net whose bare `/` reads as a
+    sheet-path separator (open_points_3 Q7).
+    """
+    wanted = normalize_name(net_name)
+
+    def _raw(node: list) -> str | None:
+        n = find_child(node, "net")
+        if n and len(n) >= 2:
+            v = n[2] if isinstance(n[1], int) and len(n) > 2 else n[1]
+            if not isinstance(v, int) and normalize_name(str(v)) == wanted:
+                return str(v)
+        nn = find_child(node, "net_name")
+        if nn and len(nn) >= 2 and normalize_name(str(nn[1])) == wanted:
+            return str(nn[1])
+        return None
+
+    for node in tree[1:]:
+        if is_call(node, "footprint"):
+            for pad in find_children(node, "pad"):
+                if (r := _raw(pad)) is not None:
+                    return r
+        elif head_of(node) in ("zone", "segment", "arc", "via"):
+            if (r := _raw(node)) is not None:
+                return r
+    return None
 
 
 # Suffix conventions for diff pair members. Order matters: more-specific first.
@@ -972,23 +1005,13 @@ def _uuid() -> str:
 def get_board_outline_polygon_kicad(tree: list) -> list[tuple[float, float]] | None:
     """Extract the board outline as KiCAD-coord (x, y) points.
 
-    Currently supports rectangular outlines (`gr_rect` on Edge.Cuts), since
-    that's what `set_board_outline` produces. Returns None if no rectangular
-    Edge.Cuts is found.
+    The outer (largest) closed Edge.Cuts loop: a `gr_rect`, a `gr_poly`, a
+    `gr_circle`, or `gr_line`/`gr_arc` pieces chained end to end (a rounded
+    rectangle). Arcs are flattened to <= 5 degree chords. Returns None when no
+    closed Edge.Cuts loop exists.
     """
-    for node in find_children(tree, "gr_rect"):
-        layer = find_child(node, "layer")
-        if not layer or len(layer) < 2 or layer[1] != "Edge.Cuts":
-            continue
-        start = find_child(node, "start")
-        end = find_child(node, "end")
-        if not (start and end and len(start) >= 3 and len(end) >= 3):
-            continue
-        x1, y1 = float(start[1]), float(start[2])
-        x2, y2 = float(end[1]), float(end[2])
-        # KiCAD doesn't care about winding order.
-        return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
-    return None
+    loops = pcb_geometry.board_outline_loops(tree)
+    return loops[0] if loops else None
 
 
 def add_zone(
@@ -1021,6 +1044,8 @@ def add_zone(
     # KiCAD 10 board it is the name itself; net 0 is the unconnected net, so a
     # named zone must never be written with index 0.
     net_nodes: list[list]
+    if net_name:  # a caller may type the decoded name; write the stored one
+        net_name = stored_net_name(tree, net_name) or net_name
     if net_name and has_net_table(tree):
         idx = find_net_index(tree, net_name)
         if idx is None:

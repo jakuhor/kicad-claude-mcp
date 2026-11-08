@@ -18,11 +18,15 @@ asked.
 - Do not push, tag, or open PRs.
 
 ## Current backlog
-`docs/open_points_2.md` is the live queue. P1-P15 are all closed as of
-2026-09-19 — the file records what was done and why. Nothing is outstanding.
+`docs/open_points_4.md` is the live queue. R1-R6 closed 2026-11-08; R7
+(absorb kicad-happy's missing capabilities so this server is the only tool)
+is open — its capability matrix and phases P-A..P-F are in the file. New field
+reports go to `docs/tooling_issues.md` first, then get triaged into a round.
 
-`docs/open_points_1.md` is the previous round (P1-P7, closed 2026-09-18), kept
-for the same reason. Its numbering is independent.
+`docs/open_points_3.md` (Q1-Q13, closed 2026-11-08), `docs/open_points_2.md`
+(P1-P15, closed 2026-09-19) and `docs/open_points_1.md` (P1-P7, closed
+2026-09-18) are the previous rounds, kept for the record. Each round's
+numbering is independent.
 
 `docs/kicad_mcp_issues.md` is the original field report from the Firbox base
 board, kept for context — every heading carries its state. Do not work it
@@ -30,7 +34,7 @@ directly; it is not the queue.
 
 ## Layout
 - `server.py` — entry point; creates `FastMCP("kicad-claude")` and calls each
-  `tools/<group>.register(mcp)`. 134 tools total.
+  `tools/<group>.register(mcp)`. 143 tools total.
 - `src/kicad_claude/tools/*.py` — thin MCP tool wrappers: validate arguments,
   call an adapter, return a JSON-friendly dict.
 - `src/kicad_claude/adapters/*.py` — the real work: s-expression IO

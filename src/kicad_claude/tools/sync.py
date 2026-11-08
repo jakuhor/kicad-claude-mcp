@@ -14,7 +14,7 @@ from pathlib import Path
 
 from kicad_claude import state
 from kicad_claude.adapters import annotation, kicad_cli, kicad_python, safe_write
-from kicad_claude.adapters import sch_io
+from kicad_claude.adapters import pcb_editor, sch_io
 from kicad_claude.tools import pcb as pcb_tools
 from kicad_claude.tools import sync_components
 
@@ -89,8 +89,15 @@ def register(mcp) -> None:
         sync_fields: bool = True,
         remove_extra: bool = False,
         timeout_seconds: float = 0.0,
+        scope: str = "full",
     ) -> dict:
         """Bring the active PCB in line with the schematic — KiCAD's own update.
+
+        `scope="fields"` does step 2 only: copy Value / MPN / LCSC / … onto the
+        footprints in pure Python and save. No footprint placement, no deletion,
+        no netlist export and no pcbnew run, so it takes seconds instead of
+        minutes. Use it after a field-only schematic edit (value swap,
+        sourcing update). `scope="full"` (default) runs every step below.
 
         Process:
         1. Place a footprint for every schematic symbol that has none on the
@@ -105,8 +112,10 @@ def register(mcp) -> None:
            default). A board also carries footprints no symbol knows about —
            mounting holes, fiducials, logos — and they would go too, so they
            are only ever reported as `orphan_footprints` unless this is on.
-        4. Export the schematic netlist as kicadxml and use KiCAD's Python
-           (`pcbnew`) to add the missing nets and assign every pad's net.
+        4. Export the schematic netlist (kicadsexpr, which keeps net names in
+           KiCAD's escaped form such as `Net-(U5-NR{slash}SS)`) and use KiCAD's
+           Python (`pcbnew`) to add the missing nets and assign every pad's
+           net. The board is re-saved only if a net was added or a pad changed.
 
         A symbol with no `Footprint` property is reported in `no_footprint`; a
         footprint lib_id the library index does not know is reported in
@@ -122,6 +131,8 @@ def register(mcp) -> None:
         already placed and saved; the response says so in `stage` and
         `timed_out` instead of only raising.
         """
+        if scope not in ("full", "fields"):
+            raise ValueError(f"scope must be 'full' or 'fields', got {scope!r}")
         proj = state.get_active()
 
         # 0) Component side: place, sync fields, optionally delete.
@@ -129,6 +140,23 @@ def register(mcp) -> None:
         components = sync_components.collect_schematic_components(sch_paths)
         pcb_path = state.get_active_board_path()
         tree = sch_io.parse_file(pcb_path)
+
+        if scope == "fields":
+            fields_changed = sync_components.sync_footprint_fields(tree, components)
+            backup = safe_write.save_tree(tree=tree, path=pcb_path) if fields_changed else None
+            on_board = set(pcb_editor.all_footprint_references(tree))
+            missing = sorted(ref for ref in components if ref not in on_board)
+            out = {
+                "scope": "fields",
+                "pcb_path": str(pcb_path),
+                "fields_synced": fields_changed,
+                "missing_in_pcb": missing,
+                "backup": str(backup) if backup else None,
+            }
+            if missing:
+                out["hint"] = ("Not on the board (scope='fields' does not place footprints): "
+                               + ", ".join(missing) + ". Run scope='full' to add them.")
+            return out
 
         placement: dict = {"placed": [], "no_footprint": [], "unresolved": []}
         if place_missing:
@@ -152,17 +180,19 @@ def register(mcp) -> None:
             len(components)
         )
 
-        # 1) Export the netlist as kicadxml (different format than DSN)
-        netlist_xml = proj.path / "fab" / f"{proj.name}-netlist.xml"
-        netlist_xml.parent.mkdir(parents=True, exist_ok=True)
+        # 1) Export the netlist as kicadsexpr. Not kicadxml: the XML export
+        #    decodes `{slash}` to `/`, and pcbnew then creates a second net whose
+        #    bare `/` reads as a sheet-path separator (open_points_3 Q7).
+        netlist_path = proj.path / "fab" / f"{proj.name}-netlist.net"
+        netlist_path.parent.mkdir(parents=True, exist_ok=True)
         kicad_cli.export_netlist(
-            proj.sch_path, netlist_xml, fmt="kicadxml", timeout=timeout
+            proj.sch_path, netlist_path, fmt="kicadsexpr", timeout=timeout
         )
 
         # 2) Apply via pcbnew Python
         try:
             result = kicad_python.apply_netlist(
-                state.get_active_board_path(), netlist_xml, timeout=timeout
+                state.get_active_board_path(), netlist_path, timeout=timeout
             )
             result["timed_out"] = False
         except kicad_python.KicadPythonError as e:
@@ -171,7 +201,8 @@ def register(mcp) -> None:
             result = _timeout_result(e, timeout, len(components))
 
         # 3) Surface the artifacts and whatever could not be done automatically
-        result["netlist_path"] = str(netlist_xml)
+        result["scope"] = "full"
+        result["netlist_path"] = str(netlist_path)
         result["pcb_path"] = str(pcb_path)
         result["placed_footprints"] = placement["placed"]
         result["no_footprint"] = placement["no_footprint"]

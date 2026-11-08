@@ -211,7 +211,7 @@ def test_hierarchy_round_trip(blank_project, tmp_path, monkeypatch):
           lib_id="MiniLib:Resistor", reference="R1", value="10k",
           x_mm=80, y_mm=80)
     _call(mcp, "add_hierarchical_label",
-          net_name="+5V", x_mm=60, y_mm=80, shape="input")
+          net="+5V", x_mm=60, y_mm=80, shape="input")
 
     # Back to root + add a sheet pin
     _call(mcp, "set_active_sheet", sheet="root")
@@ -252,7 +252,7 @@ def test_hierarchical_label_refused_on_root(blank_project, tmp_path, monkeypatch
     idx = _patched_index_with_minilib(tmp_path)
     mcp = _make_mcp(monkeypatch, idx)
     with pytest.raises(RuntimeError, match="sub-sheet"):
-        _call(mcp, "add_hierarchical_label", net_name="X", x_mm=10, y_mm=10)
+        _call(mcp, "add_hierarchical_label", net="X", x_mm=10, y_mm=10)
 
 
 # ===== Acceptance: kicad-cli erc on a hierarchical project ================= #
@@ -356,3 +356,48 @@ def test_acceptance_12_layer_pcb_drc_clean(tmp_path):
     ]
     assert not bad, f"unexpected layer-related violations: {bad}"
     state.clear_active()
+
+
+def test_root_selected_by_filename_is_root(blank_project, tmp_path, monkeypatch):
+    """open_points_3 Q4: set_active_sheet('<root>.kicad_sch') then add_symbol
+    raised 'not registered in the root schematic'."""
+    idx = _patched_index_with_minilib(tmp_path)
+    mcp = _make_mcp(monkeypatch, idx)
+    _call(mcp, "add_sheet", sheet_name="X")
+    res = _call(mcp, "set_active_sheet", sheet="p.kicad_sch")
+    assert res["active_sheet"] == "root"
+    assert state.get_active_sheet_filename() is None
+    _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+          value="1k", x_mm=50.8, y_mm=50.8)
+    root = sch_io.parse_file(blank_project["sch"])
+    syms = [s for s in sch_io.find_children(root, "symbol")
+            if sch_io.get_property(s, "Reference") == "R1"]
+    assert len(syms) == 1
+    paths = sch_io.find_deep(syms[0], "path")
+    root_uuid = sch_io.find_child(root, "uuid")[1]
+    assert any(p[1] == f"/{root_uuid}" for p in paths)
+
+
+def test_list_components_sheet_argument(blank_project, tmp_path, monkeypatch):
+    """open_points_3 Q13: list one sheet without switching the active one."""
+    from kicad_claude.tools import project as project_tools
+    idx = _patched_index_with_minilib(tmp_path)
+    mcp = _make_mcp(monkeypatch, idx)
+    project_tools.register(mcp)
+    _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+          value="1k", x_mm=50.8, y_mm=50.8)
+    _call(mcp, "add_sheet", sheet_name="Power")
+    _call(mcp, "set_active_sheet", sheet="Power")
+    _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R2",
+          value="2k", x_mm=50.8, y_mm=50.8)
+    _call(mcp, "set_active_sheet", sheet="")
+
+    assert [c["reference"] for c in _call(mcp, "list_components", sheet="Power")] == ["R2"]
+    power_file = _call(mcp, "list_components", sheet="Power")[0]["sheet"]
+    assert [c["reference"] for c in _call(mcp, "list_components", sheet=power_file)] == ["R2"]
+    assert [c["reference"] for c in _call(mcp, "list_components", sheet="root")] == ["R1"]
+    assert state.get_active_sheet_filename() is None  # active sheet untouched
+    with pytest.raises(KeyError):
+        _call(mcp, "list_components", sheet="Nope")
+    with pytest.raises(ValueError):
+        _call(mcp, "list_components", sheet="Power", scope="all")

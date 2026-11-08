@@ -13,6 +13,7 @@ dependencies = [
     "pydantic>=2",
     "rapidfuzz>=3",
     "python-dotenv>=1.0",
+    "pypdf>=5",
 ]
 
 [dependency-groups]

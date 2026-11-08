@@ -326,7 +326,7 @@ class TestConnectivityTools:
         )[0]
         _call(mcp, "add_wire", x1_mm=pin["point"][0], y1_mm=pin["point"][1],
               x2_mm=pin["point"][0] + 25.4, y2_mm=pin["point"][1])
-        _call(mcp, "add_label", net_name="VBUS",
+        _call(mcp, "add_label", net="VBUS",
               x_mm=pin["point"][0] + 25.4, y_mm=pin["point"][1])
 
         res = _call(mcp, "list_sch_nets")
@@ -391,3 +391,52 @@ class TestConnectivityTools:
         mcp = _make_mcp(monkeypatch, tmp_path)
         with pytest.raises(ValueError, match="scope must be"):
             _call(mcp, "list_sch_nets", scope="sideways")
+
+
+# ----- open_points_4 R2/R3 ------------------------------------------------- #
+
+
+def test_pin_mid_wire_is_not_connected_until_a_junction(blank_project):
+    """KiCAD: a pin on a wire's interior is `pin_not_connected`."""
+    tree = _tree(blank_project)
+    _add_r(tree, "R1", 50.8, 50.8)
+    _add_r(tree, "R2", 101.6, 50.8)
+    a = netlist.pins_of_instance(tree, ed.find_symbol_by_reference(tree, "R1"))[0]
+    b = netlist.pins_of_instance(tree, ed.find_symbol_by_reference(tree, "R2"))[0]
+    # A wire from R2's pin running straight through R1's pin and beyond.
+    ax, ay = a["point"]
+    bx, by = b["point"]
+    assert ay == by, "fixture pins must share a row"
+    ed.add_wire(tree, bx, by, ax - 12.7, ay)
+    s_r1 = ed.find_symbol_by_reference(tree, "R1")
+    hits = netlist.pins_on_wire_interior(tree, s_r1)
+    assert [h["number"] for h in hits] == [a["number"]]
+    assert {("R1", a["number"]), ("R2", b["number"])} not in _sets(tree)
+    ed.add_junction(tree, ax, ay)
+    assert netlist.pins_on_wire_interior(tree, s_r1) == []
+    assert {("R1", a["number"]), ("R2", b["number"])} in _sets(tree)
+
+
+_FLAG_LIB = """(kicad_symbol_lib (version 20251024) (generator "t")
+  (symbol "GND" (power)
+    (property "Reference" "#PWR" (at 0 0 0)) (property "Value" "GND" (at 0 0 0))
+    (symbol "GND_1_1" (pin power_in line (at 0 0 270) (length 0) (name "~") (number "1"))))
+  (symbol "PWR_FLAG" (power)
+    (property "Reference" "#FLG" (at 0 0 0)) (property "Value" "PWR_FLAG" (at 0 0 0))
+    (symbol "PWR_FLAG_0_0" (pin power_out line (at 0 0 90) (length 0) (name "~") (number "1"))))
+)"""
+
+
+def test_pwr_flag_never_names_a_net(blank_project, tmp_path):
+    lib = tmp_path / "power.kicad_sym"
+    lib.write_text(_FLAG_LIB, encoding="utf-8")
+    tree = _tree(blank_project)
+    _add_r(tree, "R1", 50.8, 50.8)
+    p = netlist.pins_of_instance(tree, ed.find_symbol_by_reference(tree, "R1"))[1]["point"]
+    for name, ref in (("GND", "#PWR01"), ("PWR_FLAG", "#FLG01")):
+        ed.add_symbol(tree, qualified_lib_id=f"power:{name}", reference=ref, value=name,
+                      x_mm=p[0], y_mm=p[1], rotation=0,
+                      sym_def_node=ed.fetch_symbol_def(lib, name), project_name="net")
+    names = [n for n, e in netlist.build_sheet_nets(tree).nets.items()
+             if any(pin["ref"] == "R1" for pin in e["pins"])]
+    assert "GND" in names and "PWR_FLAG" not in names

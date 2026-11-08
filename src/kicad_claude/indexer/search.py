@@ -48,6 +48,32 @@ def _search(
     if not query.strip() or not entries:
         return []
 
+    # Name matches first (open_points_4 R4). WRatio over lib_id + description
+    # + keywords rewards partial token overlap, so `ESP32-C6-MINI-1` lost to
+    # 4000-series logic. Tiers on the normalized symbol/footprint name (the
+    # part after `Lib:`): exact 100, prefix 99, substring 98; shorter names
+    # first within a tier. Fuzzy results fill the rest, capped at 97.
+    q = utils.default_process(query)
+    tiers: list[tuple[int, int, str]] = []  # (-score, name length, lib_id)
+    if q:
+        for lid in entries:
+            name = utils.default_process(lid.split(":", 1)[-1])
+            if name == q:
+                tiers.append((-100, len(name), lid))
+            elif name.startswith(q):
+                tiers.append((-99, len(name), lid))
+            elif len(q) >= 3 and q in name:
+                tiers.append((-98, len(name), lid))
+    tiers.sort()
+    out: list[dict[str, Any]] = []
+    for neg, _len, lid in tiers[:max_results]:
+        entry = dict(entries[lid])
+        entry["_score"] = float(-neg)
+        out.append(entry)
+    if len(out) >= max_results:
+        return out
+    seen = {t[2] for t in tiers[:max_results]}
+
     # Build (lib_id, haystack) parallel lists once.
     lib_ids = list(entries.keys())
     haystacks = [haystack_fn(entries[k]) for k in lib_ids]
@@ -59,14 +85,17 @@ def _search(
         haystacks,
         scorer=fuzz.WRatio,
         processor=utils.default_process,
-        limit=max_results,
+        limit=max_results + len(seen),
         score_cutoff=score_cutoff,
     )
-    out = []
     for _haystack, score, idx in results:
+        if lib_ids[idx] in seen:
+            continue
         entry = dict(entries[lib_ids[idx]])
-        entry["_score"] = round(score, 1)
+        entry["_score"] = round(min(score, 97.0), 1)
         out.append(entry)
+        if len(out) >= max_results:
+            break
     return out
 
 
