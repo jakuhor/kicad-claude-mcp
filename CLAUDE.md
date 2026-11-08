@@ -5,10 +5,11 @@ MCP server that reads and modifies KiCad files. It must never corrupt a file,
 and it must preserve KiCad's own formatting so that a project's git diff stays
 minimal.
 
-Focus: design work, design for manufacturing, and design review through the
-`kicad-happy` plugin. Manufacturing output, panelization and automated ordering
-exist in the code but are **not** a current focus — do not extend them unless
-asked.
+Focus: design work, design for manufacturing, and design review. The server is
+meant to be the user's only tool: what the `kicad-happy` plugin does and this
+server does not is being ported in (`docs/open_points.md`). Manufacturing
+output, panelization and automated ordering exist in the code but are **not**
+a current focus — do not extend them unless asked.
 
 ## Do NOT
 - **Do not create commits.** Never run `git commit`, `git add` + commit, or any
@@ -17,20 +18,16 @@ asked.
   review and commit.
 - Do not push, tag, or open PRs.
 
-## Current backlog
-`docs/open_points_4.md` is the live queue. R1-R6 closed 2026-11-08; R7
-(absorb kicad-happy's missing capabilities so this server is the only tool)
-is open — its capability matrix and phases P-A..P-F are in the file. New field
-reports go to `docs/tooling_issues.md` first, then get triaged into a round.
-
-`docs/open_points_3.md` (Q1-Q13, closed 2026-11-08), `docs/open_points_2.md`
-(P1-P15, closed 2026-09-19) and `docs/open_points_1.md` (P1-P7, closed
-2026-09-18) are the previous rounds, kept for the record. Each round's
-numbering is independent.
-
-`docs/kicad_mcp_issues.md` is the original field report from the Firbox base
-board, kept for context — every heading carries its state. Do not work it
-directly; it is not the queue.
+## Open points and documentation
+- `docs/open_points.md` is the only queue and holds **only open items**
+  (OP-n, numbers never reused). New field reports and gaps go straight in as
+  the next OP. Decisions taken with the user are marked *(decided, date)* —
+  do not re-ask them.
+- When an item is done: delete it from `open_points.md` and document the
+  finished capability in `README.md` (Capabilities; the rule-ID table for new
+  review rules). History lives in git, not in docs.
+- Keep the counts in `README.md` (tools, tests) and below in step with the
+  code.
 
 ## Layout
 - `server.py` — entry point; creates `FastMCP("kicad-claude")` and calls each
@@ -72,7 +69,7 @@ directly; it is not the queue.
 ## Commands
 ```bash
 uv sync
-uv run pytest -m "not slow and not network" -q   # fast tests (~3 s)
+uv run pytest -m "not slow and not network" -q   # fast tests (~1 min)
 uv run pytest -m "slow" -q                       # acceptance, needs kicad-cli
 uv run pytest -m "network" -q                    # live DigiKey/Mouser
 uv run ruff check .
