@@ -1,4 +1,4 @@
-"""Phase 20 — design review: power tree (open_points_4 R7, P-C)."""
+"""Phase 20 — design review: power tree and connectivity."""
 
 from __future__ import annotations
 
@@ -133,7 +133,7 @@ def test_analyze_power_tree_tool(tmp_path):
     assert "note" in res
 
 
-# ---- review_connectivity (P-C step 2) ------------------------------------- #
+# ---- review_connectivity --------------------------------------------------- #
 
 from kicad_claude.adapters import connectivity_review as cr  # noqa: E402
 

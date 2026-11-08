@@ -1,5 +1,5 @@
 """Structured datasheet specs, extracted by the calling agent and cached per
-project (open_points_4 R7, phase P-A step 2).
+project.
 
 The server does not run a language model. `task()` hands the agent the PDF
 path, the most relevant pages' text, the schematic context and the schema;

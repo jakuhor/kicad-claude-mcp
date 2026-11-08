@@ -1855,7 +1855,7 @@ class TestAddPowerSymbolPrefix:
 
 
 def test_add_symbol_footprint_and_fields(blank_project, tmp_path, monkeypatch):
-    """open_points_3 Q5: footprint and extra fields in the same call."""
+    """Footprint and extra fields in the same call."""
     mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
     res = _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
                 value="10k", x_mm=100, y_mm=100,
@@ -1879,7 +1879,7 @@ def test_add_symbol_footprint_and_fields(blank_project, tmp_path, monkeypatch):
 
 
 def test_move_symbol_carries_fields(blank_project, tmp_path, monkeypatch):
-    """open_points_3 Q6: fields follow a move and a rotation, landing where
+    """Fields follow a move and a rotation, landing where
     add_symbol would have put them at the new pose."""
     mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
 
@@ -1934,7 +1934,7 @@ def test_set_field_position(blank_project, tmp_path, monkeypatch):
 
 
 def test_power_symbol_reference_is_hidden():
-    """open_points_3 Q9: field visibility comes from the library part, and a
+    """Field visibility comes from the library part, and a
     `#` reference is never shown."""
     lib = sexpdata.loads('''(symbol "GND" (power)
       (property "Reference" "#PWR" (at 0 -6.35 0) (effects (font (size 1.27 1.27)) (hide yes)))
@@ -1979,7 +1979,7 @@ _MINI_POWER_LIB = """(kicad_symbol_lib (version 20251024) (generator "test")
 
 
 def test_add_power_symbol_custom_net(blank_project, tmp_path, monkeypatch):
-    """open_points_3 Q10: a net with no stock power symbol."""
+    """A net with no stock power symbol."""
     from mcp.server.fastmcp import FastMCP
 
     sym_dir = tmp_path / "psyms"
@@ -2011,7 +2011,7 @@ def test_add_power_symbol_custom_net(blank_project, tmp_path, monkeypatch):
 
 
 def test_strict_args_aliases(blank_project, tmp_path, monkeypatch):
-    """open_points_3 Q12: old spellings work, say so, and unknown ones still fail."""
+    """Old spellings work, say so, and unknown ones still fail."""
     import asyncio
     from mcp.server.fastmcp.exceptions import ToolError
     from kicad_claude import strict_args

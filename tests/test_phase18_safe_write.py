@@ -228,7 +228,7 @@ class TestBackupRetention:
         assert len(kept) == safe_write.DEFAULT_KEEP_BACKUPS
 
 
-# ===== open_points_3 Q11 — stale lock diagnosis and opt-in removal ========= #
+# ===== stale lock diagnosis and opt-in removal ============================= #
 
 
 def _write_lock(path: Path, user, host) -> None:

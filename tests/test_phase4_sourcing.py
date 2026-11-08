@@ -571,7 +571,7 @@ def test_farnell_live_lookup_lm358n():
     assert all(r.get("mpn") for r in results)
 
 
-# ===== open_points_4 R5 — jlcpcb source ==================================== #
+# ===== jlcpcb source ======================================================= #
 
 _JLC_PAYLOAD = {
     "code": 200,
@@ -641,7 +641,7 @@ def test_jlcpcb_live_finds_an_rf_module():
     assert hit["mpn"] == "ESP32-C6-MINI-1-N4" and hit["lcsc"].startswith("C")
 
 
-# ===== open_points_4 R6 — fetch_datasheet =================================== #
+# ===== fetch_datasheet ===================================================== #
 
 
 def _mock_stream(monkeypatch, routes):

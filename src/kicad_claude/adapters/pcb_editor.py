@@ -831,7 +831,7 @@ def stored_net_name(tree: list, net_name: str) -> str | None:
     Names are compared decoded, but the value returned is the raw string from
     the file: `Net-(U5-NR{slash}SS)`, never `Net-(U5-NR/SS)`. Writing the
     decoded form would create a different net whose bare `/` reads as a
-    sheet-path separator (open_points_3 Q7).
+    sheet-path separator.
     """
     wanted = normalize_name(net_name)
 

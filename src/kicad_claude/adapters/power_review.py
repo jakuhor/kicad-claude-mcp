@@ -1,4 +1,4 @@
-"""Power-tree and regulator review from a KiCAD netlist (open_points_4 R7, P-C).
+"""Power-tree and regulator review from a KiCAD netlist.
 
 Input is the `kicadsexpr` netlist `kicad-cli sch export netlist` writes: it
 covers the whole hierarchy, keeps KiCAD's own net names, and carries each

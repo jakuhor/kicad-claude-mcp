@@ -1,5 +1,4 @@
-"""Phase 21 — project datasheets: sync, extraction cache, consumers
-(open_points_4 R7, P-A)."""
+"""Phase 21 — project datasheets: sync, extraction cache, consumers."""
 
 from __future__ import annotations
 
@@ -274,7 +273,7 @@ def test_log_redacts_api_keys():
     assert "abc-123" not in msg and "s9b" not in msg and "q=1" in msg and "apiKey=***" in msg
 
 
-# ---- datasheet consumers in the power tree (P-A step 3) -------------------- #
+# ---- datasheet consumers in the power tree --------------------------------- #
 
 def _pt(tmp_path):
     from kicad_claude.adapters import power_review as pr
@@ -363,7 +362,7 @@ def test_validate_anyout():
     assert any("anyout" in e for e in errors)
 
 
-# ---- datasheet-backed connectivity checks (P-A step 4) --------------------- #
+# ---- datasheet-backed connectivity checks ---------------------------------- #
 
 def _cr_nl(tmp_path):
     from kicad_claude.adapters import power_review as pr

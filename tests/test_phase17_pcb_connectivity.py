@@ -491,7 +491,7 @@ class TestUnroutedSummary:
         assert "omitted" not in res
 
 
-# ----- open_points_3 Q7: escaped net names survive writes ------------------- #
+# ----- escaped net names survive writes ------------------------------------ #
 
 _ESCAPED_BOARD = """
 (kicad_pcb

@@ -359,7 +359,7 @@ def test_acceptance_12_layer_pcb_drc_clean(tmp_path):
 
 
 def test_root_selected_by_filename_is_root(blank_project, tmp_path, monkeypatch):
-    """open_points_3 Q4: set_active_sheet('<root>.kicad_sch') then add_symbol
+    """set_active_sheet('<root>.kicad_sch') then add_symbol
     raised 'not registered in the root schematic'."""
     idx = _patched_index_with_minilib(tmp_path)
     mcp = _make_mcp(monkeypatch, idx)
@@ -379,7 +379,7 @@ def test_root_selected_by_filename_is_root(blank_project, tmp_path, monkeypatch)
 
 
 def test_list_components_sheet_argument(blank_project, tmp_path, monkeypatch):
-    """open_points_3 Q13: list one sheet without switching the active one."""
+    """List one sheet without switching the active one."""
     from kicad_claude.tools import project as project_tools
     idx = _patched_index_with_minilib(tmp_path)
     mcp = _make_mcp(monkeypatch, idx)

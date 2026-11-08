@@ -1,6 +1,6 @@
 """Download a datasheet PDF from the first URL that really serves one.
 
-Manufacturer and distributor sites fail in different ways (open_points_4 R6):
+Manufacturer and distributor sites fail in different ways:
 an expired TLS certificate (onsemi), bot-protection HTML instead of the PDF
 (Littelfuse), automated downloads blocked (Mouser). So each candidate URL is
 tried in turn and a response is accepted only when its body starts with

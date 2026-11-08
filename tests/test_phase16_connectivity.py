@@ -393,7 +393,7 @@ class TestConnectivityTools:
             _call(mcp, "list_sch_nets", scope="sideways")
 
 
-# ----- open_points_4 R2/R3 ------------------------------------------------- #
+# ----- pins mid-wire, PWR_FLAG never names a net ---------------------------- #
 
 
 def test_pin_mid_wire_is_not_connected_until_a_junction(blank_project):

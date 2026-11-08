@@ -2,7 +2,7 @@
 
 Uses the public parts-search endpoint the jlcpcb.com/parts page calls. No API
 key. It covers what the community `jlcsearch` index misses (RF modules, many
-ICs and connectors — open_points_4 R5), and is the only source that says
+ICs and connectors), and is the only source that says
 whether a part is a JLCPCB **Basic** part (no feeder-loading fee), a
 **Preferred** extended part, or an **Extended** part.
 

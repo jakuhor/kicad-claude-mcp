@@ -482,7 +482,7 @@ def test_lib_dirs_are_filtered_by_what_they_hold(tmp_path: Path, monkeypatch):
     assert kicad_paths.find_footprint_lib_dirs() == [fp_dir.resolve()]
 
 
-# ----- open_points_4 R1 / R4 ----------------------------------------------- #
+# ----- derived symbols, exact-name search ranking -------------------------- #
 
 
 def test_flatten_symbol_resolves_extends():

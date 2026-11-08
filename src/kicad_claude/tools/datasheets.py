@@ -1,4 +1,4 @@
-"""Project datasheet tools (open_points_4 R7, phase P-A).
+"""Project datasheet tools.
 
 Tools:
     sync_datasheets — one PDF per schematic MPN in `<project>/datasheets/`,

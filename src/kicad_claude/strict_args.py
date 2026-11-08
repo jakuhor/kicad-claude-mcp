@@ -9,8 +9,8 @@ failed call.
 
 Deprecated / commonly guessed spellings are accepted as **aliases** and
 renamed to the tool's canonical argument before validation; the response then
-carries `deprecated_arguments` naming the canonical spelling (open_points_3
-Q12). An alias is only applied when the tool lacks the alias name and has the
+carries `deprecated_arguments` naming the canonical spelling. An alias is
+only applied when the tool lacks the alias name and has the
 target, and never when the caller passed both spellings.
 
 `install(mcp)` wraps the tool manager once, so every tool group gets the check

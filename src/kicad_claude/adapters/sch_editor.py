@@ -326,7 +326,7 @@ def library_field_offsets(sym_def_node: list) -> dict[str, dict]:
             "angle": float(at[3]) if len(at) > 3 else 0.0,
             "justify": [str(x) for x in justify_node[1:]] if justify_node else None,
             # KiCAD copies field visibility from the library part on placement:
-            # power ports hide their `#PWR` Reference (open_points_3 Q9).
+            # power ports hide their `#PWR` Reference.
             "hidden": _field_hidden(prop),
         }
     return out

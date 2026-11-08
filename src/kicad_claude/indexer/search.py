@@ -48,7 +48,7 @@ def _search(
     if not query.strip() or not entries:
         return []
 
-    # Name matches first (open_points_4 R4). WRatio over lib_id + description
+    # Name matches first. WRatio over lib_id + description
     # + keywords rewards partial token overlap, so `ESP32-C6-MINI-1` lost to
     # 4000-series logic. Tiers on the normalized symbol/footprint name (the
     # part after `Lib:`): exact 100, prefix 99, substring 98; shorter names

@@ -1,4 +1,4 @@
-"""Netlist connectivity review (open_points_4 R7, P-C step 2).
+"""Netlist connectivity review.
 
 Datasheet-free checks on the kicadsexpr netlist `power_review.parse_netlist`
 reads:
@@ -17,7 +17,7 @@ reads:
 
 What it does NOT do: resolve a 7-bit I2C address, check a pull-up value
 against a bus spec, or say a pin is on the *wrong* rail — each needs the
-part's datasheet (phase P-A). The per-IC pin -> rail map is reported so the
+part's datasheet (the spec cache). The per-IC pin -> rail map is reported so the
 caller can compare it with the datasheet.
 
 Rule ideas follow kicad-happy 3.0.1 `validation_detectors.py` /

@@ -81,7 +81,7 @@ def _junction_mid_wire_pins(tree: list, s_node: list) -> list[dict]:
     """Add a junction under every pin of `s_node` that sits mid-wire.
 
     KiCAD leaves such a pin unconnected; a pin placed on a wire is meant to
-    join it (open_points_4 R2). Returns `[{pin, position_mm}]` for the report.
+    join it. Returns `[{pin, position_mm}]` for the report.
     """
     added = []
     for hit in netlist.pins_on_wire_interior(tree, s_node):

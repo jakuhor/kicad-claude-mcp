@@ -413,7 +413,7 @@ def test_acceptance_spice_netlist_export(tmp_path: Path):
     state.clear_active()
 
 
-# ===== open_points_3 Q1/Q2: KiCAD 10 zones, rounded outlines ================ #
+# ===== KiCAD 10 zones, rounded outlines ===================================== #
 
 # A 40 x 30 board with 5 mm corner radii (lines + arcs, as KiCAD draws a
 # rounded rectangle), a 4-layer GND zone in the KiCAD 10 form

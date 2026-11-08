@@ -1,4 +1,4 @@
-"""Design review tools (open_points_4 R7, phase P-C).
+"""Design review tools.
 
 Tools:
     analyze_power_tree — regulators, rails, enable/PG sequencing and

@@ -182,7 +182,7 @@ def register(mcp) -> None:
 
         # 1) Export the netlist as kicadsexpr. Not kicadxml: the XML export
         #    decodes `{slash}` to `/`, and pcbnew then creates a second net whose
-        #    bare `/` reads as a sheet-path separator (open_points_3 Q7).
+        #    bare `/` reads as a sheet-path separator.
         netlist_path = proj.path / "fab" / f"{proj.name}-netlist.net"
         netlist_path.parent.mkdir(parents=True, exist_ok=True)
         kicad_cli.export_netlist(

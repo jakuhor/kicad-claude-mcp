@@ -548,7 +548,7 @@ def test_aisler_presets_match_the_published_process():
         assert ps.FAB_PRESETS[name]["rules"]["allow_microvias"] is False
 
 
-# ----- open_points_3 Q3: preset vs existing project rules ------------------- #
+# ----- apply_fab_preset: preset vs existing project rules ------------------ #
 
 
 def _project_with_rules(tmp_path, **rules):

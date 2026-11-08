@@ -1,5 +1,4 @@
-"""Project datasheet directory: manifest, PDF text, MPN -> PDF matching
-(open_points_4 R7, phase P-A).
+"""Project datasheet directory: manifest, PDF text, MPN -> PDF matching.
 
 `<project>/datasheets/manifest.kicad-claude.json` maps each MPN in the
 schematic to its PDF in `<project>/datasheets/`:
