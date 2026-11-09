@@ -164,6 +164,114 @@ def register(mcp) -> None:
         return result
 
     @mcp.tool()
+    def review_circuits(
+        groups: str = "power,analog,digital,misc",
+        rail_voltages: dict[str, float] | None = None,
+        internal_connectors: str = "",
+        audio_f_low_hz: float = 20.0,
+        fb_z_max_ohm: float = 100e3,
+        netlist_path: str = "",
+    ) -> dict:
+        """Circuit-level detectors on the active schematic (whole hierarchy),
+        driven by pin names and pin types, with datasheet values only from the
+        spec cache.
+
+        `groups` (comma list):
+          - `power`: USB Type-C CC termination (PW-USBC-CC: Rd 5.1 k per CC
+            pin, Rp value vs its rail, a controller pin, CC1+CC2 on one
+            resistor), D+ / D- of both orientations joined (PW-USBC-DATA),
+            clamps on connector supply nets (PW-VBUS-TVS) and a ground pin
+            (PW-CONN-GND), ESD clamps on external connector signal nets
+            (PW-ESD; `internal_connectors="J2,J5"` excludes board-to-board
+            and test connectors), enable loops / self-enable (PW-SEQ-*), reset
+            nets (PW-RESET), FB divider impedance (PW-FB-Z, above
+            `fb_z_max_ohm`) and FB bias current error (PW-FB-IB, spec cache);
+          - `analog`: op-amp inputs with no DC path (AU-BIAS), input coupling
+            high-pass corner vs `audio_f_low_hz` (AU-HPF), output coupling cap
+            to a connector without a bleed resistor (AU-BLEED), unused
+            channels (AU-UNUSED); converter (ADC / DAC / codec) reference /
+            VCOM caps (AD-VREF), analog supply decoupling (AD-SUPPLY), split
+            grounds with no join (AD-GND), inputs without RC (AD-AAF); jacks
+            driven straight from an output (HP-JACK); level shifters (LS-*);
+          - `digital`: inputs with nothing driving them (DG-FLOAT; pins the
+            datasheet says may stay open are skipped, DG-PINTYPE when the
+            datasheet calls the pin an output), boot / mode straps (DG-BOOT),
+            I2C pull-ups stronger than the 3 mA sink (DG-I2C-RPU), SPI chip
+            selects shared / without pull-up (DG-SPI-CS), driver vs receiver
+            supply (DG-LEVEL), branched clocks without series R
+            (DG-CLK-TERM), USB data ESD (DG-USB-ESD), SWD pins reachable
+            (DG-SWD);
+          - `misc`: LEDs without a current limit (LE-NORES), LED driver set
+            pins (LE-ISET), display charge-pump / VCOMH caps (DS-CAP), RTC
+            backup pin (RTC-VBAT), buttons without pull-up (KB-PULL), switch
+            matrices without diodes (KB-GHOST).
+
+        Rail voltages come from `analyze_power_tree` plus `rail_voltages`.
+        Heuristic: confirm each finding against the schematic and datasheet.
+        """
+        from kicad_claude.adapters import circuit_review
+
+        wanted = tuple(g.strip() for g in groups.split(",") if g.strip())
+        bad = [g for g in wanted if g not in circuit_review.GROUPS]
+        if bad:
+            raise ValueError(f"unknown group(s) {bad}; valid: {list(circuit_review.GROUPS)}")
+        nl = power_review.parse_netlist(project_netlist(netlist_path))
+        pt = power_review.analyze(nl, datasheet=_datasheet_values(nl),
+                                  rail_voltages=rail_voltages or {})
+        internal = {r.strip() for r in internal_connectors.split(",") if r.strip()}
+        return circuit_review.analyze(nl, pt, _specs_by_ref(nl), wanted, internal,
+                                      audio_f_low_hz, fb_z_max_ohm)
+
+    @mcp.tool()
+    def review_part_ratings(
+        loads: dict[str, float] | None = None,
+        rail_voltages: dict[str, float] | None = None,
+        efficiency: dict[str, float] | None = None,
+        default_efficiency: float = 0.85,
+        ambient_c: float | None = None,
+        fsw: dict[str, float] | None = None,
+        tj_margin_c: float = 25.0,
+        netlist_path: str = "",
+    ) -> dict:
+        """Check parts against their datasheet ratings with a per-rail current
+        model (active schematic, whole hierarchy).
+
+        `loads` is the current drawn from each rail in amps, by net name
+        (`{"+5VD": 0.5, "/+18V": 0.15}`; a bare name matches the net's last
+        path part). It is carried up the power tree: series links unchanged,
+        linear regulators Iin = Iout, switchers by power with `efficiency`
+        per regulator (`{"U1": 0.9}` or `{"U2/ch1": 0.8}`; others use
+        `default_efficiency`, listed as assumed), and from each root rail
+        through the series path (inductors, CMC winding, <= 1 Ohm resistors,
+        FET dies, series diodes) to the power-entry connector.
+
+        Checks, each citing the spec record's page: RT-L-ISAT (peak, with buck
+        ripple from L and fsw - `fsw` per regulator or the datasheet's) and
+        RT-L-IRMS for inductors; RT-CMC-I; RT-CONN-I (per contact);
+        RT-REG-IOUT (recommended IOUT / current limit) and RT-REG-ILIM (buck
+        inductor peak vs switch limit); RT-TJ (Ta + rth_ja P vs Tj max, for
+        regulators - channels of one IC summed -, FETs I^2 RDS(on), series
+        diodes, CCRs; `ambient_c`, default 40 C stated as assumed); RT-FET-ID,
+        RT-D-IF; RT-LED (LED current from series R and VF or a CCR's I_reg vs
+        IF max, CCR headroom); RT-MODEL (a regulator whose voltages are
+        unknown); RT-NODATA (carries current, nothing extracted).
+
+        First-pass estimate: rth_ja is the datasheet's test board, efficiency
+        is a number you supply, ripple is computed for bucks only.
+        """
+        from kicad_claude.adapters import part_ratings
+
+        nl = power_review.parse_netlist(project_netlist(netlist_path))
+        pt = power_review.analyze(nl, datasheet=_datasheet_values(nl),
+                                  rail_voltages=rail_voltages or {})
+        result = part_ratings.check(nl, pt, _specs_by_ref(nl), loads or {}, efficiency,
+                                    default_efficiency, ambient_c, fsw, tj_margin_c)
+        if not loads:
+            result["note"] = ("No loads given: every current is zero except what the "
+                              "schematic implies (LED strings). Pass loads={rail: amps}.")
+        return result
+
+    @mcp.tool()
     def review_connectivity(
         checks: str = "power_pins,decoupling,open_drain,i2c,datasheet_pins,pin_abs_max,"
                       "cap_voltage",
@@ -203,9 +311,11 @@ def register(mcp) -> None:
             Vouts, plus `rail_voltages` for unregulated inputs) and resistor
             dividers (CR-PIN-ABS);
           - `cap_voltage`: DC voltage across each fitted capacitor against its
-            `Voltage` field (or a `/50V` suffix in Value): CR-CAP-V above the
-            rating, CR-CAP-DERATE above `cap_derating` x rating. The rating is
-            the schematic field, not the fitted MPN's datasheet.
+            rating: the fitted MPN's extracted datasheet (`absolute_max.V`)
+            when there is one, else the `Voltage` field (or a `/50V` suffix in
+            Value). CR-CAP-V above the rating, CR-CAP-DERATE above
+            `cap_derating` x rating, CR-CAP-FIELD when the field disagrees
+            with the datasheet.
 
         The pin -> rail map is returned so it can be checked against each
         datasheet; whether a rail is the *right* one is not judged here.

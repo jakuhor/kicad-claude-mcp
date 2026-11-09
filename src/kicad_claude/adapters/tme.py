@@ -28,6 +28,10 @@ import httpx
 
 logger = logging.getLogger("kicad-claude.adapters.tme")
 
+from kicad_claude.utils.logging import quiet_http  # noqa: E402
+
+quiet_http()
+
 DEFAULT_BASE = "https://api.tme.eu"
 TOKEN_LEEWAY_SEC = 30  # tokens live 300 s; refresh a little early
 

@@ -1,12 +1,12 @@
 # kicad-claude-mcp
 
 > Design KiCAD PCBs from natural language. An MCP server that gives Claude
-> Code (or any MCP client) **143 tools** to drive a complete PCB workflow —
+> Code (or any MCP client) **156 tools** to drive a complete PCB workflow —
 > schematic capture, library management, PCB layout, autorouting, design
 > review against the parts' datasheets, sourcing, manufacturing outputs,
 > signal-integrity calculations, RF design, and more.
 
-**143 MCP tools · 621 tests (565 fast, 50 acceptance, 6 network) · headless from idea to gerbers**
+**156 MCP tools · 674 tests (618 fast, 50 acceptance, 6 network) · headless from idea to gerbers**
 
 The server edits `.kicad_sch` / `.kicad_pcb` / `.kicad_pro` files directly, in
 KiCAD 10's own formatting — one added wire is a ten-line git diff, not a
@@ -168,7 +168,7 @@ section, exposed under its own name. Drop it if you only run one.
 - **Availability**: `check_availability` against Mouser, DigiKey, TME, Farnell and JLCPCB (opt-in source: LCSC number, stock, USD price breaks, basic / preferred / extended library type, no key needed)
 - **Single datasheet**: `fetch_datasheet` tries the given URL and each source's datasheet link in order and keeps the first body that really is a PDF (bot-protection HTML is rejected; TLS verification is never disabled); every attempt is reported
 - **Project datasheet folder**: `sync_datasheets` gives every schematic MPN its PDF in `datasheets/` and records the mapping in `datasheets/manifest.kicad-claude.json`. Existing vendor-named files (`8471fd.pdf`) are matched through the symbol's Datasheet URL, the PDF's own text (MPN or family stem) or the file name; the rest is downloaded. The folder is `<project>/datasheets`, or the nearest parent `datasheets/` up to the git root (one shared folder for a multi-board repo). Reports unmapped parts and orphan PDFs.
-- **Structured specs, extracted by the calling agent**: `get_datasheet_extraction_task` hands over the PDF path, the text of the pages holding the tables, the part's schematic pins and nets, and the schema; `save_datasheet_extraction` validates the record and caches it in `datasheets/specs/<MPN>.json`. Every value carries its PDF page and SI unit; the server checks each number against the cited page's text and warns when it is not there. A record goes `stale` when its PDF changes. `get_datasheet_specs` returns one record or the coverage. No value is taken from general knowledge.
+- **Structured specs, extracted by the calling agent**: `get_datasheet_extraction_task` hands over the PDF path, the text of the pages holding the tables, the part's schematic pins and nets, and the schema; `save_datasheet_extraction` validates the record and caches it in `datasheets/specs/<MPN>.json`. Every value carries its PDF page and SI unit; the server checks each number against the cited page's text and warns when it is not there. A record goes `stale` when its PDF changes. `get_datasheet_specs` returns one record or the coverage. No value is taken from general knowledge. Graphs go in `curves` (points read off the plot, with page; e.g. a capacitor's `C_bias`, capacitance vs DC bias). The schema names the keys the analyzers read: capacitor `C`, `ESR`, `ESL`, rated `V`, `C_bias`; inductor `L`, `DCR`, `Isat`, `Irms*`; common-mode choke `Z_cm`, `DCR`, `I_rated`; LED `VF`, `IF`; constant-current regulator `I_reg`, `V_min`; connector `I_rated` (per contact) / `I_rated_total` (a rail's contacts together); `thermal.rth_ja` / `tj_max`; op-amp `GBW`; crystal `CL`.
 - **BOM enrichment**: `enrich_bom_with_sourcing` queries the chosen sources per unique value and appends MPN / stock / price / URL columns (JLCPCB adds `jlc_lcsc`, `jlc_type`)
 - API keys never reach the log: request URLs are not logged and key-like query values are redacted.
 
@@ -201,7 +201,9 @@ section, exposed under its own name. Drop it if you only run one.
 Both tools export the whole hierarchy with `kicad-cli sch export netlist`, so the connectivity is exactly KiCAD's. They are pin-name and pin-type heuristics: every finding says what it saw, and should be confirmed against the schematic and datasheet.
 
 - **`analyze_power_tree`** — finds each regulator (one record per channel on multi-channel parts), its topology, input and output rail, EN state (tied to input, divider, driven by another part's pin = sequencing, floating …), power-good pull-up, feedback divider (values, ratio), SET resistor, switch-node inductor and input / output capacitors. Builds the rail tree through series L / ferrite / 0 Ω links (DNP marked). Computes each Vout from the datasheet specs — FB divider with the right-polarity Vref, ANY-OUT pin strapping, or SET current × R — or from a caller `vref`, and carries rail voltages through the links. With those voltages it checks VIN against absolute maximum and recommended range, VOUT range, LDO headroom against dropout, and the EN pin voltage (divider / pull-up, power-good released) against the EN rating and turn-on threshold. Unregulated inputs (a USB-PD contract) come from `rail_voltages={"/VBUS": 20}`.
-- **`review_connectivity`** — checks (all on by default, choose with `checks=`): IC power pins and how each rail is sourced; decoupling per IC supply net; open-drain outputs without pull-up; I2C buses (pull-ups, address strapping, fixed datasheet addresses); symbol pins against the datasheet pin table; every pin and pin pair (VDS, VGS, TVS standoff) against its absolute maximum at the net's voltage; capacitor DC voltage against its `Voltage` field (`cap_derating`, default 0.8).
+- **`review_connectivity`** — checks (all on by default, choose with `checks=`): IC power pins and how each rail is sourced; decoupling per IC supply net; open-drain outputs without pull-up; I2C buses (pull-ups, address strapping, fixed datasheet addresses); symbol pins against the datasheet pin table; every pin and pin pair (VDS, VGS, TVS standoff) against its absolute maximum at the net's voltage; capacitor DC voltage against its rating — the fitted MPN's extracted datasheet when there is one, else the `Voltage` field (`cap_derating`, default 0.8).
+- **`review_part_ratings`** — parts against their datasheet ratings with a per-rail current model. `loads={"+5VD": 0.5}` (amps per rail) is carried up the power tree: series links unchanged, linear regulators Iin = Iout, switchers by power with `efficiency` per regulator (others use `default_efficiency`, reported as assumed), and from each root rail through the series path (inductors, common-mode choke winding, ≤ 1 Ω resistors, FET dies, series diodes) to the connector that brings power in. Buck inductor ripple from L, `fsw` (caller or datasheet), Vin, Vout; other topologies average only. Junction temperature Ta + rth_ja·P (`ambient_c`, default 40 °C, stated as assumed) for regulators (channels of one IC summed), FETs (I²·RDS(on) per die), series diodes and LED current regulators; rth_ja is the datasheet's test board. LED strings: current from the series R and VF, or a CCR's `I_reg` and its headroom.
+- **`review_circuits`** — circuit detectors in four groups (`groups=`): **power** — USB Type-C CC termination (Rd 5.1 k per CC pin, Rp value vs its rail, controller pin, CC1 + CC2 on one resistor), D+ / D- of both plug orientations joined, clamps on connector supply nets, ground pins on power connectors, ESD clamps on external connector signal nets (`internal_connectors` excludes board-to-board and test connectors), enable loops and self-enable, reset nets, FB divider impedance and FB bias-current error; **analog** — op-amp inputs with no DC path, input coupling high-pass corner vs `audio_f_low_hz`, output coupling caps to a connector without a bleed resistor, unused op-amp channels, converter reference / VCOM caps, analog supply decoupling, split converter grounds with no join, ADC inputs without RC, jacks driven straight from an output, level shifters; **digital** — inputs with nothing driving them (pins the datasheet lets float — ANY-OUT, "may be left open" — are skipped; a symbol input the datasheet calls an output is `DG-PINTYPE`), boot / mode straps, I2C pull-ups stronger than the 3 mA sink, SPI chip selects shared or without pull-up, driver vs receiver supply voltage, branched clocks without a series resistor, USB data ESD, SWD pins brought out; **misc** — LEDs without a current limit, LED-driver set pins, display charge-pump / VCOMH caps, RTC backup pin, buttons without pull-up, switch matrices without diodes.
 
 | Rule | Severity | Meaning |
 |---|---|---|
@@ -224,9 +226,25 @@ Both tools export the whole hierarchy with `kicad-cli sch export netlist`, so th
 | `CR-I2C-ADDR`, `CR-I2C-UNRES` | error, info | Two devices at one address (same part and strapping, or same datasheet address) / address unknown |
 | `CR-PIN-MISSING`, `CR-PIN-EXTRA`, `CR-PIN-NAME`, `CR-PIN-NC` | warning | Symbol pins vs the datasheet pin table; a leave-unconnected pin that shares a net |
 | `CR-PIN-ABS` / `CR-PIN-REC` | error / warning | A pin or pin pair outside its absolute maximum / recommended limit |
-| `CR-CAP-V` / `CR-CAP-DERATE` | error / warning | Capacitor DC voltage above its rating / above the derating fraction |
+| `CR-CAP-V` / `CR-CAP-DERATE`, `CR-CAP-FIELD` | error / warning | Capacitor DC voltage above its rating / above the derating fraction; `Voltage` field differs from the MPN's datasheet |
+| `RT-L-ISAT`, `RT-L-IRMS` | error (warning above 80 % Isat), warning | Inductor peak current vs Isat, average vs the lowest Irms |
+| `RT-CMC-I`, `RT-CONN-I` | error | Common-mode choke current vs I_rated; connector current per contact / per rail group |
+| `RT-REG-IOUT`, `RT-REG-ILIM` | warning / error | Regulator output vs recommended IOUT / current limit; buck inductor peak vs the switch limit |
+| `RT-TJ` | error / warning | Junction temperature above Tj max / within `tj_margin_c` of it |
+| `RT-FET-ID`, `RT-D-IF`, `RT-LED` | error / warning | FET / series diode / LED current vs rating; CCR without headroom; LED with no limit |
+| `RT-MODEL`, `RT-NODATA` | info | Regulator voltages unknown (current not carried up) / a part carries current but has no extracted rating |
+| `PW-USBC-CC`, `PW-USBC-DATA` | error / warning | Type-C CC termination; D+ / D- of the two orientations not joined |
+| `PW-VBUS-TVS`, `PW-CONN-GND`, `PW-ESD` | warning, info | Supply entry without clamp / without a ground pin; external signal nets without ESD clamp |
+| `PW-SEQ-LOOP`, `PW-SEQ-SELF`, `PW-RESET` | error, warning / info | Enable loop / regulator enabled by a part it powers; reset net pull-up and filter cap |
+| `PW-FB-IB`, `PW-FB-Z` | warning, info | FB bias current × R_top above 0.5 % of Vout; divider impedance above `fb_z_max_ohm` |
+| `AU-BIAS`, `AU-HPF`, `AU-BLEED`, `AU-UNUSED` | error, warning | Op-amp input without DC path; coupling high-pass in the audio band; no bleed resistor; unused channel floating |
+| `AD-VREF`, `AD-SUPPLY`, `AD-GND`, `AD-AAF` | warning, info | Converter reference / analog supply without cap; split grounds not joined; inputs without RC |
+| `HP-JACK`, `LS-SAME`, `LS-OE` | warning, info | Jack driven directly from an output; level shifter on one rail / OE not driven |
+| `DG-FLOAT`, `DG-PINTYPE`, `DG-BOOT` | error / warning, info | Input with no driver or unconnected; symbol pin type vs datasheet; boot strap without resistor |
+| `DG-I2C-RPU`, `DG-SPI-CS`, `DG-LEVEL`, `DG-CLK-TERM`, `DG-USB-ESD`, `DG-SWD` | error / warning / info | I2C pull-up too strong; SPI CS shared / no pull-up; supply mismatch driver → receiver; clock fan-out without series R; USB data without ESD; debug pins not reachable |
+| `LE-NORES`, `LE-ISET`, `DS-CAP`, `RTC-VBAT`, `KB-PULL`, `KB-GHOST` | warning / error / info | LED without limit; LED driver set pin open; display pump caps missing; RTC backup pin; button without pull-up; key matrix without diodes |
 
-Parts of the rule vocabulary (pin-name sets, non-regulator exclusions) follow kicad-happy (MIT, Copyright (c) 2025 Andrew Klofas).
+Parts of the rule vocabulary (pin-name sets, non-regulator exclusions) and the scope of the circuit detectors follow kicad-happy (MIT, Copyright (c) 2025 Andrew Klofas).
 
 ### Manufacturing outputs
 
@@ -246,10 +264,72 @@ Parts of the rule vocabulary (pin-name sets, non-regulator exclusions) follow ki
 - **Return path continuity** — `check_return_path_continuity` checks each signal segment against the filled ground on the adjacent layer(s), skipping pad / via ends and power nets
 - **EMC sanity checks** — `analyze_ground_coverage` (filled zone area on board outlines with rounded corners), `find_long_traces` (antenna detection), `validate_decoupling_caps` (cap placement distance)
 
+### EMC pre-compliance review (`analyze_emc`)
+
+Runs on the board's real filled copper: every zone's filled polygons are rasterised onto one grid (`resolution_mm`, default 0.5; even-odd fill, so fractured polygons with holes are exact) and all checks query it. Refill zones before running. Regulators, rail voltages and part data come from the schematic netlist, `analyze_power_tree` and the datasheet spec cache. It is a first-pass estimator for pre-compliance, not a sign-off.
+
+- **`ground`** — each layer's role from its fill (a layer is a ground plane at ≥ 50 % ground fill, ≥ 80 % if it also carries signals — an inner GND layer is never mistaken for a signal layer), adjacent reference plane for every routed layer with the dielectric thickness, floating ground islands, every ground net and the parts that join them, signals crossing a change of reference-plane net without a bridging capacitor, ground-via stitching against λ/20 at `f_max_hz`, ground copper along the board edge, connector ground pins.
+- **`switching`** — per switching regulator: switch-node copper area, the input hot loop through the real pad positions, the trapezoidal harmonic envelope, and a differential-mode radiation estimate (Ott, E = K·f²·A·I/r) against `standard` (`fcc-class-b`, `fcc-class-a`, `cispr-class-b`, `cispr-class-a`); switching inductors near the edge or a connector. Duty cycle from the rail voltages (buck only when the switch-node inductor lands on the output). The switching frequency is taken from `fsw={"U1": 500e3, "U2/ch1": 1.8e6}` only — it depends on RT/SYNC, so the datasheet value is shown as a hint, never used. Load current from `iout=`, else the datasheet IOUT max (worst case, said so).
+- **`decoupling`** — every IC supply pin (power_in, from the netlist) to its nearest capacitor on the same net, each cap's ground pad to the nearest ground via, and per-rail capacitor banks against `pdn={"+3V3": 0.05}` or `{"ripple": 0.03, "i_step": 0.5}`. ESL / ESR only from extracted capacitor datasheets — never a generic per-package value.
+- **`io`** — every connector line: TVS / ESD diode present and its distance to the pin, series filtering on signal lines; signal tracks near the edge; clocks near connectors; crystal-to-IC distance; diff-pair skew, layer changes and reference-plane continuity; clock / high-speed tracks closer than 3H to another net; connector aperture slot resonance (c / 2L, L from the connector's pad extent) against the known switching harmonics, and the shielding the radiation estimates leave to an enclosure.
+- **`thermal`** — class-II MLCCs biased at ≥ 50 % of their `Voltage` rating (the capacitance loss only from an extracted datasheet, never a generic derating table) and ferrites within 10 mm of a switching regulator.
+- **Test plan** — always returned: the tests to run for the standard, each switcher's harmonics in the conducted (150 kHz – 30 MHz) and radiated bands, near-field probe points (switch nodes, connectors), and the top risks.
+
+| Rule | Severity | Meaning |
+|---|---|---|
+| `EM-GND-NONE` | error | No filled ground copper on any layer |
+| `EM-ZONES-UNFILLED` | warning | Zones without fill in the file (refill and re-run) |
+| `EM-STACK-REF` | warning | A routed layer has no adjacent plane |
+| `EM-GND-ISLAND` | warning | Ground copper island with no via or pad |
+| `EM-GND-DOMAINS` | info | Ground nets and the parts joining them |
+| `EM-SPLIT-CROSS` | warning | Signal crosses a change of reference-plane net, no bridging cap within 5 mm |
+| `EM-STITCH` | warning | < 90 % of the overlapping ground area within λ/40 of a ground via |
+| `EM-EDGE-GND` | warning / info | Ground copper covers < 70 % / < 90 % of the board edge |
+| `EM-CONN-GND` | warning / info | Connector with fewer than max(2, signals/4) ground pins (warning for high-speed) |
+| `EM-SW-AREA` | warning / info | Switch-node copper > 100 / ≥ 25 mm² |
+| `EM-SW-CIN` | warning | Nearest input cap > 5 mm from the VIN pin |
+| `EM-SW-RAD` | warning / info | Radiation estimate margin < 6 dB / margin, or why it was skipped |
+| `EM-SW-FSW`, `EM-SW-NONET` | info | No switching frequency given / no netlist |
+| `EM-SW-L-EDGE`, `EM-SW-L-CONN` | warning | Switching inductor < 3 mm from the edge / < 5 mm from a connector |
+| `EM-DEC-DIST`, `EM-DEC-NONE` | warning | Supply pin's nearest cap beyond `decap_max_mm` / no cap on that net |
+| `EM-DEC-VIA` | info | Cap ground pad farther than `cap_via_max_mm` from a ground via |
+| `EM-PDN` | info | Rail bank vs target impedance (capacitive asymptote; ESL coverage stated) |
+| `EM-IO-ESD`, `EM-IO-ESD-DIST` | warning (info on power lines) | Connector line without TVS / ESD diode / protection farther than `esd_max_mm` |
+| `EM-IO-FILTER` | info | Signal line leaves the board with no series R / ferrite / inductor |
+| `EM-EDGE-TRACE` | warning / info | Signal track within `edge_keepout_mm` of the edge (warning for clock / high-speed) |
+| `EM-CLK-CONN` | warning | Clock passes < 10 mm from a connector |
+| `EM-XTAL-DIST` | warning | Crystal > 10 mm from the IC it drives |
+| `EM-DIFF-SKEW`, `EM-DIFF-REF` | warning | Pair skew > `diff_skew_ps` / reference plane changes net or has gaps under the pair |
+| `EM-DIFF-LAYERS` | info | Pair routed on more than one layer |
+| `EM-3H` | warning | Clock / high-speed track parallel to another net closer than 3H |
+| `EM-SHIELD-SLOT`, `EM-SHIELD-SE` | warning, info | Connector aperture resonance near a known harmonic / shielding needed for 6 dB margin |
+| `EM-TH-BIAS`, `EM-TH-FERRITE` | info | Class-II MLCC at ≥ 50 % of rating / ferrite < 10 mm from a switcher |
+
 ### Simulation
 
 - **SPICE** — `export_spice_netlist` + `run_ngspice_simulation` (transient / DC / AC / noise)
 - *Note: requires symbols with `Spice_*` fields and `ngspice` installed (`brew install ngspice`)*
+- **Automatic subcircuit checks** — `simulate_subcircuits` finds the passive networks in the schematic itself (no `Spice_*` fields needed) and checks them against the design intent:
+  - `divider` — resistor dividers into an active pin: ratio, tapped voltage, worst case from each resistor's `Tolerance` field; for a regulator FB divider, Vout typ and worst case from the datasheet Vref min / max in the spec cache, plus Monte Carlo (`monte_carlo=N`);
+  - `rc` — RC low-pass nodes feeding an active input (not supply rails): corner frequency with the node's Thevenin resistance;
+  - `lc` — LC / ferrite / π ladders (series L between nodes with capacitors to ground; converter switch nodes excluded), with R–C damping branches, run as an ngspice AC sweep from the ladder's source end to its far end: resonance peaks and attenuation at `freqs` and at the 1st–3rd harmonic of each `fsw`; Monte Carlo over L / C tolerances; optional `loads={net: Ω}` and `source_ohm`.
+
+  - `opamp` — op-amp stages from pin names (`+IN` / `IN+` / `1IN-` / `-INA` / `OUTA` …): follower, non-inverting or inverting, gain and noise gain from the feedback network, feedback-capacitor pole, and the closed-loop bandwidth GBW / noise gain when the spec cache has the op-amp's `GBW`. With a vendor model — `opamp_models={"U1": {"lib": "OPA1612.lib", "subckt": "OPA1612", "pins": ["+IN", "-IN", "V+", "V-", "OUT"]}}` (roles in `.subckt` node order, else read from the node names) or the symbol's KiCAD `Sim.Library` / `Sim.Name` / `Sim.Pins` fields — each stage is simulated with ngspice AC on its real feedback network and supplies (rail voltages or `supplies=`): gain, −3 dB frequency, peaking; without one the amplifier is ideal and the result says so;
+  - `crystal` — a crystal with a load cap on each pin: effective load C1·C2/(C1+C2) + `c_stray_pf` (no stray value is assumed) against the crystal's `CL` from the spec cache (warning beyond ±10 %).
+
+  Inductor DCR, capacitor ESR / ESL and L / C tolerances come from the datasheet spec cache when a part has them (a `Tolerance` field wins), and a capacitor with a `C_bias` curve is derated at its rail's DC voltage (`dc_bias_ratio` in the result); `pcb_parasitics=True` adds each ladder capacitor's mounting inductance: the ground-via barrel from its layer to the first ground plane (L = 0.2·h·(ln(4h/d) + 1) nH) plus the pad-to-via connection as a strip over the plane (track width, or the pad width for a pour; inductance per length from Hammerstad's microstrip Z0). Otherwise parts are ideal — with an open load the peaking is an upper bound and is reported as info. Rules: `SP-DIV-VOUT`, `SP-TOL` (no Tolerance field), `SP-LC-PEAK` (peaking above `peaking_warn_db`, warning only with loads given), `SP-LC-ATT`, `SP-OPAMP`, `SP-XTAL-CL`, `SP-NOSIM` (no ngspice).
+
+### Release: Gerbers, diff, what-if, lifecycle, BOM, gate
+
+- **`analyze_gerbers`** — reads the exported Gerber (RS-274X / X2) and Excellon folder as the fab will: per file the function, polarity, apertures, draws / flashes / regions and extent; per drill file the tool table with hits. Cross-checks the `.gbrjob`: files listed but missing (`GB-MISSING-FILE`, error only for fabrication layers), copper layer count (`GB-LAYERS`), outline extent vs board size (`GB-SIZE`); missing outline / drill (`GB-NO-OUTLINE`, `GB-NO-DRILL`), holes outside the outline (`GB-DRILL-OUTSIDE`), Gerbers older than the board file (`GB-STALE`), and with `preset` the narrowest conductor draw and smallest drill against the fab minimum (`GB-MIN-TRACE`, `GB-MIN-DRILL`).
+- **`diff_designs`** — two revisions of the active project (`git:<ref>`, a folder, or the working tree; git refs go to a temporary folder, read-only). Schematic, from KiCAD's netlists: parts added / removed, Value / Footprint / lib / DNP / field changes, net renames, pins moved to another net, nets added / removed. PCB: footprints added / removed / moved / rotated / flipped / re-footprinted, routing changes per net (length, segments), vias, zones per net and layer, board size.
+- **`what_if`** — `changes={"R7": "120k", "C42": {"dnp": true}}` re-runs `analyze_power_tree`, `review_connectivity`, the divider / RC checks, (with ngspice) the LC / π ladders and (with `emc=True`) the netlist-driven `analyze_emc` groups on the unchanged copper, on a changed copy of the netlist (no file touched): regulator Vout and enable changes, rail voltages, divider outputs, RC corners, filter peaking and attenuation at the `fsw` harmonics, switcher radiation margins, and the findings that appear or disappear.
+- **`audit_lifecycle`** — every schematic MPN at DigiKey / Mouser / element14-Farnell (exact match; `jlcpcb` adds JLC stock): lifecycle (DigiKey `ProductStatus` + Discontinued / EndOfLife, Mouser `LifecycleStatus` + `SuggestedReplacement`, Farnell `productStatus`) and stock. `LC-EOL` (error; includes Farnell `NO_LONGER_MANUFACTURED`), `LC-NRND`, `LC-RESTRICTED`, `LC-STOCK` (warnings), `LC-SINGLE`, `LC-NOTFOUND`, `LC-DIST-DROP` (info: a distributor stopped stocking it, `NO_LONGER_STOCKED`).
+- **`review_assembly`** — real (also non-convex) courtyard outlines that overlap (`AS-CRTYD-OVERLAP`; touching is fine) or sit closer than `min_spacing_mm` (`AS-CRTYD-SPACING`), courtyards beyond or near the board edge (`AS-EDGE`, info for connectors), no courtyard (`AS-NO-CRTYD`), SMD parts on a side the assembler will not populate (`assembly_sides`, `AS-SIDE` error), through-hole parts (`AS-THT`), fiducials per populated side (`AS-FIDUCIAL`), polarized parts with no silkscreen of their own (`AS-SILK-POLARITY`) or no asymmetric mark at pad 1 — a silk point near pad 1 whose point reflection through the pads' centre has no counterpart: pin-1 dot, cathode bar, chamfer (`AS-PIN1-MARK`); part heights from each footprint's 3D STEP model (offset / scale / rotation applied; `KICAD{N}_3DMODEL_DIR` resolved): tall parts near the edge (`AS-TALL-EDGE`), parts above `max_height_top_mm` / `max_height_bottom_mm` (`AS-HEIGHT`, enclosure clearance), model paths that do not resolve (`AS-3D-MISSING`), no model (`AS-3D-NONE`) — heights are the model's, not the fitted part's datasheet; and schematic ↔ PCB cross-verify: parts on one side only (`XV-MISSING` / `XV-EXTRA`), symbol pins without a pad of that number (`XV-PADS`, error), Value / Footprint / MPN differing between schematic and board (`XV-FIELD`).
+- **`diff_bom`** — the BOM of two revisions (`git:<ref>`, a folder, or the working tree): designators added / removed, Value / Footprint / MPN / Manufacturer / LCSC / distributor numbers / DNP / exclude-from-BOM changes (`extra_fields` for more), quantity changes per BOM line (MPN, or value + footprint), MPNs new or gone.
+- **`export_fab_bom`** — assembly BOM + CPL in the fab's columns: `jlcpcb` (`Comment, Designator, Footprint, LCSC Part #`; `FB-NO-LCSC`) or `pcbway` (`Item #, Designator, Qty, Manufacturer, Mfg Part #, Description / Value, Package/Footprint, Type, Your Instructions / Notes`; `FB-NO-MPN`, `FB-NO-MFR`), CPL `Designator, Mid X, Mid Y, Layer, Rotation` from `kicad-cli pcb export pos`. DNP, excluded-from-BOM, test points, holes, fiducials and `exclude_refs` (consigned parts) are left out. Rotation offsets: `rotation_offsets={"^SOT-23": 180}` (footprint regex) or a `JLCPCB Rotation Offset` / `Rotation Offset` symbol field — no fab table is assumed.
+- **`update_symbol_fields`** — set fields on many symbols across the whole sheet hierarchy from `updates={"R7": {"MPN": "...", "Manufacturer": "..."}}` and / or a CSV (Reference / Designator column, one column per field). Dry run first (old → new list); `dry_run=False` writes each changed sheet through the guarded writer, every unit of a multi-unit symbol. Reused sheets are reported (a field is shared by every instance); `Reference` is refused.
+- **`fab_release_gate`** — one verdict, `FAB-READY` or `NOT FAB-READY`, with blockers and warnings: ERC errors; DRC errors, unconnected items and schematic parity (run without refilling or saving); errors from the power tree and connectivity reviews; the Gerber folder (errors, stale Gerbers, preset minimums); MPN coverage (blocking only with `require_mpn`); assembly and cross-verify errors; optionally the lifecycle audit (`LC-EOL` blocks). Read-only.
 
 ### Multi-board projects
 
@@ -307,7 +387,9 @@ kicad-claude-mcp/
 │   ├── state.py                       # active project / sheet / board
 │   ├── tools/                         # MCP tools, thin wrappers over adapters
 │   │   ├── project.py                 # create_project, set_project, list_components, clear_stale_lock
-│   │   ├── review.py                  # analyze_power_tree, review_connectivity
+│   │   ├── review.py                  # analyze_power_tree, review_connectivity, review_circuits, review_part_ratings
+│   │   ├── bom.py                     # diff_bom, export_fab_bom, update_symbol_fields
+│   │   ├── release.py                 # analyze_gerbers, diff_designs, what_if, audit_lifecycle, review_assembly, fab_release_gate
 │   │   ├── datasheets.py              # sync_datasheets, extraction task / save / specs
 │   │   ├── library.py                 # index_libraries, search_*, get_symbol_details
 │   │   ├── schematic.py               # add_symbol, wires, hierarchical sheets, buses
@@ -322,9 +404,9 @@ kicad-claude-mcp/
 │   │   ├── signal_integrity.py        # impedance calculators
 │   │   ├── thermal.py                 # IPC-2152 current capacity
 │   │   ├── rf.py                      # via arrays, ground stitching, RF microstrip
-│   │   ├── emc.py                     # heuristic EMC checks
+│   │   ├── emc.py                     # EMC heuristics + analyze_emc
 │   │   ├── simulation.py              # thermal network, crosstalk, return path
-│   │   ├── spice.py                   # ngspice batch wrapper
+│   │   ├── spice.py                   # ngspice wrapper + simulate_subcircuits
 │   │   └── panelization.py            # grid panelize + mouse bites
 │   ├── adapters/                      # logic detached from MCP framing
 │   │   ├── sch_io.py                  # parse + write
@@ -339,6 +421,14 @@ kicad-claude-mcp/
 │   │   ├── freerouting.py             # JAR runner with timeout + log parser
 │   │   ├── power_review.py            # regulators, rails, Vout, datasheet limit checks
 │   │   ├── connectivity_review.py     # power pins, pull-ups, I2C, pinout, abs max, caps
+│   │   ├── circuit_review.py          # power / analog / digital / misc circuit detectors
+│   │   ├── part_ratings.py            # per-rail current model, ratings, Tj, LED strings
+│   │   ├── bom_tools.py               # BOM diff, JLCPCB / PCBWay BOM + CPL, field write-back
+│   │   ├── emc_review.py              # EMC review on rasterised copper + test plan
+│   │   ├── spice_auto.py              # divider / RC / LC-pi detection, ngspice AC, Monte Carlo
+│   │   ├── gerber_review.py           # Gerber / Excellon / gbrjob analysis
+│   │   ├── design_diff.py             # schematic + PCB diff, git snapshots
+│   │   ├── assembly_review.py         # courtyards, sides, fiducials, schematic <-> PCB cross-verify
 │   │   ├── datasheet_index.py         # manifest, PDF text, MPN <-> PDF matching
 │   │   ├── datasheet_specs.py         # spec schema, validation, cache
 │   │   ├── datasheet_fetch.py         # PDF download with fallback
@@ -356,7 +446,7 @@ kicad-claude-mcp/
 │   ├── indexer/                       # KiCAD library indexing (~10 MB cache)
 │   ├── templates/                     # blank project / sheet / PCB
 │   └── utils/                         # logging, geometry (mm, grid snap), paths
-├── tests/                             # 565 fast + 50 acceptance + 6 network tests
+├── tests/                             # 618 fast + 50 acceptance + 6 network tests
 └── docs/open_points.md                # the open-items queue
 ```
 
@@ -381,7 +471,7 @@ Open work and new field reports live in [`docs/open_points.md`](./docs/open_poin
 
 ```bash
 uv run mcp dev server.py                          # MCP Inspector (browser UI)
-uv run pytest -m "not slow and not network" -q    # 565 fast tests, ~1 min
+uv run pytest -m "not slow and not network" -q    # 618 fast tests, ~1 min
 uv run pytest -m "slow" -q                        # 50 acceptance tests via kicad-cli (~8 min)
 uv run pytest -m "network" -q                     # 6 live distributor tests
 ```

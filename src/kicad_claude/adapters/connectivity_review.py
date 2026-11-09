@@ -578,11 +578,14 @@ def _rating(comp: dict, field: str) -> float | None:
 
 
 def check_cap_voltage(nl: Netlist, findings: list, volts: dict, derating: float = 0.8,
-                      field: str = "Voltage") -> dict:
+                      field: str = "Voltage", specs: dict | None = None) -> dict:
     """DC voltage across each fitted capacitor (rails, dividers) against its
-    rating from the symbol `field`. Error above the rating, warning above
-    `derating` x rating. The rating is the schematic's field, not the
-    datasheet of the fitted MPN."""
+    rating: the fitted MPN's extracted datasheet (`absolute_max.V`) when
+    there is one, else the symbol `field`. Error above the rating, warning
+    above `derating` x rating; a field that disagrees with the datasheet is
+    CR-CAP-FIELD."""
+    from kicad_claude.adapters import datasheet_specs as dss
+    specs = specs or {}
     from kicad_claude.adapters.power_review import _net_voltage
 
     rows, unknown, no_rating = [], [], []
@@ -593,6 +596,15 @@ def check_cap_voltage(nl: Netlist, findings: list, volts: dict, derating: float 
         if len(pins) != 2:
             continue
         rating = _rating(comp, field)
+        src = f"{field} field"
+        ds = dss.rated(specs.get(ref), "absolute_max", "V", "V_rated") or             dss.rated(specs.get(ref), "electrical", "V_rated")
+        if ds:
+            mpn = specs[ref].get("mpn")
+            if rating is not None and abs(rating - ds[0]) > 1e-6:
+                findings.append(_f("warning", "CR-CAP-FIELD", ref,
+                                   f"{field} field says {rating:g} V but {mpn} is rated "
+                                   f"{ds[0]:g} V (datasheet p.{ds[1]}); the datasheet is used."))
+            rating, src = ds[0], f"{mpn} datasheet p.{ds[1]}"
         if rating is None:
             no_rating.append(ref)
             continue
@@ -602,16 +614,16 @@ def check_cap_voltage(nl: Netlist, findings: list, volts: dict, derating: float 
             continue
         v = abs(va - vb)
         use = v / rating
-        row = {"ref": ref, "value": comp["value"], "rating": rating, "volts": round(v, 3),
-               "use": round(use, 3), "nets": [pins[0].net, pins[1].net]}
+        row = {"ref": ref, "value": comp["value"], "rating": rating, "rating_source": src,
+               "volts": round(v, 3), "use": round(use, 3), "nets": [pins[0].net, pins[1].net]}
         rows.append(row)
         if use > 1:
             findings.append(_f("error", "CR-CAP-V", ref,
-                               f"{comp['value']} rated {rating:g} V ({field} field) sees "
+                               f"{comp['value']} rated {rating:g} V ({src}) sees "
                                f"{v:.4g} V ({pins[0].net} / {pins[1].net})."))
         elif use > derating:
             findings.append(_f("warning", "CR-CAP-DERATE", ref,
-                               f"{comp['value']} rated {rating:g} V at {v:.4g} V = {use:.0%} of "
+                               f"{comp['value']} rated {rating:g} V ({src}) at {v:.4g} V = {use:.0%} of "
                                f"rating (> {derating:.0%} derating). Ceramic X5R/X7R also lose "
                                "capacitance under DC bias - check the MPN's curve."))
     return {"checked": rows, "voltage_unknown": unknown, "no_rating": no_rating,
@@ -647,7 +659,8 @@ def analyze(nl: Netlist, checks: tuple[str, ...] = CHECKS, specs: dict | None = 
     if "pin_abs_max" in checks:
         result["pin_abs_max"] = check_pin_abs_max(nl, findings, specs, volts or {})
     if "cap_voltage" in checks:
-        result["cap_voltage"] = check_cap_voltage(nl, findings, volts or {}, cap_derating)
+        result["cap_voltage"] = check_cap_voltage(nl, findings, volts or {}, cap_derating,
+                                                  specs=specs)
     result["specs_used"] = sorted(f"{r}={s.get('mpn')}" for r, s in specs.items())
     order = {"error": 0, "warning": 1, "info": 2}
     findings.sort(key=lambda f: (order[f["severity"]], f["rule"], f["ref"]))

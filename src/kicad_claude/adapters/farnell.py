@@ -22,6 +22,10 @@ import httpx
 
 logger = logging.getLogger("kicad-claude.adapters.farnell")
 
+from kicad_claude.utils.logging import quiet_http  # noqa: E402
+
+quiet_http()
+
 DEFAULT_BASE = "https://api.element14.com"
 
 
@@ -142,4 +146,5 @@ def _summarize_part(p: dict) -> dict:
         "datasheet_url": _first_datasheet(p),
         "product_url": f"https://{_store()}/{sku}" if sku else "",
         "sku": sku,
+        "lifecycle": p.get("productStatus") or "",
     }

@@ -33,6 +33,18 @@ class RedactSecrets(logging.Filter):
         return True
 
 
+def quiet_http() -> None:
+    """Keep request URLs (which carry the Mouser / element14 API keys) out of
+    every log, whatever handler is installed: httpx / httpcore log at WARNING
+    and their records pass through `RedactSecrets` on the logger itself.
+    Idempotent; called at import by every sourcing adapter."""
+    for name in ("httpx", "httpcore"):
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.WARNING)
+        if not any(isinstance(f, RedactSecrets) for f in lg.filters):
+            lg.addFilter(RedactSecrets())
+
+
 def setup_logging(level: int | str | None = None) -> logging.Logger:
     """Configure root logging to stderr. Idempotent.
 
@@ -55,8 +67,7 @@ def setup_logging(level: int | str | None = None) -> logging.Logger:
         root.handlers.clear()
         root.addHandler(handler)
         root.setLevel(level)
-        for noisy in ("httpx", "httpcore"):
-            logging.getLogger(noisy).setLevel(logging.WARNING)
+        quiet_http()
         _CONFIGURED = True
     else:
         logging.getLogger().setLevel(level)

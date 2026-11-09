@@ -27,6 +27,10 @@ from kicad_claude.utils.kicad_paths import cache_dir
 
 logger = logging.getLogger("kicad-claude.adapters.digikey")
 
+from kicad_claude.utils.logging import quiet_http  # noqa: E402
+
+quiet_http()
+
 DEFAULT_BASE = "https://api.digikey.com"
 TOKEN_LEEWAY_SEC = 60  # refresh a minute before actual expiry
 
@@ -214,6 +218,9 @@ def _summarize_product(p: dict) -> dict:
         "datasheet_url": p.get("DatasheetUrl") or "",
         "product_url": p.get("ProductUrl") or "",
         "category": (classifications.get("ParentCategory") or {}).get("Name", ""),
+        "lifecycle": (p.get("ProductStatus") or {}).get("Status", ""),
+        "discontinued": bool(p.get("Discontinued")),
+        "end_of_life": bool(p.get("EndOfLife")),
         "ecad_models": [
             m.get("Url") for m in media if "ECAD" in (m.get("Title") or "").upper()
         ],

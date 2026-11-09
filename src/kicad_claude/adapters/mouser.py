@@ -16,6 +16,10 @@ import httpx
 
 logger = logging.getLogger("kicad-claude.adapters.mouser")
 
+from kicad_claude.utils.logging import quiet_http  # noqa: E402
+
+quiet_http()
+
 DEFAULT_BASE = "https://api.mouser.com/api/v2"
 
 
@@ -144,4 +148,6 @@ def _summarize_part(p: dict) -> dict:
         "datasheet_url": p.get("DataSheetUrl", "") or "",
         "product_url": p.get("ProductDetailUrl", "") or "",
         "lead_time": p.get("LeadTime", ""),
+        "lifecycle": p.get("LifecycleStatus") or "",
+        "suggested_replacement": p.get("SuggestedReplacement") or "",
     }

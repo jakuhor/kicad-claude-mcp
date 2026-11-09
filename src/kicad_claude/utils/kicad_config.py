@@ -59,7 +59,8 @@ def config_dirs() -> list[Path]:
 
 
 def _install_dir_vars() -> dict[str, str]:
-    """`KICAD{N}_SYMBOL_DIR` / `KICAD{N}_FOOTPRINT_DIR` from the installs found."""
+    """`KICAD{N}_SYMBOL_DIR` / `KICAD{N}_FOOTPRINT_DIR` / `KICAD{N}_3DMODEL_DIR`
+    from the installs found."""
     out: dict[str, str] = {}
     for leaf, dirs in (
         ("SYMBOL_DIR", _platform_default_symbol_dirs()),
@@ -72,6 +73,11 @@ def _install_dir_vars() -> dict[str, str]:
             if m:
                 out.setdefault(f"KICAD{m.group(1)}_{leaf}", str(d))
             out.setdefault(f"KICAD_{leaf}", str(d))
+            if leaf == "FOOTPRINT_DIR" and (d.parent / "3dmodels").is_dir():
+                models = str(d.parent / "3dmodels")      # share/kicad/{footprints,3dmodels}
+                if m:
+                    out.setdefault(f"KICAD{m.group(1)}_3DMODEL_DIR", models)
+                out.setdefault("KICAD_3DMODEL_DIR", models)
     return out
 
 

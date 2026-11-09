@@ -6,6 +6,8 @@ They are pragmatic checks based on common best-practice rules:
     analyze_ground_coverage  — % of each copper layer occupied by GND zones
     find_long_traces         — antenna candidates (longer = better radiator)
     validate_decoupling_caps — heuristic: any IC pad without a cap within 3 mm
+    analyze_emc              — EMC pre-compliance review on the filled copper
+                               (ground & stackup, switching converters, …)
 """
 
 from __future__ import annotations
@@ -201,3 +203,103 @@ def register(mcp) -> None:
             "ic_count": len(ics),
             "cap_count": len(caps),
         }
+
+    @mcp.tool()
+    def analyze_emc(
+        groups: str = "ground,switching,decoupling,io,thermal",
+        standard: str = "fcc-class-b",
+        fsw: dict[str, float] | None = None,
+        iout: dict[str, float] | None = None,
+        rail_voltages: dict[str, float] | None = None,
+        f_max_hz: float = 200e6,
+        stitch_spacing_mm: float = 0.0,
+        rise_time_s: float = 10e-9,
+        decap_max_mm: float = 3.0,
+        cap_via_max_mm: float = 1.5,
+        pdn: dict | None = None,
+        edge_keepout_mm: float = 1.0,
+        esd_max_mm: float = 10.0,
+        diff_skew_ps: float = 25.0,
+        resolution_mm: float = 0.5,
+        netlist_path: str = "",
+    ) -> dict:
+        """EMC pre-compliance review of the active board, on its real filled
+        copper (zones rasterised at `resolution_mm`; refill zones first).
+
+        Groups (`groups`, comma list):
+          - `ground` — layer roles from fill (an inner GND layer is a plane,
+            not a signal layer), adjacent reference plane for every routed
+            layer (EM-STACK-REF), floating ground islands (EM-GND-ISLAND),
+            ground nets and the parts joining them (EM-GND-DOMAINS), signals
+            crossing a change of reference-plane net without a bridging cap
+            (EM-SPLIT-CROSS), ground-via stitching vs λ/20 at `f_max_hz`
+            (EM-STITCH), ground at the board edge (EM-EDGE-GND), connector
+            ground pins (EM-CONN-GND);
+          - `switching` — per switching regulator (from the schematic and the
+            datasheet specs): switch-node copper area (EM-SW-AREA), input hot
+            loop through the real pads (EM-SW-CIN), harmonic envelope and a
+            differential-mode radiation estimate against `standard`
+            (`fcc-class-b|fcc-class-a|cispr-class-b|cispr-class-a`; EM-SW-RAD),
+            switching inductors near the edge or a connector;
+          - `decoupling` — every IC supply pin (power_in, from the netlist)
+            to its nearest capacitor on the same net (EM-DEC-DIST > 
+            `decap_max_mm`, EM-DEC-NONE), each cap's ground pad to the nearest
+            ground via (EM-DEC-VIA > `cap_via_max_mm`), per-rail capacitor bank
+            vs a target impedance `pdn={"+3V3": 0.05}` or
+            `pdn={"+3V3": {"ripple": 0.03, "i_step": 0.5}}` (EM-PDN; ESL / ESR
+            only from extracted cap datasheets — never assumed);
+          - `io` — every connector line: TVS / ESD diode present and its
+            distance (EM-IO-ESD, EM-IO-ESD-DIST > `esd_max_mm`), series filter
+            on signal lines (EM-IO-FILTER); signal tracks within
+            `edge_keepout_mm` of the edge (EM-EDGE-TRACE); clocks near
+            connectors (EM-CLK-CONN); crystal-to-IC distance (EM-XTAL-DIST);
+            diff-pair skew (EM-DIFF-SKEW > `diff_skew_ps`); clock / high-speed
+            tracks parallel to another net closer than 3H (EM-3H); pair layer
+            changes (EM-DIFF-LAYERS) and reference-plane continuity under a
+            pair (EM-DIFF-REF); connector aperture slot resonance (c / 2L,
+            L from the pad extent) vs the switching harmonics
+            (EM-SHIELD-SLOT) and the shielding the radiation estimates leave
+            to an enclosure (EM-SHIELD-SE);
+          - `thermal` — class-II MLCCs at >= 50 % of their `Voltage` rating
+            (EM-TH-BIAS; the capacitance loss only from an extracted datasheet,
+            never a generic table) and ferrites within 10 mm of a switching
+            regulator (EM-TH-FERRITE).
+
+        Always returns `test_plan`: tests to run for `standard`, the
+        switchers' harmonics in the conducted and radiated bands, near-field
+        probe points (switch nodes, connectors) and the top risks.
+
+        `fsw={"U1": 500e3, "U2/ch1": 1.8e6}` — switching frequencies; not
+        taken from the datasheet because it depends on RT/SYNC (the spec value
+        is shown as a hint). `iout` — load currents (default: the datasheet
+        IOUT max, worst case). `rail_voltages` — unregulated inputs, as for
+        `analyze_power_tree`. Results are first-pass estimators, not sign-off.
+        """
+        from kicad_claude.adapters import emc_review, power_review
+        from kicad_claude.tools.review import (
+            _datasheet_values,
+            _specs_by_ref,
+            project_netlist,
+        )
+
+        wanted = tuple(g.strip() for g in groups.split(",") if g.strip())
+        bad = [g for g in wanted if g not in emc_review.GROUPS]
+        if bad:
+            raise ValueError(f"unknown group(s) {bad}; valid: {list(emc_review.GROUPS)}")
+        tree = sch_io.parse_file(state.get_active_board_path())
+        power = nl = None
+        specs: dict = {}
+        if {"switching", "decoupling", "thermal"} & set(wanted):
+            nl = power_review.parse_netlist(project_netlist(netlist_path))
+            specs = _specs_by_ref(nl)
+            power = power_review.analyze(nl, datasheet=_datasheet_values(nl),
+                                         rail_voltages=rail_voltages or {})
+        result = emc_review.analyze(
+            tree, wanted, f_max_hz=f_max_hz, stitch_spacing_mm=stitch_spacing_mm or None,
+            resolution_mm=resolution_mm, power=power, nl=nl, specs=specs, fsw=fsw or {},
+            iout=iout or {}, standard=standard, rise_time_s=rise_time_s,
+            decap_max_mm=decap_max_mm, cap_via_max_mm=cap_via_max_mm, pdn=pdn or {},
+            edge_keepout_mm=edge_keepout_mm, esd_max_mm=esd_max_mm, diff_skew_ps=diff_skew_ps)
+        result["note"] = ("First-pass EMC estimator on the board file; confirm with "
+                          "measurement or a field solver before sign-off.")
+        return result

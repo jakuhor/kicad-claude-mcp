@@ -115,6 +115,8 @@ def parse_netlist(path: Path) -> Netlist:
             "lib_id": f"{_v(_c(ls, 'lib'))}:{_v(_c(ls, 'part'))}" if ls else "",
             "fields": fields,
             "dnp": "dnp" in props,
+            "in_bom": "exclude_from_bom" not in props,
+            "on_board": "exclude_from_board" not in props,
         }
     for net in (_c(tree, "nets") or [None])[1:]:
         if _h(net) != "net":

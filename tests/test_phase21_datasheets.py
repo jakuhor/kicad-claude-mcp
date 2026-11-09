@@ -532,3 +532,15 @@ def test_cap_voltage(tmp_path):
     r = cr.analyze(nl, ("cap_voltage",), volts={"+20V": (20.0, "c"), "+5V": (5.0, "c")},
                    cap_derating=0.75)
     assert ("CR-CAP-DERATE", "C1") in {(x["rule"], x["ref"]) for x in r["findings"]}
+
+
+def test_sourcing_import_quiets_http():
+    import importlib
+    import logging
+
+    logging.getLogger("httpx").setLevel(logging.INFO)
+    from kicad_claude.adapters import mouser
+    importlib.reload(mouser)
+    from kicad_claude.utils.logging import RedactSecrets
+    lg = logging.getLogger("httpx")
+    assert lg.level == logging.WARNING and any(isinstance(f, RedactSecrets) for f in lg.filters)

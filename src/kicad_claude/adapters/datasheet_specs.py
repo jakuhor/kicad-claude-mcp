@@ -24,7 +24,30 @@ Spec record (schema version 1):
                       "channels": {"1": {"vref": SV}, "2": {...}}},
      "i2c":          {"addresses": ["0x48"], "address_rule": "...", "page": 12},
      "thermal":      {"rth_ja": SV, "tj_max": SV},
+     "curves":       {"C_bias": CURVE, ...},
      "notes": ["..."]}
+
+CURVE (a graph read off the datasheet): {"x_unit": unit, "y_unit": unit,
+"points": [[x, y], ...] (>= 2, x ascending), "page": 1-based PDF page,
+"conditions": str}. `C_bias`: capacitance vs DC bias, x in "V", y in "%"
+of nominal (100 at 0 V) or in "F". Points are read from the plot, so
+they are not checked against the page text.
+
+Conventional keys the analyzers read (use these names):
+  - capacitor: electrical.C, ESR, ESL, SRF; absolute_max.V (rated
+    voltage); curves.C_bias;
+  - inductor / ferrite: electrical.L, DCR, Isat, Irms (or Irms_<n>C, the
+    lowest-rise one is used), SRF; ferrite Z_100MHz;
+  - common_mode_choke: electrical.Z_cm (at a stated frequency), DCR,
+    I_rated; absolute_max.V;
+  - led: electrical.VF (at the IF in conditions), absolute_max.IF;
+  - current_regulator (CCR): electrical.I_reg, V_min (anode-cathode
+    voltage needed to regulate); absolute_max.V;
+  - connector: electrical.I_rated (per contact) and / or I_rated_total
+    (collective for the contacts of one rail, e.g. USB-C VBUS pins),
+    absolute_max.V;
+  - every part with a die: thermal.rth_ja, thermal.tj_max;
+  - opamp: electrical.GBW, SR; crystal: electrical.CL, ESR.
 
 SV (spec value): {"min", "typ", "max": number|null (at least one), "unit":
 SI base unit from UNITS, "page": 1-based PDF page, "conditions": str,
@@ -181,7 +204,7 @@ def validate(rec: dict, pages: list[str]) -> tuple[list[str], list[str]]:
     if not isinstance(rec, dict):
         return ["extraction must be a JSON object"], []
     allowed = {"mpn", "category", "description", "pins", *SV_GROUPS, "regulator",
-               "i2c", "thermal", "notes"}
+               "i2c", "thermal", "curves", "notes"}
     extra = set(rec) - allowed - {"schema_version", "pdf", "extracted", "extracted_by"}
     if extra:
         errors.append(f"unknown top-level keys {sorted(extra)}; allowed {sorted(allowed)}")
@@ -231,6 +254,33 @@ def validate(rec: dict, pages: list[str]) -> tuple[list[str], list[str]]:
             for a in i2c.get("addresses", []):
                 if not re.fullmatch(r"0x[0-7][0-9A-Fa-f]", str(a)):
                     errors.append(f"i2c.addresses: {a!r} is not a 7-bit hex address (0x00-0x7F)")
+    curves = rec.get("curves", {})
+    if not isinstance(curves, dict):
+        errors.append("curves: object of name -> CURVE")
+        curves = {}
+    for name, cv in curves.items():
+        p = f"curves.{name}"
+        if not isinstance(cv, dict):
+            errors.append(f"{p}: expected {{x_unit, y_unit, points, page, conditions}}")
+            continue
+        extra = set(cv) - {"x_unit", "y_unit", "points", "page", "conditions"}
+        if extra:
+            errors.append(f"{p}: unknown keys {sorted(extra)}")
+        for k in ("x_unit", "y_unit"):
+            if cv.get(k) not in UNITS:
+                errors.append(f"{p}.{k}: {cv.get(k)!r} is not a unit from {sorted(UNITS)}")
+        pts = cv.get("points")
+        if (not isinstance(pts, list) or len(pts) < 2 or any(
+                not isinstance(q, list) or len(q) != 2
+                or not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in q)
+                for q in pts)):
+            errors.append(f"{p}.points: list of >= 2 [x, y] number pairs")
+        elif [q[0] for q in pts] != sorted(q[0] for q in pts):
+            errors.append(f"{p}.points: x must be ascending")
+        page = cv.get("page")
+        if not isinstance(page, int) or isinstance(page, bool) or (
+                pages and not 1 <= page <= len(pages)):
+            errors.append(f"{p}.page: required, 1-based integer within the PDF")
     notes = rec.get("notes", [])
     if not isinstance(notes, list) or any(not isinstance(n, str) for n in notes):
         errors.append("notes: list of strings")
@@ -271,4 +321,49 @@ def value(sv: dict | None, prefer: str = "typ") -> float | None:
     for k in (prefer, "typ", "min", "max"):
         if sv.get(k) is not None:
             return float(sv[k])
+    return None
+
+
+def curve_at(cv: dict, x: float) -> float:
+    """Linear interpolation of a CURVE at x (clamped to its ends)."""
+    pts = cv["points"]
+    if x <= pts[0][0]:
+        return float(pts[0][1])
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if x <= x1:
+            return float(y0 + (y1 - y0) * (x - x0) / (x1 - x0)) if x1 != x0 else float(y1)
+    return float(pts[-1][1])
+
+
+def c_bias_ratio(rec: dict | None, volts: float, nominal_f: float | None = None) -> float | None:
+    """Remaining fraction of nominal capacitance at `volts` DC bias from the
+    record's `curves.C_bias`, or None without a curve. A curve in F needs
+    the nominal value."""
+    cv = ((rec or {}).get("curves") or {}).get("C_bias")
+    if not cv:
+        return None
+    y = curve_at(cv, abs(volts))
+    if cv.get("y_unit") == "%":
+        return y / 100.0
+    if cv.get("y_unit") == "F" and nominal_f:
+        return y / nominal_f
+    return None
+
+
+def rated(rec: dict | None, group: str, *keys: str, prefer: str = "max") -> tuple | None:
+    """(|value|, page, key) of the first present key in `group` (magnitude:
+    a P-channel FET's ID -6 A is a 6 A rating); for `Irms` the lowest of
+    the Irms* keys (smallest temperature rise)."""
+    grp = (rec or {}).get(group) or {}
+    for k in keys:
+        if k == "Irms":
+            cands = [(abs(value(sv, "typ")), sv.get("page"), name) for name, sv in grp.items()
+                     if name.lower().startswith("irms") and value(sv, "typ") is not None]
+            if cands:
+                return min(cands)
+            continue
+        sv = grp.get(k)
+        v = value(sv, prefer)
+        if v is not None:
+            return abs(v), sv.get("page"), k
     return None

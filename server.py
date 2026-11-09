@@ -51,6 +51,8 @@ from kicad_claude.tools.pcb import register as register_pcb_tools  # noqa: E402
 from kicad_claude.tools.project import register as register_project_tools  # noqa: E402
 from kicad_claude.tools.review import register as register_review_tools  # noqa: E402
 from kicad_claude.tools.datasheets import register as register_datasheet_tools  # noqa: E402
+from kicad_claude.tools.release import register as register_release_tools  # noqa: E402
+from kicad_claude.tools.bom import register as register_bom_tools  # noqa: E402
 from kicad_claude.tools.rf import register as register_rf_tools  # noqa: E402
 from kicad_claude.tools.routing import register as register_routing_tools  # noqa: E402
 from kicad_claude.tools.rules import register as register_rules_tools  # noqa: E402
@@ -96,6 +98,8 @@ register_spice_tools(mcp)
 register_simulation_tools(mcp)
 register_review_tools(mcp)
 register_datasheet_tools(mcp)
+register_release_tools(mcp)
+register_bom_tools(mcp)
 
 # Unknown keyword arguments must fail loudly, not be dropped (defect 2).
 install_strict_args(mcp)

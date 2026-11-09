@@ -25,6 +25,10 @@ import httpx
 
 logger = logging.getLogger("kicad-claude.adapters.jlcpcb")
 
+from kicad_claude.utils.logging import quiet_http  # noqa: E402
+
+quiet_http()
+
 DEFAULT_BASE = "https://jlcpcb.com"
 _SEARCH_PATH = "/api/overseas-pcb-order/v1/shoppingCart/smtGood/selectSmtComponentList"
 

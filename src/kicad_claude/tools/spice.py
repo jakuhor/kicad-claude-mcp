@@ -3,6 +3,9 @@
 Tools:
     export_spice_netlist      — KiCAD schematic → SPICE netlist
     run_ngspice_simulation    — run ngspice on a netlist + analysis directive
+    simulate_subcircuits      — detect dividers / RC / LC-pi filters in the
+                                schematic and check them (worst case, ngspice
+                                AC sweep, Monte Carlo)
 
 Requires `ngspice` on PATH for actual simulation. On macOS:
     brew install ngspice
@@ -109,7 +112,7 @@ def register(mcp) -> None:
         # ngspice batch mode: -b runs the netlist non-interactively. Append the
         # analysis directive + .end to a temp file so we don't mutate the user's.
         composed = (
-            f"* kicad-claude SPICE driver\n"
+            "* kicad-claude SPICE driver\n"
             + nl_path.read_text(encoding="utf-8", errors="replace")
             + f"\n{analysis}\n.print all\n.end\n"
         )
@@ -136,3 +139,148 @@ def register(mcp) -> None:
             "stdout_tail": r.stdout[-2000:] if r.stdout else "",
             "stderr_tail": r.stderr[-2000:] if r.stderr else "",
         }
+
+    @mcp.tool()
+    def simulate_subcircuits(
+        types: str = "divider,rc,lc,opamp,crystal",
+        fsw: dict[str, float] | None = None,
+        freqs: list[float] | None = None,
+        monte_carlo: int = 0,
+        rail_voltages: dict[str, float] | None = None,
+        peaking_warn_db: float = 6.0,
+        loads: dict[str, float] | None = None,
+        source_ohm: dict[str, float] | None = None,
+        pcb_parasitics: bool = False,
+        c_stray_pf: float | None = None,
+        opamp_models: dict | None = None,
+        supplies: dict | None = None,
+        seed: int = 1,
+        netlist_path: str = "",
+        include_decks: bool = False,
+    ) -> dict:
+        """Find simulatable passive subcircuits in the active schematic and
+        check them against the design intent.
+
+        - `divider` — resistor dividers into an active pin. Ratio, tapped
+          voltage (rails from `analyze_power_tree`), worst case from each
+          resistor's `Tolerance` field; for a regulator FB divider, Vout typ
+          and worst case using the datasheet Vref min / max from the spec
+          cache (SP-DIV-VOUT), plus Monte Carlo with `monte_carlo=N`.
+          SP-TOL when a resistor has no Tolerance field.
+        - `rc` — RC low-pass nodes feeding an active input: corner frequency
+          with the Thevenin resistance of every resistor on the node.
+        - `lc` — LC / ferrite / pi ladders (series L between nodes with
+          capacitors to ground; switch nodes of converters excluded), with
+          R-C damping branches, run as an ngspice AC sweep from the ladder's
+          source end to its far end: resonance peaks (SP-LC-PEAK above
+          `peaking_warn_db`) and attenuation (SP-LC-ATT) at `freqs` and at
+          the 1st-3rd harmonic of every `fsw={"U1": 500e3}` value. Monte
+          Carlo varies L and C within their Tolerance fields.
+          `loads={"/VBUS_+20V": 20}` adds resistive loads and
+          `source_ohm={"<input net>": 0.1}` a source resistance; with an open
+          load the peaking is an upper bound and SP-LC-PEAK is only info.
+
+        - `opamp` — op-amp stages from pin names (+IN / IN+ / 1IN- / OUTA …):
+          follower / non-inverting / inverting, gain and noise gain from the
+          feedback resistors, feedback-cap pole, and closed-loop bandwidth
+          GBW / noise gain when the spec cache has the op-amp's `GBW`
+          (SP-OPAMP). With a vendor model — `opamp_models={"U1": {"lib":
+          "OPA1612.lib", "subckt": "OPA1612", "pins": ["+IN", "-IN", "V+",
+          "V-", "OUT"]}}` (roles in .subckt node order; omitted roles are
+          read from node names), or the symbol's KiCAD `Sim.Library` /
+          `Sim.Name` / `Sim.Pins` fields — each stage is simulated with
+          ngspice AC on its real feedback network and supplies (rail
+          voltages, or `supplies={"U1": {"V+": 15, "V-": -15}}`): gain,
+          -3 dB frequency, peaking. Without one the amplifier is ideal and
+          the result says so.
+        - `crystal` — crystals with a load cap on each pin: effective load
+          C1·C2/(C1+C2) + `c_stray_pf` (none assumed) against the crystal's
+          `CL` from the spec cache (SP-XTAL-CL; warning beyond ±10 %).
+
+        `pcb_parasitics=True` adds each ladder capacitor's mounting
+        inductance in series with it: ground-via barrel from the cap's layer
+        to the first ground plane (L = 0.2 h (ln(4h/d) + 1) nH) plus the
+        pad-to-via strip over the plane (track width, or the pad width for
+        a pour; Hammerstad microstrip inductance).
+
+        Parts are ideal unless the datasheet spec cache gives ESR / ESL / DCR;
+        ferrite beads without an inductance value are a short (noted). Open
+        load, zero source impedance — the passive network, not the
+        regulator loop. Needs ngspice on PATH for `lc`.
+        """
+        from kicad_claude.adapters import connectivity_review, power_review, spice_auto
+        from kicad_claude.adapters import datasheet_index as dsi
+        from kicad_claude.adapters import datasheet_specs as dss
+        from kicad_claude.tools.review import _datasheet_values, project_netlist
+
+        wanted = tuple(t.strip() for t in types.split(",") if t.strip())
+        bad = [t for t in wanted if t not in spice_auto.TYPES]
+        if bad:
+            raise ValueError(f"unknown type(s) {bad}; valid: {list(spice_auto.TYPES)}")
+        nl = power_review.parse_netlist(project_netlist(netlist_path))
+        power = power_review.analyze(nl, datasheet=_datasheet_values(nl),
+                                     rail_voltages=rail_voltages or {})
+        volts = {k: v["volts"] for k, v in power["rail_voltages"].items()}
+        # datasheet Vref range per FB net
+        vref: dict = {}
+        proj = state.get_active_or_none()
+        ds_dir = dsi.datasheets_dir(proj.path) if proj else None
+        for r in power["regulators"]:
+            div = (r.get("feedback") or {}).get("divider")
+            mpn = (nl.components.get(r["ref"], {}).get("fields") or {}).get("MPN", "")
+            rec = dss.load(ds_dir, mpn) if ds_dir and mpn else None
+            if not div or not rec or rec.get("stale"):
+                continue
+            reg = rec.get("regulator") or {}
+            chan = (reg.get("channels") or {}).get(r["channel"] or "") or {}
+            key = "vref_negative" if power_review.is_negative_rail(div["sense_net"]) else "vref"
+            sv = chan.get(key) or reg.get(key)
+            if sv:
+                vref[r["feedback"]["net"]] = {
+                    "min": sv.get("min"), "typ": sv.get("typ"), "max": sv.get("max"),
+                    "source": f"datasheet {mpn} p.{sv.get('page')}"}
+        specs = {}
+        if ds_dir:
+            for ref, comp in nl.components.items():
+                mpn = comp["fields"].get("MPN", "")
+                if mpn and kind_is_passive(ref) or (mpn and _re_ic(ref)):
+                    rec = dss.load(ds_dir, mpn)
+                    if rec and not rec.get("stale"):
+                        specs[ref] = rec
+        f_list = list(freqs or [])
+        for f in (fsw or {}).values():
+            f_list += [f, 2 * f, 3 * f]
+        mount = {}
+        if pcb_parasitics and "lc" in wanted:
+            from kicad_claude.adapters import sch_io as _sch_io
+            board = _sch_io.parse_file(state.get_active_board_path())
+            caps = [r for r in nl.components if r.startswith("C")]
+            mount = {c: v["l_h"] for c, v in spice_auto.mounting_inductance(board, caps).items()}
+        if opamp_models:
+            proj_dir = proj.path if proj else Path.cwd()
+            for m in opamp_models.values():
+                if not Path(m["lib"]).is_absolute():
+                    m["lib"] = str(proj_dir / m["lib"])
+        result = spice_auto.analyze(
+            nl, wanted, volts=volts, vref=vref, regulators=power["regulators"],
+            sources=connectivity_review.sourced_nets(nl), freqs=sorted(set(f_list)),
+            mc=monte_carlo, seed=seed, specs=specs, peaking_warn_db=peaking_warn_db,
+            loads=loads or {}, source_ohm=source_ohm or {}, mount_l=mount,
+            c_stray_pf=c_stray_pf, opamp_models=opamp_models or {}, supplies=supplies or {})
+        if not include_decks:
+            for lad in result.get("ladders", []):
+                lad.pop("deck", None)
+        result["note"] = ("First-pass check of the passive networks with ideal parts unless "
+                          "the spec cache has ESR / DCR; not a substitute for the vendor "
+                          "models in a full converter simulation.")
+        return result
+
+
+def kind_is_passive(ref: str) -> bool:
+    import re as _re
+    return bool(_re.match(r"(L|C|FB|R)\d", ref))
+
+
+def _re_ic(ref: str) -> bool:
+    import re as _re
+    return bool(_re.match(r"(U|IC|Y|X)\d", ref))
