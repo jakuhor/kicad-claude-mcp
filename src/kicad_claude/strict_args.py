@@ -25,11 +25,8 @@ from typing import Any
 from mcp.server.fastmcp.exceptions import ToolError
 
 # alias -> canonical, applied to any tool that has the canonical name and not
-# the alias. The canonical net argument is `net`; PCB tools that still take
-# `net_name` accept `net` the other way round.
+# the alias. Every tool names its net argument `net`.
 GENERIC_ALIASES: dict[str, str] = {
-    "net_name": "net",
-    "net": "net_name",
     "x": "x_mm",
     "y": "y_mm",
 }
@@ -52,6 +49,10 @@ def _message(name: str, unknown: list[str], accepted: set[str]) -> str:
     parts = []
     for arg in unknown:
         close = difflib.get_close_matches(arg, sorted(accepted), n=2, cutoff=0.6)
+        # A prefix of the other spelling (`net_name` / `net`, `x` / `x_mm`) is
+        # too short a match for difflib, and the likeliest intended name.
+        close += [a for a in sorted(accepted) if a not in close
+                  and (arg.startswith(a + "_") or a.startswith(arg + "_"))][:2]
         parts.append(f"{arg!r}" + (f" (did you mean {' or '.join(close)}?)" if close else ""))
     return (
         f"{name}: unknown argument(s) {', '.join(parts)}. "

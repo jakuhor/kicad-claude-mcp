@@ -12,6 +12,7 @@ Callers snap to the 1.27 mm grid before calling (see `tools/schematic.py`).
 
 from __future__ import annotations
 
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -1515,6 +1516,30 @@ def remove_text(tree: list, item_uuid: str) -> str:
     return previous
 
 
+# Removed through their own tools: a symbol drags wiring and instance data
+# along, a sheet a whole sub-schematic.
+_NOT_REMOVABLE_BY_UUID = {"symbol": "remove_symbol", "sheet": "(not supported)"}
+
+
+def remove_by_uuid(tree: list, item_uuid: str) -> dict:
+    """Delete one top-level item by uuid. Returns its kind (and text, if any)."""
+    node = find_by_uuid(tree, item_uuid)
+    if node is None:
+        raise KeyError(f"no item with uuid {item_uuid!r} on this sheet")
+    head = head_of(node)
+    if head in _NOT_REMOVABLE_BY_UUID:
+        raise ValueError(f"a {head} is not removed by uuid; use "
+                         f"{_NOT_REMOVABLE_BY_UUID[head]}")
+    for i, n in enumerate(tree):
+        if n is node:
+            del tree[i]
+            break
+    out: dict = {"kind": head}
+    if len(node) > 1 and isinstance(node[1], str):
+        out["text"] = node[1]
+    return out
+
+
 def list_texts(tree: list) -> list[dict]:
     """Every free text note on the sheet, with uuid and position."""
     out = []
@@ -2001,3 +2026,50 @@ def refresh_lib_symbol(
 
     report["fields_written"] = fields_written
     return report
+
+
+# --------------------------------------------------------------------------- #
+# Placement helpers used by add_symbol / add_power_symbol
+# --------------------------------------------------------------------------- #
+
+
+def junction_mid_wire_pins(tree: list, s_node: list) -> list[dict]:
+    """Add a junction under every pin of `s_node` that sits mid-wire.
+
+    KiCAD leaves such a pin unconnected; a pin placed on a wire is meant to
+    join it. Returns `[{pin, position_mm}]` for the report.
+    """
+    from kicad_claude.adapters import sch_netlist  # sch_netlist imports this module
+
+    added = []
+    for hit in sch_netlist.pins_on_wire_interior(tree, s_node):
+        x, y = hit["point"]
+        add_junction(tree, x, y)
+        added.append({"pin": hit["number"], "position_mm": [x, y]})
+    return added
+
+
+def library_reference_prefix(sym_def_node: list, default: str = "#PWR") -> str:
+    """The reference prefix a library symbol asks for — `#PWR`, `#FLG`, …
+
+    KiCAD's `power:PWR_FLAG` carries `#FLG`, while `power:GND` and the rails
+    carry `#PWR`. Assuming `#PWR` for everything in the power library gives a
+    flag the wrong designator, which KiCAD's own annotation then renumbers.
+    """
+    prefix = get_symbol_property(sym_def_node, "Reference")
+    return prefix if prefix else default
+
+
+def next_virtual_reference(references, prefix: str = "#PWR") -> str:
+    """Smallest `<prefix>####` not in `references`, e.g. `#PWR0003`.
+
+    These references must be unique across all sheets or KiCAD reports
+    annotation errors, so pass the whole hierarchy's. Each prefix is numbered
+    independently, the way KiCAD numbers them.
+    """
+    pattern = re.compile(rf"{re.escape(prefix)}0*(\d+)")
+    used = {int(m.group(1)) for r in references if r and (m := pattern.fullmatch(r))}
+    n = 1
+    while n in used:
+        n += 1
+    return f"{prefix}{n:04d}"

@@ -275,16 +275,17 @@ def parse_updates_csv(text: str) -> dict[str, dict[str, str]]:
 
 
 def write_fields(root: Path, updates: dict[str, dict[str, str]], create: bool = True,
-                 dry_run: bool = True, save=None) -> dict:
+                 dry_run: bool = True, save_all=None) -> dict:
     """Apply `{ref: {field: value}}` to every unit of each symbol, on
-    whichever sheet holds it. `save(tree, path)` writes a sheet (the guarded
-    writer); with `dry_run` nothing is written. `Reference` is refused."""
+    whichever sheet holds it. `save_all([(path, tree), ...])` writes the changed
+    sheets as one edit and returns their backups (`safe_write.save_trees`);
+    with `dry_run` nothing is written. `Reference` is refused."""
     bad = [r for r, f in updates.items() if "Reference" in f]
     if bad:
         raise ValueError(f"refusing to set Reference on {bad}: use annotate_schematic")
     changes, missing_field, shared = [], [], []
     found: set[str] = set()
-    touched = []
+    dirty_sheets: list[tuple[Path, list]] = []
     for path in sheet_files(root):
         tree = sch_io.parse_file(path)
         dirty = False
@@ -316,8 +317,10 @@ def write_fields(root: Path, updates: dict[str, dict[str, str]], create: bool = 
                             ed.set_symbol_property(s, name, value)
                         dirty = True
         if dirty and not dry_run:
-            backup = save(tree, path)
-            touched.append({"sheet": str(path), "backup": str(backup) if backup else None})
+            dirty_sheets.append((path, tree))
+    backups = save_all(dirty_sheets) if dirty_sheets else []
+    touched = [{"sheet": str(path), "backup": str(b) if b else None}
+               for (path, _tree), b in zip(dirty_sheets, backups)]
     seen_units = defaultdict(set)
     uniq = []
     for c in changes:     # one row per ref / field (units repeat the change)

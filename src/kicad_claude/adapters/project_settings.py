@@ -25,10 +25,15 @@ def load_pro(pro_path: Path) -> dict:
     return json.loads(Path(pro_path).read_text(encoding="utf-8"))
 
 
-def save_pro(pro_path: Path, data: dict) -> None:
-    Path(pro_path).write_text(
+def save_pro(pro_path: Path, data: dict) -> Path | None:
+    """Write `.kicad_pro` through the guarded writer (lock check, backup,
+    re-parse). Returns the backup."""
+    from kicad_claude.adapters import safe_write
+
+    return safe_write.save_text(
+        Path(pro_path),
         json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+        lambda p: json.loads(Path(p).read_text(encoding="utf-8")),
     )
 
 

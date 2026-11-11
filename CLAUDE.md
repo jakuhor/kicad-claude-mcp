@@ -30,10 +30,23 @@ a current focus — do not extend them unless asked.
   code.
 
 ## Layout
-- `server.py` — entry point; creates `FastMCP("kicad-claude")` and calls each
-  `tools/<group>.register(mcp)`. 156 tools total.
-- `src/kicad_claude/tools/*.py` — thin MCP tool wrappers: validate arguments,
-  call an adapter, return a JSON-friendly dict.
+- `server.py` — entry point; creates `FastMCP("kicad-claude")`, registers
+  `ping` and calls `toolsets.install(mcp)`. 142 tools total.
+- `src/kicad_claude/toolsets.py` — the tool sets (`core`, `sch`, `pcb`, …).
+  Set `<name>` is the module or package `tools/<name>` with `register(mcp)`;
+  a package's `__init__` registers its submodules. Only `core` loads at
+  startup; `load_toolset` adds sets at runtime. A new tool goes into the
+  module of its set, and a set must stay inside its token budget
+  (`tests/test_core_toolsets.py`).
+- Fixed choices are `Literal` types, lists are `list[...]` — never a
+  comma-joined string. Shared choice types live in `arg_types.py`.
+- Tool docstrings: the text before a line holding only `Details:` is the
+  listed description (≤ 500 chars: what, when, key arguments); everything
+  after it is served by `help(tool)` only. Over budget → move text below
+  `Details:`, do not raise the cap.
+- `src/kicad_claude/tools/` — thin MCP tool wrappers: validate arguments,
+  call an adapter, return a JSON-friendly dict. Helpers used by more than
+  one set live in `tools/common.py`, not in another set's module.
 - `src/kicad_claude/adapters/*.py` — the real work: s-expression IO
   (`sch_io.py`), editors (`sch_editor.py`, `pcb_editor.py`), `kicad_cli.py`,
   vendor APIs, calculations.
@@ -42,7 +55,8 @@ a current focus — do not extend them unless asked.
   `kicad_paths.py`, `logging.py` (stderr only; stdout belongs to MCP).
 - `src/kicad_claude/state.py` — `ActiveProject` singleton; one active project
   per server process.
-- `tests/test_phase<N>_*.py` — one file per feature phase.
+- `tests/test_<set>_<topic>.py` — tests filed by tool set (`test_sch_*`,
+  `test_pcb_*`, `test_review_*`, …); `test_io_safe_write.py` for the writer.
 
 ## File-format rules
 - Round-trip safety first: parse, mutate the tree, write back. A write must
@@ -75,7 +89,7 @@ uv run pytest -m "network" -q                    # live DigiKey/Mouser
 uv run ruff check .
 uv run mcp dev server.py                         # MCP Inspector
 ```
-Add a test to the matching `tests/test_phase<N>_*.py` for every new or fixed
+Add a test to the matching `tests/test_<set>_*.py` for every new or fixed
 tool.
 
 ## KiCad

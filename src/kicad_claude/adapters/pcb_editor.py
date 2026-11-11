@@ -24,9 +24,8 @@ from typing import Any
 import sexpdata
 
 import math
-import re
 
-from kicad_claude.adapters import length_tuning, pcb_geometry, pcb_layers, sch_io
+from kicad_claude.adapters import length_tuning, pcb_geometry, pcb_layers
 from kicad_claude.adapters.sch_io import (
     find_child,
     find_children,
@@ -233,11 +232,8 @@ def set_board_outline(
     TOP-left corner and the rectangle extends right and down from it.
     Returns a summary including both diagonal corners.
     """
-    if shape not in ("rect", "rounded_rect"):
-        raise ValueError(f"shape must be 'rect' or 'rounded_rect' (got {shape!r})")
-    if shape == "rounded_rect":
-        # Rounded corners need 4 lines + 4 arcs; defer until Phase 6+.
-        raise NotImplementedError("rounded_rect outline not yet implemented")
+    if shape != "rect":
+        raise ValueError(f"only 'rect' outlines are supported (got {shape!r})")
 
     remove_board_outline(tree)
 
@@ -468,6 +464,63 @@ def remove_footprint(tree: list, reference: str) -> bool:
             tree.pop(i)
             return True
     return False
+
+
+# Board item kinds `remove_board_items` removes, by s-expression head.
+REMOVABLE_KINDS = {"track": "segment", "arc": "arc", "via": "via", "zone": "zone"}
+
+
+def _item_layers(node: list) -> list[str]:
+    layers = find_child(node, "layers") or find_child(node, "layer")
+    return [str(x) for x in layers[1:]] if layers else []
+
+
+def remove_board_items(
+    tree: list,
+    *,
+    item_uuid: str = "",
+    net: str = "",
+    kinds: list[str] | tuple[str, ...] = ("track", "arc", "via"),
+    layer: str = "",
+    dry_run: bool = False,
+) -> list[dict]:
+    """Remove routing items by uuid, or every item of `kinds` on `net`.
+
+    `layer` narrows a net removal to tracks, arcs and zones on that layer;
+    vias are kept then, since they join that layer to others. Returns one
+    `{kind, uuid, net, layers}` per removed item (all matches with `dry_run`).
+    """
+    if not item_uuid and not net:
+        raise ValueError("pass a uuid or a net; removing every item is not supported")
+    unknown = sorted(set(kinds) - set(REMOVABLE_KINDS))
+    if unknown:
+        raise ValueError(f"unknown kind(s) {unknown}; use {sorted(REMOVABLE_KINDS)}")
+    heads = {REMOVABLE_KINDS[k]: k for k in kinds}
+    want_net = normalize_name(net) if net else ""
+    matched: list[tuple[int, dict]] = []
+    for i, node in enumerate(tree):
+        if not isinstance(node, list) or head_of(node) not in (
+                heads if not item_uuid else REMOVABLE_KINDS.values()):
+            continue
+        u = find_child(node, "uuid")
+        uid = str(u[1]) if u and len(u) >= 2 else ""
+        if item_uuid:
+            if uid != item_uuid:
+                continue
+        else:
+            if normalize_name(net_of(node, tree)) != want_net:
+                continue
+            if layer and (head_of(node) == "via" or layer not in _item_layers(node)):
+                continue
+        kind = {v: k for k, v in REMOVABLE_KINDS.items()}[head_of(node)]
+        matched.append((i, {"kind": kind, "uuid": uid, "net": net_of(node, tree),
+                            "layers": _item_layers(node)}))
+    if item_uuid and not matched:
+        raise KeyError(f"no track, arc, via or zone with uuid {item_uuid!r} on this board")
+    if not dry_run:
+        for i, _ in reversed(matched):
+            del tree[i]
+    return [m for _, m in matched]
 
 
 def move_footprint(

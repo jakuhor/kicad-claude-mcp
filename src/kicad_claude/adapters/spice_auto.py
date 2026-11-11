@@ -352,12 +352,12 @@ def run_ac(deck: str, nodes: list[str], ngspice: str, timeout: float = 60.0) -> 
         ctrl = (".control\nrun\nset wr_singlescale\nwrdata " + str(data).replace("\\", "/")
                 + " " + " ".join(f"vdb({n})" for n in nodes) + "\n.endc\n")
         cir.write_text(deck.replace(".end\n", ctrl + ".end\n"), encoding="utf-8")
-        r = subprocess.run([ngspice, "-b", str(cir)], capture_output=True, text=True,
+        r = subprocess.run([ngspice, "-b", str(cir)], capture_output=True, text=True, encoding="utf-8", errors="replace",
                            timeout=timeout, check=False)
         if not data.is_file():
             raise RuntimeError(f"ngspice produced no data: {(r.stderr or r.stdout)[-400:]}")
         out = {n: [] for n in nodes}
-        for line in data.read_text().splitlines():
+        for line in data.read_text(encoding="utf-8", errors="replace").splitlines():
             parts = line.split()
             if len(parts) < 1 + len(nodes):
                 continue

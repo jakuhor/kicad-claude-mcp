@@ -139,15 +139,53 @@ def parse_netlist(path: Path) -> Netlist:
 
 # ---- value parsing --------------------------------------------------------- #
 
-_MULT = {"p": 1e-12, "n": 1e-9, "u": 1e-6, "µ": 1e-6, "m": 1e-3, "k": 1e3,
-         "K": 1e3, "M": 1e6, "G": 1e9, "R": 1.0, "r": 1.0}
+_MULT = {"f": 1e-15, "p": 1e-12, "n": 1e-9, "u": 1e-6, "m": 1e-3, "k": 1e3,
+         "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "R": 1.0, "r": 1.0}
+_NUMBER = r"[+-]?\d+(?:\.\d+)?"
+_VALUE = r"([+-]?\d+(?:\.\d+)?)([fpnumkKMGTRr]?)(\d*)"   # 4k7, 2.2u, 1R0, 10
+# What may follow a number after a space and still belong to it: "10 µF", "4.7 k",
+# "10 ohm" — a prefix or unit, not another field such as "50V" or "1%".
+_UNIT_START = re.compile("(?:meg|ohms?|[fpnumkKMGTRr]?[FHfhΩΩ]?)(?:$)", re.I)
 
 
 def parse_value(text: str) -> float | None:
-    """`4k7` 4700, `10k` 1e4, `100n` 1e-7, `2.2uF` 2.2e-6, `0R` 0, `49.9` 49.9."""
-    s = text.strip().split()[0] if text.strip() else ""
-    s = re.sub(r"(?i)(ohm|Ω|f|h)$", "", s)
-    m = re.fullmatch(r"(\d+(?:\.\d+)?)([pnuµmkKMGRr]?)(\d*)", s)
+    """A component value in SI units, as KiCAD's simulator reads it.
+
+    `4k7` 4700, `10k` 1e4, `100n` 1e-7, `2.2uF` 2.2e-6, `0R` 0, `49.9` 49.9,
+    `10 µF` / `10μF` 1e-5 (micro sign or Greek mu, unit after a space),
+    `2.2Meg` 2.2e6, `4,7k` / `0,1uF` (decimal comma), `0.1uF, 50V` (first field
+    of a list), `78 182` 78182 (digit groups). `1,000` is a decimal comma or a
+    thousands separator, so it is not guessed: None, as for `DNP` or `abc`.
+    """
+    s = (text or "").strip().replace("µ", "u").replace("μ", "u")
+    if not s:
+        return None
+    # A field list ends at the first comma that is not between two digits.
+    for i, c in enumerate(s):
+        if c in ",;" and not (c == "," and 0 < i < len(s) - 1
+                              and s[i - 1].isdigit() and s[i + 1].isdigit()):
+            s = s[:i].strip()
+            break
+    if re.search(r"\d,\d{3}(?!\d)", s):
+        return None
+    s = s.replace(",", ".")
+    tokens = s.split()
+    if len(tokens) > 1:
+        groups = 1
+        while (groups < len(tokens) and re.fullmatch(r"\d{3}", tokens[groups])
+               and re.fullmatch(r"[+-]?\d{1,3}", tokens[0])):
+            groups += 1
+        if groups > 1:
+            tokens = ["".join(tokens[:groups])] + tokens[groups:]
+        elif re.fullmatch(_NUMBER, tokens[0]) and _UNIT_START.match(tokens[1]):
+            tokens = [tokens[0] + tokens[1]] + tokens[2:]
+    s = tokens[0] if tokens else ""
+    s = re.sub(r"(?i)meg(?=\d*[a-zΩΩ]*$)", "M", s)
+    s = re.sub("(?i)(?:ohms?|[ΩΩ])$", "", s)
+    # One trailing farad / henry letter: `100nF`, `100nf`, `22uH`, `1fF`.
+    if s and s[-1] in "FfHh" and re.fullmatch(_VALUE, s[:-1]):
+        s = s[:-1]
+    m = re.fullmatch(_VALUE, s)
     if not m:
         return None
     base, mult, frac = m.groups()

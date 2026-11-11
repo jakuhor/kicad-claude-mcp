@@ -1,4 +1,4 @@
-"""Phase 15 — closed-form thermal and EMC analysis helpers.
+"""Closed-form thermal and EMC analysis helpers.
 
 These are NOT real FEM simulations. For thermal we use a lumped-element
 resistive model (junction → case → ambient, optional board-spreader

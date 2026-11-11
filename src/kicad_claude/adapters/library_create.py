@@ -20,7 +20,7 @@ import uuid as _uuid
 from pathlib import Path
 from typing import Any
 
-from kicad_claude.adapters import sch_io, vendor_import
+from kicad_claude.adapters import safe_write, sch_io, vendor_import
 from kicad_claude.adapters.sch_io import is_call, sym
 
 logger = logging.getLogger("kicad-claude.adapters.library_create")
@@ -235,7 +235,7 @@ def append_symbol_to_lib(lib_path: Path, symbol_node: list) -> None:
                 "remove it manually or import via a different name."
             )
     tree.append(symbol_node)
-    sch_io.write_file(lib_path, tree)
+    safe_write.save_tree(lib_path, tree)
 
 
 def create_symbol(
@@ -403,7 +403,8 @@ def build_footprint_node(
         minx, miny, maxx, maxy = _bounding_box(pads)
         # Silk slightly outside the pads — typical 0.15 mm
         infl = 0.15
-        minx -= infl; maxx += infl; miny -= infl; maxy += infl
+        minx, maxx = minx - infl, maxx + infl
+        miny, maxy = miny - infl, maxy + infl
         for s, e in (
             ((minx, miny), (maxx, miny)),
             ((maxx, miny), (maxx, maxy)),
@@ -504,7 +505,7 @@ def create_footprint(
         add_courtyard=add_courtyard,
         add_silk_outline=add_silk_outline,
     )
-    sch_io.write_file(target, node)
+    safe_write.save_tree(target, node)
     table_path = vendor_import.update_fp_lib_table(project_dir, lib_name)
     return {
         "lib_id": qualified,

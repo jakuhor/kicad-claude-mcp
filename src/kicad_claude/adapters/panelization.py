@@ -15,9 +15,7 @@ from __future__ import annotations
 
 import copy
 import logging
-import math
 import uuid
-from pathlib import Path
 from typing import Any
 
 import sexpdata

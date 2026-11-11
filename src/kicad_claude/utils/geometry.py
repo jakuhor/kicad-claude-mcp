@@ -63,7 +63,7 @@ def file_to_pcb_xy(x_mm: float, y_mm: float) -> tuple[float, float]:
 
 
 def normalize_rotation(deg: float) -> int:
-    """Snap a rotation to {0, 90, 180, 270}. Phase 3 only supports right angles."""
+    """Snap a rotation to {0, 90, 180, 270}; only right angles are supported."""
     r = int(round(float(deg))) % 360
     if r not in (0, 90, 180, 270):
         raise ValueError(

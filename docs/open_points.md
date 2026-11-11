@@ -26,8 +26,11 @@ detector groups (OP-9 … OP-12) done 2026-11-09.
 
 ## OP-8 — Retire kicad-happy (user decision)
 
-OP-1 … OP-12 are done. Compare against kicad-happy once more and let the
-user decide whether to uninstall it.
+OP-1 … OP-12 are done. Compared against kicad-happy 3.0.1 (2026-11-06) on
+2026-11-11: not yet a full replacement; the gaps are OP-17. Retire it once
+OP-17's review checks, layout thermal + DFM, and SPICE + datasheet quality
+groups are closed; inputs + workflow are not required *(decided,
+2026-11-11)*.
 
 ## OP-13 — Accepted limits of the estimators (no work planned)
 
@@ -40,3 +43,33 @@ Kept so they stay visible; each is stated in the tool output.
   cache has them (DC-NODATA lists the gaps).
 - The circuit detectors are pin-name heuristics, validated on KiCAD's demo
   designs and synthetic netlists; a new design style can still trip them.
+
+## OP-17 — kicad-happy 3.0.1 parity gaps
+
+kicad-happy analyses; this server also edits, routes, exports and reads
+connectivity from KiCAD's own netlist, ERC and DRC (so net naming, DNP,
+per-instance references and pin alternates are KiCAD's by construction —
+much of kicad-happy 3.0.1's fix list does not apply). What it has and this
+server does not:
+- Design-review checks: inrush, sleep-current / power budget, reverse-polarity
+  FET, fuse sizing, CAN termination, I2C rise time (only the 3 mA sink is
+  checked), UART voltage domains beyond DG-LEVEL, resistor power derating,
+  derating profiles (commercial / military / automotive), over-designed parts,
+  temperature-grade audit, alternative-part suggestions.
+- Thermal from the layout: package Rθ_JA table (only datasheet values here),
+  thermal-via correction and adequacy, MLCC / electrolytic proximity to hot
+  parts (TP-001/002).
+- PCB DFM score and assembly-complexity score.
+- SPICE: LTspice and Xyce backends, model lookup / generation / caching from
+  distributor specs, external-deck runner; EMC harmonic-limit screen.
+- Datasheets: page selection and quality scoring, PDF SHA-256 bound to each
+  extraction, quote verification against the page (Deep Review gate).
+- Not required for retiring kicad-happy *(decided, 2026-11-11)*:
+  inputs: KiCad 5–9 files (this server: KiCad 10 only), KiCad 10 design
+  variants (`--variant`), PDF schematics / reference designs.
+- Not required either *(decided, 2026-11-11)*: workflow — GitHub Action and PR comments, GitHub issue export, analysis run
+  folders with provenance, report generation, OSHWA / standards checklists,
+  JLCPCB / PCBWay ordering knowledge, per-supplier order files and a BOM
+  tracking CSV.
+- Validation: kicad-happy runs on a 5,800-project corpus; this server is
+  validated on KiCAD's demo designs and synthetic netlists (OP-13).

@@ -28,8 +28,19 @@ def parse_file(path: Path) -> list:
     A truncated or empty file raises `ValueError` naming the file. `sexpdata`
     signals an empty input with a bare `AssertionError` and unbalanced parens
     with its own `ExpectClosingBracket`; neither says which file failed.
+
+    The file must be UTF-8, as KiCAD writes it. Bytes that do not decode
+    raise `ValueError` instead of turning into U+FFFD, which the next write
+    would put into the file for good.
     """
-    text = Path(path).read_text(encoding="utf-8", errors="replace")
+    raw = Path(path).read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"{path} is not valid UTF-8 (byte {exc.start}: {raw[exc.start:exc.start + 8]!r}); "
+            f"refusing to read it, since writing it back would corrupt those bytes"
+        ) from exc
     if not text.strip():
         raise ValueError(f"{path} is empty — not a KiCAD file")
     try:
@@ -167,7 +178,27 @@ def write_file(path: Path, tree: list) -> None:
     text = dumps(tree)
     if newline != "\n":
         text = text.replace("\n", newline)
-    p.write_bytes(text.encode("utf-8"))
+    atomic_write_bytes(p, text.encode("utf-8"))
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write a sibling temp file and swap it in, as KiCAD's own
+    SIBLING_TEMP_FILE does: a crash mid-write leaves the old file whole."""
+    p = Path(path)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, p)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def write_text_file(path: Path, text: str) -> None:
+    """Write UTF-8 `text` (LF-separated) keeping the file's line ending."""
+    newline = detect_newline(path)
+    if newline != "\n":
+        text = text.replace("\r\n", "\n").replace("\n", newline)
+    atomic_write_bytes(path, text.encode("utf-8"))
 
 
 # --------------------------------------------------------------------------- #

@@ -18,6 +18,7 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 from kicad_claude.adapters import sch_io
 
@@ -71,7 +72,7 @@ def kicad_gui_running() -> bool | None:
     try:
         if sys.platform == "win32":
             out = subprocess.run(
-                ["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True,
+                ["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=10, check=False,
             ).stdout.lower()
             names = {line.split(",")[0].strip('"') for line in out.splitlines() if line}
@@ -212,11 +213,33 @@ def save_tree(
     both the parse error and the backup path, so the caller is never left with a
     file that cannot be opened.
     """
+    return _guarded_write(path, lambda p: sch_io.write_file(p, tree), sch_io.parse_file,
+                          keep_backups=keep_backups, verify=verify)
+
+
+def save_text(
+    path: Path,
+    text: str,
+    check: Callable[[Path], object],
+    *,
+    keep_backups: int = DEFAULT_KEEP_BACKUPS,
+    verify: bool | None = None,
+) -> Path | None:
+    """`save_tree` for a text file (`.kicad_pro`, `.kicad_dru`, lib tables).
+
+    `check(path)` must raise when the written file is not valid. The file's
+    line ending is kept. Returns the backup.
+    """
+    return _guarded_write(path, lambda p: sch_io.write_text_file(p, text), check,
+                          keep_backups=keep_backups, verify=verify)
+
+
+def _guarded_write(path, write, check, *, keep_backups, verify) -> Path | None:
     path = Path(path)
     check_not_locked(path)
 
     backup = backup_file(path, keep=keep_backups)
-    sch_io.write_file(path, tree)
+    write(path)
 
     if verify is None:
         verify = _env_flag(VERIFY_ENV, True)
@@ -224,7 +247,7 @@ def save_tree(
         return backup
 
     try:
-        sch_io.parse_file(path)
+        check(path)
     except Exception as exc:
         if backup is not None:
             shutil.copy2(backup, path)
@@ -232,8 +255,72 @@ def save_tree(
                 f"write to {path} produced a file that does not parse ({exc}); "
                 f"restored from {backup}"
             ) from exc
+        path.unlink(missing_ok=True)
         raise RuntimeError(
             f"write to {path} produced a file that does not parse ({exc}); "
-            f"there was no previous version to restore"
+            f"there was no previous version, so the new file was removed"
         ) from exc
     return backup
+
+
+def guard_external(path: Path, run: Callable[[], object], *,
+                   keep_backups: int = DEFAULT_KEEP_BACKUPS) -> tuple[object, Path | None]:
+    """The same guard for a writer outside this process (pcbnew through KiCAD's
+    Python, Freerouting's SES import): lock check, backup, `run()`, re-parse.
+
+    A run that fails, or leaves a file that does not parse, puts the backup
+    back. Returns `(run's result, backup)`.
+    """
+    path = Path(path)
+    check_not_locked(path)
+    backup = backup_file(path, keep=keep_backups)
+
+    def _restore_if_broken() -> bool:
+        try:
+            sch_io.parse_file(path)
+            return False
+        except Exception:
+            if backup is not None:
+                shutil.copy2(backup, path)
+            return True
+
+    try:
+        result = run()
+    except Exception:
+        _restore_if_broken()
+        raise
+    if _env_flag(VERIFY_ENV, True) and _restore_if_broken():
+        raise RuntimeError(f"{path} does not parse after the external write; "
+                           f"restored from {backup}")
+    return result, backup
+
+
+def save_trees(pairs: list[tuple[Path, list]], *,
+               keep_backups: int = DEFAULT_KEEP_BACKUPS) -> list[Path | None]:
+    """`save_tree` for several files as one edit: all are written or none.
+
+    Every lock is checked before the first write. When a later file fails,
+    each file already written in this call gets its backup back (a file that
+    did not exist before is deleted), and the error says so. Returns the
+    backups in order.
+    """
+    pairs = [(Path(p), t) for p, t in pairs]
+    for path, _tree in pairs:
+        check_not_locked(path)
+    done: list[tuple[Path, Path | None, bool]] = []
+    try:
+        for path, tree in pairs:
+            existed = path.is_file()
+            backup = save_tree(path, tree, keep_backups=keep_backups)
+            done.append((path, backup, existed))
+    except Exception as exc:
+        for path, backup, existed in reversed(done):
+            if backup is not None:
+                shutil.copy2(backup, path)
+            elif not existed:
+                path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"saving {pairs[len(done)][0].name} failed ({exc}); the "
+            f"{len(done)} file(s) already written in this edit were restored"
+        ) from exc
+    return [backup for _p, backup, _e in done]

@@ -19,13 +19,14 @@ from collections import defaultdict
 from pathlib import Path
 
 from kicad_claude import state
+from kicad_claude.arg_types import Source, clean
 from kicad_claude.adapters import datasheet_fetch, datasheet_index as dsi, power_review
 from kicad_claude.adapters import datasheet_specs as dss
-from kicad_claude.tools.review import project_netlist
+from kicad_claude.tools.common import project_netlist
 
 logger = logging.getLogger("kicad-claude.tools.datasheets")
 
-DEFAULT_SKIP = "R,C,TP,H,MH,FID,NT,JP"
+DEFAULT_SKIP = ("R", "C", "TP", "H", "MH", "FID", "NT", "JP")
 
 
 def _ds_dir(dest_dir: str) -> Path:
@@ -38,9 +39,9 @@ def _natural(ref: str) -> tuple:
     return tuple(int(t) if t.isdigit() else t for t in re.split(r"(\d+)", ref))
 
 
-def schematic_parts(netlist: Path, mpn_field: str, skip_prefixes: str) -> tuple[dict, list]:
+def schematic_parts(netlist: Path, mpn_field: str, skip_prefixes) -> tuple[dict, list]:
     """MPN -> {refs, value, manufacturer, datasheet}; plus refs without an MPN."""
-    skip = {s.strip().upper() for s in skip_prefixes.split(",") if s.strip()}
+    skip = {s.upper() for s in clean(skip_prefixes)}
     nl = power_review.parse_netlist(netlist)
     parts: dict[str, dict] = {}
     no_mpn: list[str] = []
@@ -65,15 +66,21 @@ def register(mcp) -> None:
     @mcp.tool()
     def sync_datasheets(
         download: bool = True,
-        sources: str = "digikey,farnell,jlcpcb,mouser",
+        sources: list[Source] | None = None,
         assign: dict[str, str] | None = None,
-        skip_prefixes: str = DEFAULT_SKIP,
+        skip_prefixes: list[str] | None = None,
         mpn_field: str = "MPN",
         dest_dir: str = "",
         netlist_path: str = "",
     ) -> dict:
-        """Give every MPN in the active schematic its datasheet PDF and record
-        the mapping in `datasheets/manifest.kicad-claude.json`.
+        """Give every MPN in the active schematic its datasheet PDF, recorded in
+        `datasheets/manifest.kicad-claude.json` (folder: `dest_dir`,
+        `<project>/datasheets`, or the nearest parent `datasheets/`). Order:
+        kept manifest entry, `assign={"MPN": "file.pdf"}`, Datasheet-URL base
+        name, PDF text match, then `download=True`. Returns per-MPN status,
+        `unresolved`, `alternatives` and `orphans`.
+
+        Details:
 
         The folder is `dest_dir`, else `<project>/datasheets`, else the
         nearest `datasheets/` in a parent folder up to the git root (one
@@ -99,7 +106,8 @@ def register(mcp) -> None:
         level PDFs no MPN maps to (candidates for `ingest/`).
         """
         ds_dir = _ds_dir(dest_dir)
-        parts, no_mpn = schematic_parts(project_netlist(netlist_path), mpn_field, skip_prefixes)
+        parts, no_mpn = schematic_parts(project_netlist(netlist_path), mpn_field,
+                                       clean(skip_prefixes, DEFAULT_SKIP))
         manifest = dsi.load_manifest(ds_dir)
         files = dsi.pdf_files(ds_dir)
         by_name = {f.name: f for f in files}
@@ -137,10 +145,10 @@ def register(mcp) -> None:
                 unresolved.append(mpn)
                 status[mpn] = {"status": "missing"}
                 continue
-            from kicad_claude.tools.sourcing import datasheet_candidates
+            from kicad_claude.tools.sourcing.distributors import DATASHEET_SOURCES, datasheet_candidates
 
             url = info["datasheet"] if re.match(r"(?i)(https?:)?//", info["datasheet"]) else ""
-            cands, errors = datasheet_candidates(mpn, sources, url)
+            cands, errors = datasheet_candidates(mpn, clean(sources, DATASHEET_SOURCES), url)
             res = datasheet_fetch.fetch_first_pdf(cands, mpn, ds_dir)
             if res["path"]:
                 f = Path(res["path"])
@@ -196,7 +204,13 @@ def register(mcp) -> None:
         e = man["parts"].get(mpn)
         if not e:
             raise ValueError(f"{mpn!r} is not in {dsi.MANIFEST_NAME}; run sync_datasheets first")
-        pdf = ds_dir / e["file"]
+        # The manifest may come from a cloned repo: its `file` must name a PDF
+        # directly inside the datasheets folder, as sync_datasheets writes it.
+        name = str(e.get("file") or "")
+        pdf = ds_dir / name
+        if (not name or Path(name).name != name or name in (".", "..")
+                or pdf.resolve().parent != ds_dir.resolve()):
+            raise ValueError(f"manifest entry for {mpn} points outside {ds_dir}: {name!r}")
         if not pdf.is_file():
             raise FileNotFoundError(f"{pdf} (manifest entry for {mpn}); rerun sync_datasheets")
         return e, pdf

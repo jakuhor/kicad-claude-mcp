@@ -11,7 +11,7 @@ import logging
 import subprocess
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
 
 from kicad_claude.utils.kicad_paths import find_kicad_cli
 
@@ -40,7 +40,7 @@ def _run(args: list[str], *, timeout: float = 120.0, cwd: Path | None = None) ->
     cmd = [str(cli), *args]
     try:
         r = subprocess.run(
-            cmd, capture_output=True, text=True,
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=timeout, check=False, cwd=str(cwd) if cwd else None,
         )
     except subprocess.TimeoutExpired as e:
@@ -127,7 +127,7 @@ def run_erc(
         str(sch_path),
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)
     except subprocess.TimeoutExpired as e:
         raise KicadCliError(f"kicad-cli sch erc timed out after {timeout}s") from e
     if r.returncode != 0 or not output_json.is_file():
@@ -136,7 +136,7 @@ def run_erc(
             f"stderr: {r.stderr[-300:]}"
         )
 
-    data = json.loads(output_json.read_text())
+    data = json.loads(output_json.read_text(encoding="utf-8"))
     out = _shape_erc(data, output_json)
     out["cli_path"] = str(cli)
     return out
@@ -238,7 +238,7 @@ def run_drc(
         cmd.insert(-1, "--save-board")
 
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)
     except subprocess.TimeoutExpired as e:
         raise KicadCliError(f"kicad-cli pcb drc timed out after {timeout}s") from e
     if r.returncode != 0 or not output_json.is_file():
@@ -247,7 +247,7 @@ def run_drc(
             f"stderr: {r.stderr[-300:]}"
         )
 
-    data = json.loads(output_json.read_text())
+    data = json.loads(output_json.read_text(encoding="utf-8"))
     out = _shape_drc(data, output_json)
     out["cli_path"] = str(cli)
     return out

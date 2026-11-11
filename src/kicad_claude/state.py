@@ -7,6 +7,7 @@ project at a time.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -149,3 +150,32 @@ def get_active_board_path() -> Path:
     if _active_board is None:
         return proj.pcb_path
     return proj.path / _active_board
+
+
+# --------------------------------------------------------------------------- #
+# One call on another sheet / board, without changing the active one
+# --------------------------------------------------------------------------- #
+
+
+@contextmanager
+def using_sheet(filename: str | None):
+    """Make `filename` (None: root) the active sheet for the `with` block."""
+    global _active_sheet
+    previous = _active_sheet
+    set_active_sheet(filename)
+    try:
+        yield
+    finally:
+        _active_sheet = previous
+
+
+@contextmanager
+def using_board(filename: str | None):
+    """Make `filename` (None: the project's board) active for the `with` block."""
+    global _active_board
+    previous = _active_board
+    set_active_board(filename)
+    try:
+        yield
+    finally:
+        _active_board = previous

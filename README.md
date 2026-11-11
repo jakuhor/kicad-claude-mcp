@@ -1,12 +1,12 @@
 # kicad-claude-mcp
 
 > Design KiCAD PCBs from natural language. An MCP server that gives Claude
-> Code (or any MCP client) **156 tools** to drive a complete PCB workflow —
+> Code (or any MCP client) **142 tools**, loaded in groups on demand, to drive a complete PCB workflow —
 > schematic capture, library management, PCB layout, autorouting, design
 > review against the parts' datasheets, sourcing, manufacturing outputs,
 > signal-integrity calculations, RF design, and more.
 
-**156 MCP tools · 709 tests (642 fast, 61 acceptance, 6 network) · headless from idea to gerbers**
+**142 MCP tools in 11 on-demand sets · 819 tests (752 fast, 61 acceptance, 6 network) · headless from idea to gerbers**
 
 The server edits `.kicad_sch` / `.kicad_pcb` / `.kicad_pro` files directly, in
 KiCAD 10's own formatting — one added wire is a ten-line git diff, not a
@@ -51,7 +51,7 @@ files. You verify the result by opening KiCAD.
 git clone https://github.com/Greg3001/kicad-claude-mcp.git
 cd kicad-claude-mcp
 uv sync
-cp .env.example .env       # fill API keys when ready (optional, only Phase 4+)
+cp .env.example .env       # fill API keys when ready (optional, sourcing only)
 ```
 
 Download Freerouting 2.1.0 to `third_party/freerouting.jar` (only needed for `autoroute_pcb`):
@@ -123,6 +123,10 @@ Add to `~/.claude/settings.json`:
 The second entry is optional — it is the branch checkout from the previous
 section, exposed under its own name. Drop it if you only run one.
 
+The server starts with the `core` tool set only and the model loads the rest
+with `load_toolset` (see [Tool sets](#tool-sets)). To register everything at
+startup instead, add `"env": {"KICAD_MCP_TOOLSETS": "all"}` to the entry.
+
 ### First run
 
 ```
@@ -135,26 +139,57 @@ section, exposed under its own name. Drop it if you only run one.
 
 ## Capabilities
 
+### Tool sets
+
+Every listed tool schema costs context on every turn, so the tools come in
+groups and only `core` is registered at startup (12 tools, about 1.2k tokens;
+all sets together about 20k, against 36.6k before the rework).
+
+| Set | Contents |
+|---|---|
+| `core` | `ping`, project create/open/state, `list_components`, `run_erc`, `run_drc`, `clear_stale_lock`, `help`, `list_toolsets`, `load_toolset`, `unload_toolset` |
+| `sch` | schematic edit and query, sheets, buses, fields, nets, annotation, update PCB from schematic |
+| `pcb` | board edit and query, layers, zones, diff pairs, meanders, multi-board, autorouting, RF stitching |
+| `rules` | design rules, fab presets, net classes, custom DRC rules |
+| `library` | library index and search, symbol and footprint creation |
+| `review` | connectivity, circuits, part ratings, power tree, what-if, design diff, lifecycle, assembly, release gate |
+| `emc_si` | EMC pre-compliance, return paths, crosstalk, ground coverage, impedance and current calculators, thermal |
+| `sim` | SPICE export, ngspice, subcircuit simulation |
+| `datasheets` | datasheet download, extraction cache, specs |
+| `sourcing` | distributor availability, vendor parts, BOM enrichment and diff, field write-back |
+| `fab` | Gerber/drill/pos/BOM/STEP/render exports, fab package, panelization |
+
+- `load_toolset(toolsets=[...])` registers one or more sets (`all` for every set) and sends `notifications/tools/list_changed`, so the client re-lists its tools; the server declares `tools.listChanged`. `unload_toolset` removes sets again; `core` stays. `list_toolsets` shows every set, whether it is loaded, and its tool names.
+- A call to a tool whose set is not loaded fails with the set to load.
+- Listed descriptions are summaries (at most 500 characters): what the tool does, when to use it, its key arguments. `help(tool)` returns the full documentation — arguments, outputs, method notes, rule IDs — for any tool, loaded or not. Input schemas are listed without pydantic titles and without the `null` branch of optional arguments. Fixed choices are enums and list arguments are arrays (`groups=["ground", "io"]`), so the schema shows the accepted values.
+- Budgets are tests (`tests/test_core_toolsets.py`): 500 characters per description, 1600 per listed tool, and a character budget per set.
+- `KICAD_MCP_TOOLSETS` picks the startup sets: a comma list, or `all` for clients that defer tool schemas themselves. Default `core`.
+- Sheet-level tools take an optional `sheet` ("root", a `.kicad_sch` file or a root sheet name) and board-level tools an optional `board` ("main" or a `.kicad_pcb` file); without it they use the active sheet / board, and the active one never changes because of the argument.
+- Coordinates: a point is `x_mm, y_mm`; anything with two ends (wire, bus, track, box) is `x1_mm, y1_mm, x2_mm, y2_mm`.
+- Plain (`def`) tools run in a worker thread, one at a time, so a minutes-long kicad-cli or pcbnew run no longer freezes ping, tool listing or cancellation.
+
 ### Safe file writes
 
 - **Round-trip formatting**: a write touches only the nodes it changed. The layout comes from a port of KiCAD's own `Prettify`; all 91 KiCAD 10 demo schematics round-trip byte-identically, so a git diff shows only the edit.
-- **Every mutating tool goes through one writer**: it refuses while KiCAD holds the project's `.lck`, backs up to `<project>/.backups/<timestamp>_<file>` (newest 10 kept), re-parses the result and restores the backup if it does not parse. Control characters are escaped on write.
+- **Every write to a KiCAD file goes through one guard** (`adapters/safe_write.py`): schematics, boards, libraries and lib tables (`save_tree`), `.kicad_pro` and `.kicad_dru` (`save_text`), and the board rewrites pcbnew and Freerouting do (`guard_external`). It refuses while KiCAD holds the project's `.lck`, backs up to `<file dir>/.backups/<timestamp>_<file>` (newest 10 kept), writes a sibling temp file and swaps it in (as KiCAD does, so a crash never leaves half a file), re-parses the result and restores the backup if it does not parse. A test fails when new code writes around the guard. An edit that spans several files (annotation, `rename_label`, `refresh_lib_symbols`, `update_symbol_fields`, a new sub-sheet) is all-or-nothing: every lock is checked first, and if one file fails the others get their backups back. Control characters are escaped on write.
+- **UTF-8 only**: files are read and written as UTF-8 and kicad-cli / git / ngspice output is decoded as UTF-8, whatever the Windows code page. A KiCAD file with bytes that are not UTF-8 is refused rather than read lossily, so a write cannot corrupt them.
+- **Custom DRC rules are edited in place**: adding, replacing or removing a rule changes only that rule's text; comments (`#`), other rules and clauses the server does not model stay byte for byte. A `.kicad_dru` that does not parse is reported, never overwritten.
 - **Stale locks**: the refusal says who holds the lock (KiCAD's lock file has only user and host) and whether a KiCAD process is running; `clear_stale_lock` removes it only on explicit request.
-- **Strict arguments**: an unknown keyword is an error naming the closest accepted spelling, not silently ignored. Older spellings (`net_name` → `net`, …) still work and the response lists them under `deprecated_arguments`.
+- **Strict arguments**: an unknown keyword is an error naming the closest accepted spelling, not silently ignored. Every net argument is named `net`. A few guessed spellings (`x` → `x_mm`, `text` → `net` on labels, …) are renamed and the response lists them under `deprecated_arguments`.
 
 ### Schematic capture
 
-- **Symbol placement & connections**: `add_symbol` (with `footprint=` and arbitrary `fields=` in the same call), `add_wire`, `add_label`, `add_power_symbol`, `add_no_connect`, `move_symbol`, `remove_symbol`, `replace_symbol`, `get_pin_position`, `list_pins`
+- **Symbol placement & connections**: `add_symbol` (with `footprint=` and arbitrary `fields=` in the same call), `add_wire`, `add_label`, `add_power_symbol`, `add_no_connect`, `move_item`, `remove_symbol`, `replace_symbol`, `get_pin_position`, `list_pins`
 - **Derived library symbols** (`extends`, e.g. `TLV75733PDBV`, `2N7002`) are flattened like KiCAD's `LIB_SYMBOL::Flatten`, so their pins are placed and wired correctly.
 - **Pins landing mid-wire**: KiCAD does not connect a pin to a wire's interior without a junction. `add_symbol` / `add_power_symbol` add the junction and report it (`junctions_added`).
 - **Power ports**: any net name works (`add_power_symbol(net="GND_USB")`, built on a stock base symbol with the Value overridden, `base_symbol=` to choose it); the `#PWR` / `#FLG` reference is hidden as in KiCAD. `PWR_FLAG` never names a net.
-- **Fields**: `move_symbol` carries the fields with the symbol (rotation included); `set_field_position`, `set_symbol_property`, `remove_symbol_property`, `get_symbol_properties`, `set_dnp`, `set_in_bom`, `set_on_board`
-- **Editing and deletion**: `remove_wire`, `add_junction`, `remove_junction`, `remove_no_connect`, `move_item`, `rename_label`, `add_text` / `set_text` / `remove_text`, `remove_items_in_box` (both endpoints must be inside, so a crossing wire survives), and `remove_symbol(remove_connected_wires=True)` to drop the stubs left on the removed pins
+- **Fields**: `move_item` carries the fields with the symbol (rotation included); `set_field_position`, `set_symbol_property`, `remove_symbol_property`, `get_symbol_properties`, `set_symbol_flags` (dnp / in_bom / on_board / exclude_from_sim)
+- **Editing and deletion**: `remove_item` (wire / bus / junction / no-connect by position, or any item by uuid), `add_junction`, `move_item` (a symbol by reference or any item by uuid), `rename_label`, `add_text` / `set_text`, `remove_items_in_box` (both endpoints must be inside, so a crossing wire survives), and `remove_symbol(remove_connected_wires=True)` to drop the stubs left on the removed pins
 - **Connectivity model**: `list_sch_nets`, `trace_net`, `get_pin_net`, `find_dangling` — the same connectivity KiCAD uses (net names from power symbols with a `power_in` pin, labels, hierarchy)
 - **Grid discipline**: every placement snaps to KiCAD's 1.27 mm grid unless you pass `snap_to_grid=False`, so endpoints actually connect
 - **Hierarchical sheets**: `add_sheet`, `set_active_sheet` (the root sheet by its file name too), `get_active_sheet`, `add_hierarchical_label`, `add_sheet_pin`, `list_sheets`; `list_components(sheet=…)` lists one sheet without switching
 - **Buses**: `add_bus`, `add_bus_entry`, `add_bus_alias` — visual grouping of address/data lines
-- **Annotation**: `annotate_schematic` — auto-numbers `R?` → `R1, R2, ...` across all sheets
+- **Annotation**: `annotate_schematic` — auto-numbers `R?` → `R1, R2, ...` across the whole hierarchy, nested sheets included. A sheet used twice gets one reference per instance (KiCAD's `(instances … (path … (reference …)))`), the next free number counts every instance's reference, and the units of one multi-unit part share a number (U1A / U1B). A locked project is refused before any sheet is written.
 - **Custom symbols**: `create_symbol` with full pin specifications and arbitrary fields; `refresh_lib_symbols` updates a sheet's cached library symbols
 
 ### Library management
@@ -166,9 +201,9 @@ section, exposed under its own name. Drop it if you only run one.
 ### Sourcing and datasheets
 
 - **Availability**: `check_availability` against Mouser, DigiKey, TME, Farnell and JLCPCB (opt-in source: LCSC number, stock, USD price breaks, basic / preferred / extended library type, no key needed)
-- **Single datasheet**: `fetch_datasheet` tries the given URL and each source's datasheet link in order and keeps the first body that really is a PDF (bot-protection HTML is rejected; TLS verification is never disabled); every attempt is reported
+- **Single datasheet**: `fetch_datasheet` tries the given URL and each source's datasheet link in order and keeps the first body that really is a PDF (bot-protection HTML is rejected; TLS verification is never disabled); every attempt is reported. A Datasheet URL comes from whatever schematic is open, so downloads are http(s) only, go only to public addresses (loopback, private, link-local and reserved hosts are refused, on every redirect; `KICAD_MCP_ALLOW_PRIVATE_DOWNLOADS=1` allows an intranet server), follow at most 5 redirects and stop at 60 MB or 120 s
 - **Project datasheet folder**: `sync_datasheets` gives every schematic MPN its PDF in `datasheets/` and records the mapping in `datasheets/manifest.kicad-claude.json`. Existing vendor-named files (`8471fd.pdf`) are matched through the symbol's Datasheet URL, the PDF's own text (MPN or family stem) or the file name; the rest is downloaded. The folder is `<project>/datasheets`, or the nearest parent `datasheets/` up to the git root (one shared folder for a multi-board repo). Reports unmapped parts and orphan PDFs.
-- **Structured specs, extracted by the calling agent**: `get_datasheet_extraction_task` hands over the PDF path, the text of the pages holding the tables, the part's schematic pins and nets, and the schema; `save_datasheet_extraction` validates the record and caches it in `datasheets/specs/<MPN>.json`. Every value carries its PDF page and SI unit; the server checks each number against the cited page's text and warns when it is not there. A record goes `stale` when its PDF changes. `get_datasheet_specs` returns one record or the coverage. No value is taken from general knowledge. Pin behaviour the DC model uses goes in `pin_models` (clamp, trip current, bias current, input resistance, keyed by pin name). Graphs go in `curves` (points read off the plot, with page; e.g. a capacitor's `C_bias`, capacitance vs DC bias). The schema names the keys the analyzers read: capacitor `C`, `ESR`, `ESL`, rated `V`, `C_bias`; inductor `L`, `DCR`, `Isat`, `Irms*`; common-mode choke `Z_cm`, `DCR`, `I_rated`; LED `VF`, `IF`; constant-current regulator `I_reg`, `V_min`; connector `I_rated` (per contact) / `I_rated_total` (a rail's contacts together); `thermal.rth_ja` / `tj_max`; op-amp `GBW`; crystal `CL`.
+- **Structured specs, extracted by the calling agent**: `get_datasheet_extraction_task` hands over the PDF path, the text of the pages holding the tables, the part's schematic pins and nets, and the schema; `save_datasheet_extraction` validates the record and caches it in `datasheets/specs/<MPN>.json`. Every value carries its PDF page and SI unit; the server checks each number against the cited page's text and warns when it is not there. A record goes `stale` when its PDF changes. `get_datasheet_specs` returns one record or the coverage. A manifest entry that names a file outside `datasheets/` (a crafted manifest in a cloned repo) is refused. No value is taken from general knowledge. Pin behaviour the DC model uses goes in `pin_models` (clamp, trip current, bias current, input resistance, keyed by pin name). Graphs go in `curves` (points read off the plot, with page; e.g. a capacitor's `C_bias`, capacitance vs DC bias). The schema names the keys the analyzers read: capacitor `C`, `ESR`, `ESL`, rated `V`, `C_bias`; inductor `L`, `DCR`, `Isat`, `Irms*`; common-mode choke `Z_cm`, `DCR`, `I_rated`; LED `VF`, `IF`; constant-current regulator `I_reg`, `V_min`; connector `I_rated` (per contact) / `I_rated_total` (a rail's contacts together); `thermal.rth_ja` / `tj_max`; op-amp `GBW`; crystal `CL`.
 - **BOM enrichment**: `enrich_bom_with_sourcing` queries the chosen sources per unique value and appends MPN / stock / price / URL columns (JLCPCB adds `jlc_lcsc`, `jlc_type`)
 - API keys never reach the log: request URLs are not logged and key-like query values are redacted.
 
@@ -176,7 +211,7 @@ section, exposed under its own name. Drop it if you only run one.
 
 - **2 to 32 copper layers** with auto-generated stackup (`set_layer_count`)
 - **Footprint placement**: `add_footprint`, `move_footprint`, `place_footprints_grid`
-- **Routing**: `add_track`, `add_via`, `add_via_array`, `add_meander` (length tuning)
+- **Routing**: `add_track`, `add_via`, `add_via_array`, `add_meander` (length tuning); `remove_board_items` removes one track / arc / via / zone by uuid (DRC reports carry them) or rips up a net, optionally on one layer, with `dry_run`
 - **Copper pours**: `add_zone`, `add_ground_plane` (auto-extracts board outline, rounded corners included)
 - **Mechanical**: `add_mounting_hole` (M2/M2.5/M3/M4/M5), `add_fiducial`, `add_silk_text`
 - **RF specials**: `add_rf_microstrip` (target Z₀), `add_ground_stitching`
@@ -200,6 +235,7 @@ section, exposed under its own name. Drop it if you only run one.
 
 Both tools export the whole hierarchy with `kicad-cli sch export netlist`, so the connectivity is exactly KiCAD's. They are pin-name and pin-type heuristics: every finding says what it saw, and should be confirmed against the schematic and datasheet.
 
+- **Component values** are read as KiCAD's simulator reads them: `4k7`, `2.2Meg`, `10 µF` / `10μF` (micro sign or Greek mu, unit after a space), decimal comma (`4,7k`), the first field of `0.1uF, 50V`, digit groups (`78 182`). `1,000` (decimal comma or thousands separator) is left unparsed, not guessed.
 - **`analyze_power_tree`** — finds each regulator (one record per channel on multi-channel parts), its topology, input and output rail, EN state (tied to input, divider, driven by another part's pin = sequencing, floating …), power-good pull-up, feedback divider (values, ratio), SET resistor, switch-node inductor and input / output capacitors. Builds the rail tree through series L / ferrite / 0 Ω links (DNP marked). Computes each Vout from the datasheet specs — FB divider with the right-polarity Vref, ANY-OUT pin strapping, or SET current × R — or from a caller `vref`, and carries rail voltages through the links. With those voltages it checks VIN against absolute maximum and recommended range, VOUT range, LDO headroom against dropout, and the EN pin voltage (divider / pull-up, power-good released) against the EN rating and turn-on threshold. Unregulated inputs (a USB-PD contract) come from `rail_voltages={"/VBUS": 20}`. Nets off the rails (EN dividers, multi-branch networks) come from the DC operating-point model below, so an EN pin held by an internal clamp is checked at the clamped voltage; solved nets are returned as `net_voltages`.
 - **`review_connectivity`** — checks (all on by default, choose with `checks=`): IC power pins and how each rail is sourced; decoupling per IC supply net; open-drain outputs without pull-up; I2C buses (pull-ups, address strapping, fixed datasheet addresses); symbol pins against the datasheet pin table; every pin and pin pair (VDS, VGS, TVS standoff) against its absolute maximum at the net's voltage; capacitor DC voltage against its rating — the fitted MPN's extracted datasheet when there is one, else the `Voltage` field (`cap_derating`, default 0.8). The pin and capacitor checks run on the DC operating-point model in each switch scenario (`switch_states`: `auto` by default — every combination up to `max_switch_combos`, else all-on / all-off —, `all`, `both`, `on`, `off`, `none`; `switch_overrides={"Q3": "off"}`).
 - **DC operating-point model** (`analyze_power_tree`, `review_connectivity`) — on top of the rail voltages: every fitted resistor network solved by nodal analysis (0 Ω, inductors and ferrites are shorts); datasheet pin models (`pin_models` in the spec record: internal clamp, trip current such as an OVLO threshold, bias current, input resistance; `regulator.en_pullup_current` is applied to EN pins); zeners that clamp (VZ max from the spec cache, else the part's value), solved iteratively; transistor switches — `on` joins drain and source and the gate driver (an IC output, directly or through a series resistor) pulls to the on level, limited to the pin's datasheet drive current (`pin_models` `i_sink` / `i_source`; above it the pin becomes a current source and DC-DRIVE warns); `off` passes only the body diode (VSD from the spec cache, else no drop) and leaves the far side at 0 V. A driver's high level is its `v_oh`, else its internal regulator's `v_out` (e.g. VDDD), else an unambiguous supply. `review_connectivity` runs every on / off combination of the switches up to `max_switch_combos` (default 16) (above that: all on, all off and each switch flipped alone) and reports each pin's worst case (`pin_abs_max_worst`, `cap_voltage_worst`); DC-NODATA lists what the model ran without (drive ratings, body-diode VSD, P / N type, zener VZ); findings that occur only in some states say which (`[when Q1 on]`). Static DC: capacitors open, no switching transients.
@@ -255,17 +291,18 @@ Parts of the rule vocabulary (pin-name sets, non-regulator exclusions) and the s
 
 ### Manufacturing outputs
 
+- **`export(kind=…)`** — one output via kicad-cli: gerbers, drill, pos, bom, netlist, render, step, svg; per-kind settings in `options` (unknown keys are refused; `help("export")` lists them)
 - **`export_fab_package`** — one-shot: gerbers + drill (PTH/NPTH split) + pos CSV + BOM + 3D render, all under `<project>/fab/`
-- **3D STEP export** — `export_step_3d` for Fusion 360 / SolidWorks / FreeCAD
-- **3D render** — `render_pcb_3d` (PNG, configurable side / quality / rotation)
+- **3D STEP export** — `export(kind="step")` for Fusion 360 / SolidWorks / FreeCAD
+- **3D render** — `export(kind="render")` (PNG, configurable side / quality / rotation)
 - **SVG per layer** — for documentation
-- **BOM with sourcing fields** — `export_bom` carries the symbols' MPN / manufacturer / distributor fields
+- **BOM with sourcing fields** — `export(kind="bom")` carries the symbols' MPN / manufacturer / distributor fields
 - **Panelization** — `panelize_board_grid` duplicates the board in a grid with mouse bites for batch fabrication
 
 ### Engineering analysis
 
-- **Signal integrity** — IPC-2141A microstrip / stripline / differential / CPWG impedance, with inverse solver (target Z₀ → trace width)
-- **Thermal capacity** — IPC-2152 trace current, both directions; per-net audit identifying the weakest segment
+- **Signal integrity** — `calc_impedance`: microstrip / stripline (IPC-2141A), differential, and CPWG (conductor-backed CPW, Ghione & Naldi, checked against exact elliptic integrals) impedance from a width, or the width for a target Z₀, for every geometry
+- **Thermal capacity** — `calc_trace_current`: IPC-2152 amps for a width or width for a current; `analyze_pcb_current_capacity` per-net audit identifying the weakest segment
 - **Thermal network** — lumped-element junction temperature solver (Rjc + Rca → Tj)
 - **Crosstalk** — closed-form NEXT/FEXT for parallel microstrips
 - **Return path continuity** — `check_return_path_continuity` checks each signal segment against the filled ground on the adjacent layer(s), skipping pad / via ends and power nets
@@ -370,7 +407,7 @@ assign_net_class    net_pattern="+5V"    class_name="Power"
 add_footprint   lib_id="Resistor_SMD:R_0603_1608Metric" reference="R1" ...
 add_footprint   lib_id="Resistor_SMD:R_0603_1608Metric" reference="R2" ...
 update_pcb_from_schematic                                  # nets propagate
-add_ground_plane  layer="B.Cu"  net_name="GND"
+add_ground_plane  layer="B.Cu"  net="GND"
 autoroute_pcb     passes=20
 
 # 3. Validate + export
@@ -386,35 +423,27 @@ enrich_bom_with_sourcing  sources="mouser,digikey,tme,farnell"
 
 ```
 kicad-claude-mcp/
-├── server.py                          # FastMCP entry point — registers all tools
+├── server.py                          # FastMCP entry point — core set + toolset control
 ├── pyproject.toml                     # uv project
 ├── .env.example                       # API keys + path overrides
 ├── src/kicad_claude/
 │   ├── strict_args.py                 # unknown-argument errors + accepted aliases
 │   ├── state.py                       # active project / sheet / board
-│   ├── tools/                         # MCP tools, thin wrappers over adapters
-│   │   ├── project.py                 # create_project, set_project, list_components, clear_stale_lock
-│   │   ├── review.py                  # analyze_power_tree, review_connectivity, review_circuits, review_part_ratings
-│   │   ├── bom.py                     # diff_bom, export_fab_bom, update_symbol_fields
-│   │   ├── release.py                 # analyze_gerbers, diff_designs, what_if, audit_lifecycle, review_assembly, fab_release_gate
-│   │   ├── datasheets.py              # sync_datasheets, extraction task / save / specs
-│   │   ├── library.py                 # index_libraries, search_*, get_symbol_details
-│   │   ├── schematic.py               # add_symbol, wires, hierarchical sheets, buses
-│   │   ├── pcb.py                     # PCB editing, multi-board, layers
-│   │   ├── routing.py                 # autoroute_pcb (Freerouting wrapper)
-│   │   ├── manufacturing.py           # gerbers, drill, BOM, render, fab_package, STEP
-│   │   ├── validation.py              # run_erc, run_drc with JSON parsing
+│   ├── toolsets.py                    # tool sets: registry, load/unload, list_changed
+│   ├── arg_types.py                   # Literal choice types shared by tool signatures
+│   ├── tools/                         # MCP tools, one module or package per tool set
+│   │   ├── common.py                  # active-project helpers shared by several sets
+│   │   ├── core/                      # project.py (create/set/state/list_components/locks), validation.py (run_erc, run_drc)
+│   │   ├── sch/                       # schematic.py (symbols, wires, labels, buses, sheets, fields, nets), sync.py (annotate, update_pcb_from_schematic)
+│   │   ├── pcb/                       # layout.py (board edit/query, removal, diff pairs, multi-board), routing.py (Freerouting), rf.py
 │   │   ├── rules.py                   # design rules, net classes, fab presets, DRU
-│   │   ├── sourcing.py                # availability, fetch_datasheet, vendor ZIPs, BOM enrichment
-│   │   ├── sync.py                    # annotate, update_pcb_from_schematic
-│   │   ├── library_create.py          # create_symbol, create_footprint
-│   │   ├── signal_integrity.py        # impedance calculators
-│   │   ├── thermal.py                 # IPC-2152 current capacity
-│   │   ├── rf.py                      # via arrays, ground stitching, RF microstrip
-│   │   ├── emc.py                     # EMC heuristics + analyze_emc
-│   │   ├── simulation.py              # thermal network, crosstalk, return path
-│   │   ├── spice.py                   # ngspice wrapper + simulate_subcircuits
-│   │   └── panelization.py            # grid panelize + mouse bites
+│   │   ├── library/                   # index.py (index_libraries, search_*), create.py (create_symbol, create_footprint)
+│   │   ├── review/                    # design.py (power tree, connectivity, circuits, ratings), release.py (gerbers, diff, what_if, lifecycle, assembly, gate)
+│   │   ├── emc_si/                    # emc.py (analyze_emc + heuristics), signal_integrity.py (calc_impedance, crosstalk, return path), thermal.py
+│   │   ├── sim.py                     # SPICE netlist, ngspice, simulate_subcircuits
+│   │   ├── datasheets.py              # sync_datasheets, extraction task / save / specs
+│   │   ├── sourcing/                  # distributors.py (availability, datasheets, vendor ZIPs, enrichment), bom.py (diff, fab BOM, field write-back)
+│   │   └── fab/                       # exports.py (export, export_fab_package), panelization.py
 │   ├── adapters/                      # logic detached from MCP framing
 │   │   ├── sch_io.py                  # parse + write
 │   │   ├── kicad_prettify.py          # port of KiCAD's Prettify (byte-exact layout)
@@ -447,6 +476,7 @@ kicad-claude-mcp/
 │   │   ├── panelization.py            # tree duplication + translation
 │   │   ├── library_create.py          # symbol/footprint synthesis
 │   │   ├── annotation.py              # auto-numbering across sheets
+│   │   ├── sch_sync.py                # place missing footprints, sync fields, orphans
 │   │   ├── drc_rules.py               # .kicad_dru read/write
 │   │   ├── project_settings.py        # .kicad_pro JSON helpers
 │   │   ├── vendor_import.py           # ZIP extraction + lib-table updates
@@ -455,7 +485,7 @@ kicad-claude-mcp/
 │   ├── indexer/                       # KiCAD library indexing (~10 MB cache)
 │   ├── templates/                     # blank project / sheet / PCB
 │   └── utils/                         # logging, geometry (mm, grid snap), paths
-├── tests/                             # 642 fast + 61 acceptance + 6 network tests
+├── tests/                             # 752 fast + 61 acceptance + 6 network tests
 └── docs/open_points.md                # the open-items queue
 ```
 
@@ -480,8 +510,8 @@ Open work and new field reports live in [`docs/open_points.md`](./docs/open_poin
 
 ```bash
 uv run mcp dev server.py                          # MCP Inspector (browser UI)
-uv run pytest -m "not slow and not network" -q    # 642 fast tests, ~1 min
-uv run pytest -m "slow" -q                        # 50 acceptance tests via kicad-cli (~8 min)
+uv run pytest -m "not slow and not network" -q    # 752 fast tests, ~1 min
+uv run pytest -m "slow" -q                        # 61 acceptance tests via kicad-cli (~8 min)
 uv run pytest -m "network" -q                     # 6 live distributor tests
 ```
 
