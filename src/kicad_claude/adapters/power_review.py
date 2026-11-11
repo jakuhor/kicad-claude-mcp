@@ -332,7 +332,8 @@ def is_negative_rail(net: str | None) -> bool:
 def analyze(nl: Netlist, vref: dict | None = None,
             vref_sources: dict | None = None,
             datasheet: dict | None = None,
-            rail_voltages: dict | None = None) -> dict:
+            rail_voltages: dict | None = None,
+            specs: dict | None = None) -> dict:
     """`vref` is keyed by regulator name (`U2/ch1`) or ref (`U1`);
     `vref_sources` says where each came from (default `caller`).
 
@@ -343,7 +344,13 @@ def analyze(nl: Netlist, vref: dict | None = None,
     `(min, typ, max, source)` for `abs_vin`, `rec_vin`, `abs_vout`,
     `rec_vout`, `abs_en`, `en_on`, `dropout`; with the rail voltages (computed
     Vouts, carried through series L / ferrite / 0 R links, plus the caller's
-    `rail_voltages`) they drive the `PT-DS-*` checks."""
+    `rail_voltages`) they drive the `PT-DS-*` checks.
+
+    `specs` ({ref: spec record}) turns on the DC operating-point model
+    (`dc_model`) for nets off the rails: multi-branch resistor networks, pin
+    bias currents, internal pin clamps and zeners. The EN checks then use
+    the clamped voltage, clamps add DC-* findings, and the solved nets are
+    returned as `net_voltages`."""
     vref = vref or {}
     vref_sources = vref_sources or {}
     datasheet = datasheet or {}
@@ -357,6 +364,16 @@ def analyze(nl: Netlist, vref: dict | None = None,
         ref, ch, roles, comp = cand["ref"], cand["channel"], cand["roles"], cand["comp"]
         name = f"{ref}{'/ch' + ch if ch else ''}"
         vin = _first_net(roles.get("vin", []))
+        ds_early = datasheet.get(name) or datasheet.get(ref) or {}
+        vin_note = None
+        if ds_early.get("input_pin"):
+            pin_name, src_ip = ds_early["input_pin"]
+            hit = next((p.net for p in nl.pins.get(ref, [])
+                        if p.name.upper() == pin_name.upper() and not is_unconnected(p.net)), None)
+            if hit and hit != vin:
+                vin_note = (f"power input taken from pin {pin_name} ({hit}) per {src_ip}; "
+                            f"the VIN-named pin is on {vin}")
+                vin = hit
         vout_pin_net = _first_net(roles.get("vout", []))
         sw_net = _first_net(roles.get("sw", []))
         fb_net = _first_net(roles.get("fb", []))
@@ -446,6 +463,8 @@ def analyze(nl: Netlist, vref: dict | None = None,
             "set": set_info, "enable": en, "power_good": pg, "vout": vout,
             "input_caps": _caps(nl, vin), "output_caps": _caps(nl, out_net),
         }
+        if vin_note:
+            rec["input_note"] = vin_note
         regs.append(rec)
 
         # ---- findings (datasheet-free) ----
@@ -610,7 +629,23 @@ def analyze(nl: Netlist, vref: dict | None = None,
                     "has no input unless that part is fitted or bridged.")
 
     volts = _rail_voltages(regs, links, rail_voltages or {})
-    _datasheet_checks(nl, regs, volts, datasheet, finding)
+    # pins a part drives at another pin's voltage + offset (Skyhook / bootstrap)
+    for r in regs:
+        ds = datasheet.get(r["name"]) or datasheet.get(r["ref"]) or {}
+        for pin, (above, off, src) in (ds.get("internal_outputs") or {}).items():
+            pn_ = {p.name.upper(): p.net for p in nl.pins.get(r["ref"], [])}
+            n, a = pn_.get(pin.upper()), pn_.get(above.upper())
+            if n and a and a in volts and n not in volts:
+                volts[n] = (volts[a][0] + off, f"{r['ref']}.{pin} = {above} + {off:g} V ({src})")
+    dc = None
+    check_volts = volts
+    if specs is not None:
+        from kicad_claude.adapters import dc_model
+        dc = dc_model.solve(nl, volts, specs)
+        check_volts = {**dc["volts"], **volts}
+        for f in dc_model.findings(dc):
+            finding(f["severity"], f["rule"], f["ref"], f["message"])
+    _datasheet_checks(nl, regs, check_volts, datasheet, finding)
 
     sequencing = [{"regulator": r["name"], "enabled_by": r["enable"]["by"]}
                   for r in regs if r["enable"] and r["enable"]["state"] == "driven"]
@@ -623,6 +658,9 @@ def analyze(nl: Netlist, vref: dict | None = None,
             "rail_voltages": {k: {"volts": v[0], "source": v[1]}
                               for k, v in sorted(volts.items())},
             "sequencing": sequencing, "findings": findings,
+            **({"net_voltages": {n: {"volts": round(v, 4), "source": s}
+                                 for n, (v, s) in sorted(dc["volts"].items()) if n not in volts},
+                "dc_model": {"clamps": dc["clamps"], "notes": dc["notes"]}} if dc else {}),
             "counts": {k: sum(1 for f in findings if f["severity"] == k) for k in order}}
 
 

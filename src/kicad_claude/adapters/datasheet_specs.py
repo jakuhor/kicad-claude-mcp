@@ -21,10 +21,23 @@ Spec record (schema version 1):
                       "anyout": {"base": SV, "pins": {"12": SV, ...}}
                         (pin-strapped output: Vout = base + each listed pin
                         that is tied to ground; keys are pin NUMBERS),
+                      "light_load": "fccm" | "pfm" | "dcm" | "auto" (forced
+                        PWM keeps the inductor in CCM at any load),
+                      "input_pin": "C2" (the pin the channel's power flows
+                        in through, when it is not the VIN pin - LT8471 ch2
+                        draws from C2; VIN2 is only its driver supply),
+                      "internal_outputs": {"SHOUT": {"above_pin": "C2",
+                        "offset": SV}} (a pin the part drives at another
+                        pin's voltage + offset, e.g. a Skyhook / bootstrap
+                        rail),
                       "channels": {"1": {"vref": SV}, "2": {...}}},
      "i2c":          {"addresses": ["0x48"], "address_rule": "...", "page": 12},
      "thermal":      {"rth_ja": SV, "tj_max": SV},
      "curves":       {"C_bias": CURVE, ...},
+     "pin_models":   {"OV/UV": {"clamp": SV, "i_trip": SV, "i_bias": SV,
+                                "r_in": SV}, "EN_OUT": {"i_sink": SV,
+                                "i_source": SV, "v_oh": SV}, "VDDD":
+                                {"v_out": SV}, ...},
      "notes": ["..."]}
 
 CURVE (a graph read off the datasheet): {"x_unit": unit, "y_unit": unit,
@@ -32,6 +45,16 @@ CURVE (a graph read off the datasheet): {"x_unit": unit, "y_unit": unit,
 "conditions": str}. `C_bias`: capacitance vs DC bias, x in "V", y in "%"
 of nominal (100 at 0 V) or in "F". Points are read from the plot, so
 they are not checked against the page text.
+
+PIN MODEL (keyed by the datasheet pin name, used by the DC operating-point
+model): `clamp` internal clamp voltage to ground (V), `i_trip` current into
+that clamp at which the part changes state (A, e.g. an OVLO threshold),
+`i_bias` pin bias current, positive INTO the pin (A, max is used),
+`r_in` input resistance to ground (Ohm), `i_sink` / `i_source` an output's
+drive current (A; the minimum is used: above it the pin is a current
+source), `v_oh` output-high level (V, minimum used), `v_out` a pin the part
+holds at a fixed voltage (V, e.g. an internal LDO output). EN pull-up currents already in
+`regulator.en_pullup_current` are applied without a pin model.
 
 Conventional keys the analyzers read (use these names):
   - capacitor: electrical.C, ESR, ESL, SRF; absolute_max.V (rated
@@ -41,6 +64,10 @@ Conventional keys the analyzers read (use these names):
   - common_mode_choke: electrical.Z_cm (at a stated frequency), DCR,
     I_rated; absolute_max.V;
   - led: electrical.VF (at the IF in conditions), absolute_max.IF;
+    curves.VF (x IF in "A", y VF in "V") for VF at the operating current;
+  - switching regulator: curves.efficiency (x output current "A", y "%",
+    conditions "VIN = 12 V, VOUT = 5 V"; several curves allowed, the closest
+    VIN / VOUT is used; `efficiency_ch2` for one channel);
   - current_regulator (CCR): electrical.I_reg, V_min (anode-cathode
     voltage needed to regulate); absolute_max.V;
   - connector: electrical.I_rated (per contact) and / or I_rated_total
@@ -83,6 +110,7 @@ CATEGORIES = ("regulator_switching", "regulator_linear", "voltage_reference",
               "connector", "other")
 SV_GROUPS = ("absolute_max", "recommended", "electrical")
 REGULATOR_ENUMS = {"en_active": {"high", "low"},
+                   "light_load": {"fccm", "pfm", "dcm", "auto"},
                    "pg_output": {"open_drain", "push_pull", "none"}}
 # Section headings that hold the tables (weight 10) and softer hints (1).
 PAGE_HEADINGS = ("absolute maximum", "recommended operating", "electrical characteristics",
@@ -204,7 +232,7 @@ def validate(rec: dict, pages: list[str]) -> tuple[list[str], list[str]]:
     if not isinstance(rec, dict):
         return ["extraction must be a JSON object"], []
     allowed = {"mpn", "category", "description", "pins", *SV_GROUPS, "regulator",
-               "i2c", "thermal", "curves", "notes"}
+               "i2c", "thermal", "curves", "pin_models", "notes"}
     extra = set(rec) - allowed - {"schema_version", "pdf", "extracted", "extracted_by"}
     if extra:
         errors.append(f"unknown top-level keys {sorted(extra)}; allowed {sorted(allowed)}")
@@ -241,6 +269,20 @@ def validate(rec: dict, pages: list[str]) -> tuple[list[str], list[str]]:
                         _check_sv(f"{prefix}.anyout.base", v.get("base"), pages, errors, warnings)
                         for num, sv in v["pins"].items():
                             _check_sv(f"{prefix}.anyout.pins.{num}", sv, pages, errors, warnings)
+                    elif k == "input_pin":
+                        if not isinstance(v, str) or not v.strip():
+                            errors.append(f"{prefix}.input_pin: a pin name")
+                    elif k == "internal_outputs":
+                        if not isinstance(v, dict):
+                            errors.append(f"{prefix}.internal_outputs: {{pin: {{above_pin, offset}}}}")
+                            continue
+                        for pin, io in v.items():
+                            if not isinstance(io, dict) or not isinstance(io.get("above_pin"), str):
+                                errors.append(f"{prefix}.internal_outputs.{pin}: "
+                                              "{above_pin: pin name, offset: SV}")
+                                continue
+                            _check_sv(f"{prefix}.internal_outputs.{pin}.offset", io.get("offset"),
+                                      pages, errors, warnings)
                     elif k in REGULATOR_ENUMS:
                         if v not in REGULATOR_ENUMS[k]:
                             errors.append(f"{prefix}.{k}: {v!r} not in {sorted(REGULATOR_ENUMS[k])}")
@@ -281,6 +323,21 @@ def validate(rec: dict, pages: list[str]) -> tuple[list[str], list[str]]:
         if not isinstance(page, int) or isinstance(page, bool) or (
                 pages and not 1 <= page <= len(pages)):
             errors.append(f"{p}.page: required, 1-based integer within the PDF")
+    pms = rec.get("pin_models", {})
+    if not isinstance(pms, dict):
+        errors.append("pin_models: object of pin name -> {clamp, i_trip, i_bias, r_in, "
+                      "i_sink, i_source, v_oh, v_out}")
+        pms = {}
+    units = {"clamp": "V", "i_trip": "A", "i_bias": "A", "r_in": "Ohm", "i_sink": "A",
+             "i_source": "A", "v_oh": "V", "v_out": "V"}
+    for pin, m in pms.items():
+        if not isinstance(m, dict) or not m or set(m) - set(units):
+            errors.append(f"pin_models.{pin}: keys from {sorted(units)}")
+            continue
+        for k, sv in m.items():
+            _check_sv(f"pin_models.{pin}.{k}", sv, pages, errors, warnings)
+            if isinstance(sv, dict) and sv.get("unit") != units[k]:
+                errors.append(f"pin_models.{pin}.{k}.unit: must be {units[k]!r}")
     notes = rec.get("notes", [])
     if not isinstance(notes, list) or any(not isinstance(n, str) for n in notes):
         errors.append("notes: list of strings")

@@ -56,7 +56,8 @@ from kicad_claude.adapters.power_review import (
     parse_value,
 )
 
-GROUPS = ("power", "analog", "digital", "misc")
+GROUPS = ("power", "analog", "digital", "misc", "interfaces", "power_conversion", "drives",
+          "rf")
 CONN = ("J", "P", "CN", "X")
 DRIVERS = {"output", "bidirectional", "tri_state", "power_out", "open_collector",
            "open_emitter"}
@@ -111,8 +112,38 @@ def clamped(nl: Netlist, net: str, specs: dict) -> list[str]:
                    and kind(p.ref) in ("D", "U", "TVS", "ESD") and is_clamp(nl, p.ref, specs)})
 
 
+PASSIVE_KINDS = {"R", "RN", "C", "L", "FB", "FL", "D", "LED", "J", "P", "CN", "X", "Y", "TP", "SW",
+                 "S", "F", "FU", "Q", "T", "TR", "K", "BT", "H", "MH", "JP", "SJ", "NT", "FID",
+                 "AE", "ANT", "E", "RV", "TH", "G", "LS", "BZ", "M", "BUS", "POT"}
+XTAL_TEXT = re.compile(r"crystal|xtal|resonator|oscillator|\bOSC\b|\d\s*[kKmM]?HZ\b", re.I)
+
+
+def is_active(nl: Netlist, ref: str) -> bool:
+    """An IC or module: U / IC, or any part (Module301, A1 ...) that is not a
+    passive / connector kind and has a supply pin."""
+    k = kind(ref)
+    if k in ("U", "IC"):
+        return True
+    prefix = re.match(r"[A-Za-z]*", ref).group(0).lower()
+    if prefix in ("module", "mod", "a"):
+        return True
+    if k in PASSIVE_KINDS or is_connector(nl, ref):
+        return False
+    return any(btype(p) in ("power_in", "power_out") for p in nl.pins.get(ref, []))
+
+
+def is_connector(nl: Netlist, ref: str) -> bool:
+    c = nl.components.get(ref, {})
+    text = f"{c.get('lib_id', '')} {c.get('value', '')} {c.get('description', '')}"
+    if XTAL_TEXT.search(text) or kind(ref) in ("TP",) or re.search(r"TestPoint", text, re.I):
+        return False
+    return kind(ref) in CONN or c.get("lib_id", "").lower().startswith("connector") or bool(
+        re.search(r"\bconnector\b|\bDB-?9\b|\bDB-?25\b|\bheader\b|receptacle|\bCONN_?\d|"
+                  r"[:_]CONN_", text, re.I))
+
+
 def ics(nl: Netlist) -> list[str]:
-    return sorted(r for r in nl.components if kind(r) in ("U", "IC") and fitted(nl, r))
+    return sorted(r for r in nl.components if fitted(nl, r) and is_active(nl, r))
 
 
 def supply_v(nl: Netlist, ref: str, volts: dict) -> float | None:
@@ -130,17 +161,41 @@ def has_driver(nl: Netlist, net: str, exclude: str | None = None) -> bool:
         if p.ref == exclude or not fitted(nl, p.ref):
             continue
         k = kind(p.ref)
-        if btype(p) in DRIVERS or k in ("R", "L", "FB", "D", "Q", "Y", "X", "SW", "JP", "SJ", "RN") \
-                or k in CONN:
+        if btype(p) in DRIVERS or k in ("R", "RV", "POT", "L", "FB", "D", "Q", "Y", "X", "SW", "JP",
+                                        "SJ", "NT", "RN", "V", "I", "VS", "IS") or is_connector(nl, p.ref):
+            return True
+        # an IC pin that is not a pure input (FPGA / MCU pins typed passive,
+        # unspecified or free) can drive the net
+        if is_active(nl, p.ref) and btype(p) not in ("input", "power_in", "no_connect"):
             return True
     return False
 
 
 def _connectors(nl: Netlist) -> list[str]:
-    return sorted(r for r in nl.components if kind(r) in CONN and fitted(nl, r))
+    return sorted(r for r in nl.components if fitted(nl, r) and is_connector(nl, r))
 
 
 # ---- power & protection ------------------------------------------------------- #
+
+def board_sourced(pt: dict) -> set:
+    """Rails a regulator on this board drives, and rails linked below them."""
+    out = set()
+
+    def walk(node, under):
+        if under:
+            out.add(node["rail"])
+        for rr in node.get("regulators", []):
+            if "output" in rr:
+                walk(rr["output"], True)
+        for ch in node.get("linked", []):
+            walk(ch, under)
+    for t in pt.get("tree", []):
+        walk(t, False)
+    for r in pt.get("regulators", []):
+        if r.get("output_net"):
+            out.add(r["output_net"])
+    return out
+
 
 RP_TABLE = {5.0: ((56e3, "default USB"), (22e3, "1.5 A"), (10e3, "3.0 A")),
             3.3: ((36e3, "default USB"), (12e3, "1.5 A"), (4.7e3, "3.0 A"))}
@@ -161,7 +216,7 @@ def check_usbc(nl: Netlist, findings: list, specs: dict, volts: dict) -> list[di
                 findings.append(_f("error", "PW-USBC-CC", j, f"{name} is not connected: a Type-C "
                                    "source never enables VBUS without Rd on each CC pin."))
                 continue
-            ctrl = [p for p in nl.nets.get(net, []) if kind(p.ref) in ("U", "IC")
+            ctrl = [p for p in nl.nets.get(net, []) if is_active(nl, p.ref)
                     and fitted(nl, p.ref) and pn(p).startswith("CC")]
             rs = parts_on(nl, net, "R")
             desc = []
@@ -210,8 +265,34 @@ def check_usbc(nl: Netlist, findings: list, specs: dict, volts: dict) -> list[di
     return out
 
 
-def check_supply_entry(nl: Netlist, findings: list, specs: dict) -> list[dict]:
-    """Supply pins of connectors: a clamp on the net, and a ground pin."""
+def _outbound(nl: Netlist, net: str, board_sourced: set) -> bool:
+    """A connector supply the board drives: a power_out pin on the net, or one
+    series link (<= 1 Ohm, inductor, ferrite, transistor) from a net that
+    has one or that a regulator here sources."""
+    def driven(n):
+        return n in board_sourced or any(btype(q) == "power_out" and not is_connector(nl, q.ref)
+                                         for q in nl.nets.get(n, []))
+    if driven(net):
+        return True
+    for p in nl.nets.get(net, []):
+        k = kind(p.ref)
+        if not fitted(nl, p.ref):
+            continue
+        if k == "R" and (parse_value(nl.components[p.ref]["value"]) or 1e9) > 1.0:
+            continue
+        if k in ("R", "L", "FB", "Q"):
+            for q in nl.pins.get(p.ref, []):
+                if q.net != net and not is_ground(q.net) and driven(q.net):
+                    return True
+    return False
+
+
+def check_supply_entry(nl: Netlist, findings: list, specs: dict,
+                       board_sourced: set | None = None) -> list[dict]:
+    """Supply pins of connectors: a clamp on the net, and a ground pin.
+    Nets the board itself sources (regulator outputs and what they feed)
+    go OUT through the connector: no clamp is asked for."""
+    board_sourced = board_sourced or set()
     out = []
     for j in _connectors(nl):
         pins = nl.pins.get(j, [])
@@ -225,6 +306,8 @@ def check_supply_entry(nl: Netlist, findings: list, specs: dict) -> list[dict]:
             findings.append(_f("warning", "PW-CONN-GND", j, "Connector brings in a supply but "
                                "has no ground pin: the return current takes another path."))
         for n in sorted(sup):
+            if n in board_sourced or _outbound(nl, n, board_sourced):
+                continue
             if not clamped(nl, n, specs):
                 findings.append(_f("warning", "PW-VBUS-TVS", j, f"Supply net {n} from {j} has "
                                    "no TVS / clamp: hot-plug and ESD transients reach the input."))
@@ -590,6 +673,7 @@ OUT_DESC = re.compile(r"\binterrupt\b|\boutput\b|\bopen.drain\b", re.I)
 def check_floating(nl: Netlist, findings: list, specs: dict | None = None) -> list[dict]:
     specs = specs or {}
     out = []
+    open_inputs: dict[str, list[str]] = defaultdict(list)
     for ref in ics(nl):
         rec = specs.get(ref) or {}
         ds_pin = {str(p.get("number")): p for p in rec.get("pins", [])}
@@ -600,7 +684,8 @@ def check_floating(nl: Netlist, findings: list, specs: dict | None = None) -> li
         for p in nl.pins.get(ref, []):
             if btype(p) != "input" or NC_NAME.match(pn(p)):
                 continue
-            if is_unconnected(p.net):
+            alone = not [q for q in nl.nets.get(p.net, []) if q.ref != p.ref or q.number != p.number]
+            if is_unconnected(p.net) or alone:
                 desc = (ds_pin.get(p.number) or {}).get("description", "")
                 if p.number in anyout or LEAVE_OPEN.search(desc):
                     continue          # datasheet: open is a valid state
@@ -611,28 +696,54 @@ def check_floating(nl: Netlist, findings: list, specs: dict | None = None) -> li
                                        "unused output; fix the symbol pin type."))
                     continue
                 out.append({"ref": ref, "pin": p.name, "net": None})
-                findings.append(_f("warning", "DG-FLOAT", ref, f"Input {p.name} (pin {p.number}) "
-                                   "is unconnected: a floating CMOS input draws current and "
-                                   "toggles; tie it unless the datasheet gives an internal pull."))
+                open_inputs[ref].append(f"{p.name}({p.number})")
             elif not is_ground(p.net) and not has_driver(nl, p.net):
                 others = [q for q in nl.nets.get(p.net, []) if q.ref != ref]
                 if not any(btype(q) == "power_in" for q in others) and not any(
                         kind(q.ref) == "C" for q in others):
                     out.append({"ref": ref, "pin": p.name, "net": p.net})
-                    findings.append(_f("error", "DG-FLOAT", ref, f"Input {p.name} on {p.net} has "
-                                       "no driver, pull resistor or strap: it floats."))
+                    dnp = sorted(q.ref for q in others if not fitted(nl, q.ref))
+                    module = kind(ref) not in ("U", "IC")
+                    if dnp:
+                        findings.append(_f("info", "DG-FLOAT", ref, f"Input {p.name} on {p.net} is "
+                                           f"strapped only by DNP {', '.join(dnp)}: it floats as "
+                                           "assembled (fine if the datasheet defines a float "
+                                           "level)."))
+                    else:
+                        findings.append(_f("info" if module else "error", "DG-FLOAT", ref,
+                                           f"Input {p.name} on {p.net} has no driver, pull "
+                                           "resistor or strap: it floats"
+                                           + (" unless the module pulls it internally (check its "
+                                              "datasheet)." if module else ".")))
+    for ref, pins in sorted(open_inputs.items()):
+        big = len(nl.pins.get(ref, [])) > 64 or kind(ref) not in ("U", "IC")
+        findings.append(_f("info" if big else "warning", "DG-FLOAT", ref,
+                           f"{len(pins)} input pin(s) unconnected: {', '.join(pins[:12])}"
+                           + (" ..." if len(pins) > 12 else "")
+                           + (" - large part / module: check its unused-pin guidance." if big else
+                              " - a floating CMOS input draws current and toggles; tie them "
+                              "unless the datasheet gives an internal pull or says to leave them "
+                              "open.")))
     return out
 
 
 BOOT_RE = re.compile(r"^(BOOT\d?|BOOTSEL|MODE\d?|MD\d?|PROG|IO0|GPIO0|STRAP\w*|CFG\d?)$")
 
 
-def check_boot(nl: Netlist, findings: list) -> list[dict]:
+def check_boot(nl: Netlist, findings: list, reg_refs: set | None = None) -> list[dict]:
     out = []
     for ref in ics(nl):
+        if ref in (reg_refs or set()):
+            continue
+        names = {pn(q) for q in nl.pins.get(ref, [])}
         for p in nl.pins.get(ref, []):
             if not BOOT_RE.match(pn(p)) or is_unconnected(p.net):
                 continue
+            if parts_on(nl, p.net, "C") and not parts_on(nl, p.net, "R"):
+                continue          # bootstrap capacitor pin (BOOT / BST of a gate driver)
+            if pn(p) in ("IO0", "GPIO0") and not names & {"EN", "CHIP_PU", "CHIP_EN", "RST",
+                                                          "NRST", "RESET"}:
+                continue          # a plain GPIO0 is only a strap on SoCs with an enable pin
             rs = parts_on(nl, p.net, "R")
             tied = is_ground(p.net) or any(btype(q) == "power_out" or (q.ref != ref and btype(q) ==
                                                                           "power_in")
@@ -939,7 +1050,7 @@ def analyze(nl: Netlist, pt: dict, specs: dict | None = None, groups: tuple = GR
     res: dict = {}
     if "power" in groups:
         res["usb_c"] = check_usbc(nl, findings, specs, volts)
-        res["supply_entry"] = check_supply_entry(nl, findings, specs)
+        res["supply_entry"] = check_supply_entry(nl, findings, specs, board_sourced(pt))
         res["esd"] = check_esd_audit(nl, findings, specs, internal_connectors or set())
         res["sequencing"] = check_sequencing(nl, findings, pt)
         res["reset"] = check_reset(nl, findings)
@@ -951,7 +1062,7 @@ def analyze(nl: Netlist, pt: dict, specs: dict | None = None, groups: tuple = GR
         res["level_shifters"] = check_level_shifters(nl, findings, volts)
     if "digital" in groups:
         res["floating_inputs"] = check_floating(nl, findings, specs)
-        res["boot_pins"] = check_boot(nl, findings)
+        res["boot_pins"] = check_boot(nl, findings, {r["ref"] for r in pt["regulators"]})
         res["i2c_pullups"] = check_i2c_pullup(nl, findings, volts)
         res["spi"] = check_spi(nl, findings)
         res["levels"] = check_levels(nl, findings, volts)
@@ -962,6 +1073,9 @@ def analyze(nl: Netlist, pt: dict, specs: dict | None = None, groups: tuple = GR
         res["displays"] = check_display(nl, findings)
         res["rtc"] = check_rtc(nl, findings, set(volts))
         res["buttons"] = check_buttons(nl, findings)
+    if set(groups) & {"interfaces", "power_conversion", "drives", "rf"}:
+        from kicad_claude.adapters import domain_review
+        domain_review.analyze(nl, pt, specs, groups, findings, res)
     order = {"error": 0, "warning": 1, "info": 2}
     findings.sort(key=lambda f: (order[f["severity"]], f["rule"], f["ref"]))
     res["findings"] = findings

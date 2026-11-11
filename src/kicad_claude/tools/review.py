@@ -64,6 +64,14 @@ def _datasheet_values(nl) -> dict:
             v = dss.value(sv)
             if v is not None:
                 vals[key] = (v, src(sv))
+        ip = chan.get("input_pin") or r.get("input_pin")
+        if ip:
+            vals["input_pin"] = (ip, f"datasheet {mpn} ({rec['pdf']['file']})")
+        io = {**(r.get("internal_outputs") or {}), **(chan.get("internal_outputs") or {})}
+        if io:
+            vals["internal_outputs"] = {
+                pin: (x["above_pin"], dss.value(x["offset"]), src(x["offset"]))
+                for pin, x in io.items() if dss.value(x.get("offset")) is not None}
         ao = chan.get("anyout") or r.get("anyout")
         if ao and dss.value(ao.get("base")) is not None:
             vals["anyout"] = {"base": (dss.value(ao["base"]), src(ao["base"])),
@@ -154,7 +162,8 @@ def register(mcp) -> None:
         nl = power_review.parse_netlist(project_netlist(netlist_path))
         result = power_review.analyze(nl, vref=vref or {},
                                       datasheet=_datasheet_values(nl),
-                                      rail_voltages=rail_voltages or {})
+                                      rail_voltages=rail_voltages or {},
+                                      specs=_specs_by_ref(nl))
         if not include_details:
             for r in result["regulators"]:
                 r["input_caps"] = len(r["input_caps"])
@@ -165,7 +174,7 @@ def register(mcp) -> None:
 
     @mcp.tool()
     def review_circuits(
-        groups: str = "power,analog,digital,misc",
+        groups: str = "power,analog,digital,misc,interfaces,power_conversion,drives,rf",
         rail_voltages: dict[str, float] | None = None,
         internal_connectors: str = "",
         audio_f_low_hz: float = 20.0,
@@ -204,7 +213,24 @@ def register(mcp) -> None:
           - `misc`: LEDs without a current limit (LE-NORES), LED driver set
             pins (LE-ISET), display charge-pump / VCOMH caps (DS-CAP), RTC
             backup pin (RTC-VBAT), buttons without pull-up (KB-PULL), switch
-            matrices without diodes (KB-GHOST).
+            matrices without diodes (KB-GHOST);
+          - `interfaces`: Ethernet magnetics / Bob Smith / centre-tap caps
+            (ETH-*), HDMI / DVI ESD, DDC pull-ups, HPD, +5V protection
+            (HDMI-*), LVDS receiver termination (LVDS-TERM), flash WP / HOLD
+            and DDR VREF (MEM-*), radio-module antenna path and pi pad (WL-*);
+          - `power_conversion`: charger set resistor and thermistor (CHG-*),
+            BMS cell-sense RC and balancing (BMS-*), cell-protection sense
+            (PROT-CS), opto + shunt-reference feedback (TF-*), series
+            supercap balancing (SC-BAL), isolator grounds bridged / Y-caps /
+            decoupling (ISO-*);
+          - `drives`: motor-driver bootstrap, sense resistor, VM caps,
+            freewheel diodes on discrete low-side switches (MD-*),
+            thermocouple filter and RTD reference resistor (TC-*, RTD-*),
+            addressable LED chains, decoupling, data level and series R
+            (ALED-*);
+          - `rf`: RF pins to connectors without DC block (RF-DCBLOCK),
+            matching networks (RF-MATCH, RF-MATCH-OPEN) and the standards the
+            detected circuits point to (CERT-*).
 
         Rail voltages come from `analyze_power_tree` plus `rail_voltages`.
         Heuristic: confirm each finding against the schematic and datasheet.
@@ -278,6 +304,9 @@ def register(mcp) -> None:
         netlist_path: str = "",
         rail_voltages: dict[str, float] | None = None,
         cap_derating: float = 0.8,
+        switch_states: str = "auto",
+        switch_overrides: dict[str, str] | None = None,
+        max_switch_combos: int = 16,
     ) -> dict:
         """Datasheet-free connectivity review of the active schematic (whole
         hierarchy, from `kicad-cli sch export netlist`).
@@ -319,6 +348,25 @@ def register(mcp) -> None:
 
         The pin -> rail map is returned so it can be checked against each
         datasheet; whether a rail is the *right* one is not judged here.
+
+        Net voltages for `pin_abs_max` / `cap_voltage` come from the rails
+        plus a DC operating-point model: every resistor network solved,
+        datasheet pin models (bias current, internal clamp, trip current) and
+        zener clamps, and transistor switches (FETs / BJTs with D-S-G or C-E-B
+        pins) in each `switch_states` scenario: `all` (every on / off
+        combination), `both` (all on, all off), `on`, `off`, `none` (switch
+        nets left unknown), `single` (all on, all off, and each switch flipped
+        alone: 2n + 2 cases); `auto` (default) is `all` up to
+        `max_switch_combos` combinations, else `single`. On: the channel joins
+        drain and source and the gate driver pulls to its on level (current
+        limited by the pin's datasheet drive rating); off: body diode only
+        (VSD from the spec cache), far side at 0 V, driver released or at its
+        off level. Findings seen in only some scenarios are tagged with them;
+        `pin_abs_max_worst` / `cap_voltage_worst` give each pin's voltage
+        range over all scenarios. `switch_overrides={"Q3": "off"}` fixes single
+        switches in every scenario. The solve adds DC-CLAMP /
+        DC-TRIP (internal clamp current at its trip level, e.g. OVLO),
+        DC-ZENER-P (zener power vs Ptot) and DC-DRIVE (gate-driver pin current).
         """
         wanted = tuple(c.strip() for c in checks.split(",") if c.strip())
         bad = [c for c in wanted if c not in connectivity_review.CHECKS]
@@ -327,12 +375,115 @@ def register(mcp) -> None:
         nl = power_review.parse_netlist(project_netlist(netlist_path))
         specs = _specs_by_ref(nl)
         volts = {}
-        if {"pin_abs_max", "cap_voltage"} & set(wanted):
+        if switch_states not in ("auto", "all", "single", "both", "on", "off", "none"):
+            raise ValueError("switch_states: auto / all / single / both / on / off / none")
+        need_v = {"pin_abs_max", "cap_voltage"} & set(wanted)
+        if need_v:
             pt = power_review.analyze(nl, datasheet=_datasheet_values(nl),
                                       rail_voltages=rail_voltages or {})
             volts = {n: (v["volts"], v["source"]) for n, v in pt["rail_voltages"].items()}
-        result = connectivity_review.analyze(nl, wanted, specs=specs, volts=volts,
-                                             cap_derating=cap_derating)
+        if not need_v:
+            result = connectivity_review.analyze(nl, wanted, specs=specs, volts=volts,
+                                                 cap_derating=cap_derating)
+        else:
+            import itertools
+
+            from kicad_claude.adapters import dc_model
+            sw = [r for r in dc_model.switches_in(nl) if r not in (switch_overrides or {})]
+            mode = switch_states
+            if mode == "auto":
+                mode = "all" if sw and 2 ** len(sw) <= max_switch_combos else "single"
+            if not sw:
+                combos = [None]
+            elif mode == "all":
+                combos = [dict(zip(sw, st)) for st in itertools.product(("on", "off"),
+                                                                        repeat=len(sw))]
+            elif mode == "single":
+                # all on, all off, and each switch flipped alone from both
+                combos = [{r: "on" for r in sw}, {r: "off" for r in sw}]
+                for s in sw:
+                    combos.append({r: ("off" if r == s else "on") for r in sw})
+                    combos.append({r: ("on" if r == s else "off") for r in sw})
+                combos = list({tuple(sorted(c.items())): c for c in combos}.values())
+            else:
+                combos = {"both": [{r: "on" for r in sw}, {r: "off" for r in sw}],
+                          "on": [{r: "on" for r in sw}], "off": [{r: "off" for r in sw}],
+                          "none": [None]}[mode]
+            base = [c for c in wanted if c not in need_v]
+            result = connectivity_review.analyze(nl, tuple(base), specs=specs, volts=volts,
+                                                 cap_derating=cap_derating)
+            findings = result["findings"]
+            scen_out = {}
+            seen: dict = {}
+            worst_pin: dict = {}
+            worst_cap: dict = {}
+            sw_nets = {n for r in dc_model.switches_in(nl) for d in dc_model.switch_dies(nl, r)
+                       for n in d["main"]}
+            for combo in combos:
+                swmap = dict(combo or {})
+                swmap.update(switch_overrides or {})
+                dc = dc_model.solve(nl, volts, specs, swmap)
+                sv = {**dc["volts"], **volts} if swmap else {
+                    **volts, **{n: v for n, v in dc["volts"].items() if n not in sw_nets}}
+                part = connectivity_review.analyze(nl, tuple(need_v), specs=specs, volts=sv,
+                                                   cap_derating=cap_derating)
+                part["findings"] += dc_model.findings(dc)
+                if not swmap:
+                    name = "as drawn"
+                elif mode in ("both", "on", "off") and len(set(swmap.values())) == 1                         and not switch_overrides:
+                    name = f"switches {next(iter(swmap.values()))}"
+                else:
+                    name = ", ".join(f"{r} {s}" for r, s in sorted(swmap.items()))
+                rows = part.get("pin_abs_max") or []
+                scen_out[name] = {"switches": swmap,
+                                  "pin_abs_max_failing": [x for x in rows if not x["ok"]],
+                                  "net_voltages": {n: round(v, 4) for n, (v, _) in
+                                                   sorted(sv.items()) if n in sw_nets
+                                                   or n not in volts and n in dc["volts"]}}
+                for x in rows:
+                    k = (x["ref"], x["pin"], x["limit"])
+                    w = worst_pin.setdefault(k, {**{q: x[q] for q in ("ref", "pin", "net", "limit",
+                                                                       "min", "max", "page")},
+                                                 "v_low": x["volts"], "v_high": x["volts"],
+                                                 "failing_in": []})
+                    w["v_low"], w["v_high"] = min(w["v_low"], x["volts"]), max(w["v_high"],
+                                                                               x["volts"])
+                    if not x["ok"]:
+                        w["failing_in"].append(name)
+                for x in (part.get("cap_voltage") or {}).get("checked", []):
+                    w = worst_cap.setdefault(x["ref"], {**x, "worst_in": name})
+                    if x["use"] > w["use"]:
+                        worst_cap[x["ref"]] = {**x, "worst_in": name}
+                for f in part["findings"]:
+                    key = (f["rule"], f["ref"], f["message"].split(" [")[0])
+                    if key in seen:
+                        seen[key]["scenarios"].append(name)
+                    else:
+                        f = {**f, "scenarios": [name]}
+                        seen[key] = f
+                        findings.append(f)
+            for f in findings:
+                sc = f.get("scenarios")
+                if not (len(combos) > 1 and sc and len(sc) < len(combos)):
+                    continue
+                # the switch states every occurrence shares; if exactly the
+                # scenarios with those states produce it, say "when ..."
+                common = set.intersection(*(set(scen_out[s]["switches"].items()) for s in sc))
+                match = [s for s, o in scen_out.items() if common <= set(o["switches"].items())]
+                if common and sorted(match) == sorted(sc):
+                    f["message"] += " [when " + ", ".join(f"{r} {s}" for r, s in
+                                                          sorted(common)) + "]"
+                else:
+                    f["message"] += " [" + " | ".join(sc[:3]) + (
+                        f" | +{len(sc) - 3} more" if len(sc) > 3 else "") + "]"
+            result["switch_mode"] = mode
+            result["scenarios"] = scen_out
+            result["pin_abs_max_worst"] = sorted(worst_pin.values(),
+                                                 key=lambda w: (not w["failing_in"], w["ref"]))
+            result["cap_voltage_worst"] = sorted(worst_cap.values(), key=lambda w: -w["use"])
+            order = {"error": 0, "warning": 1, "info": 2}
+            findings.sort(key=lambda f: (order[f["severity"]], f["rule"], f["ref"]))
+            result["counts"] = {k: sum(1 for f in findings if f["severity"] == k) for k in order}
         result["note"] = ("Heuristic, pin-name/pin-type driven review; confirm each "
                           "finding against the schematic and datasheet before acting.")
         return result
