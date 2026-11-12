@@ -10,6 +10,7 @@ Strategy:
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -52,25 +53,50 @@ def test_find_java_present_in_environment():
 # ===== Stats parser ======================================================== #
 
 
+# Freerouting 2.5.0 output (KiCAD demo ecc83-pp, 5 passes), board hashes shortened.
 SAMPLE_LOG = """
-2026-05-09 21:00:00 INFO  Freerouting v2.1.0 starting
-2026-05-09 21:00:01 INFO  Loaded design: foo.dsn
-2026-05-09 21:00:05 INFO  pass 1 complete: 12% completed
-2026-05-09 21:00:30 INFO  pass 5 complete: 87% completed
-2026-05-09 21:00:35 INFO  Routing took 0:00:35 to complete
-2026-05-09 21:00:35 INFO  Total trace length: 287.5 mm
-2026-05-09 21:00:35 INFO  Total of 12 vias
+2026-11-12 22:56:22.101 INFO   Freerouting v2.5.0 (build-date: 2026-10-05)
+2026-11-12 22:56:22.912 INFO   [9290DC\\FFB21B] Auto-routing stage started on board '0cef' with baseline score 365.08 for 10 unrouted items.
+2026-11-12 22:56:23.330 INFO   [9290DC\\FFB21B] Auto-routing pass #1 on board '0cef' was completed in 0.41 seconds with score 600.00 (8 unrouted and 1 violations).
+2026-11-12 22:56:23.960 INFO   [9290DC\\FFB21B] Auto-routing pass #5 on board '577e' was completed in 0.12 seconds with score 619.05 (6 unrouted and 0 violations), using 0.98 CPU seconds and the job allocated 0.13 GB of memory so far.
+2026-11-12 22:56:23.975 INFO   [9290DC\\FFB21B] Auto-routing stage completed: started with 10 unrouted nets, completed in 1.19 seconds, final score: 619.05 (6 unrouted and 0 violations), using 0.98 total CPU seconds, 0.13 GB total allocated, and 47.1 MB peak heap usage.
+2026-11-12 22:56:24.471 INFO   [9290DC\\FFB21B] Skipping optimization stage: the board has 6 unrouted connection(s) (optimizer only runs on completely routed boards).
+2026-11-12 22:56:24.487 INFO   [9290DC\\FFB21B] Optimization was completed in 0.02 seconds with the score of 619.05 (6 unrouted and 0 violations).
 """
 
 
 def test_parse_stats_extracts_known_fields():
     stats = freerouting._parse_stats(SAMPLE_LOG)
-    assert stats.get("via_count") == 12
-    assert stats.get("trace_length_mm") == 287.5
-    assert stats.get("duration") == "0:00:35"
-    # `passes_done` and `completion_pct` take the LAST match (final state).
-    assert stats.get("passes_done") == 5
-    assert stats.get("completion_pct") == 87.0
+    # The last pass and the last score line give the final state.
+    assert stats == {
+        "passes_done": 5,
+        "score": 619.05,
+        "unrouted": 6,
+        "violations": 0,
+        "unrouted_start": 10,
+        "duration_s": 1.19,
+    }
+
+
+def test_route_passes_max_passes_with_the_2_5_flag(tmp_path, monkeypatch):
+    """2.5.0 deprecates `-mp`; the pass count goes in `router.autorouter.max_passes`."""
+    dsn = tmp_path / "b.dsn"
+    dsn.write_text("(pcb)", encoding="utf-8")
+    ses = tmp_path / "b.ses"
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        ses.write_text("(session)", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, stdout=SAMPLE_LOG, stderr="")
+
+    monkeypatch.setattr(freerouting, "_ensure_environment",
+                        lambda: (Path("fr.jar"), Path("java")))
+    monkeypatch.setattr(freerouting.subprocess, "run", fake_run)
+    res = freerouting.route(dsn, ses, passes=7)
+    assert "--router.autorouter.max_passes=7" in seen["cmd"]
+    assert "-mp" not in seen["cmd"]
+    assert res["stats"]["unrouted"] == 6
 
 
 def test_parse_stats_empty_when_no_matches():

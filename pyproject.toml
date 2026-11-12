@@ -22,7 +22,6 @@ dev = [
     # Only a test cross-checks the blank project with a second parser.
     "kicad-skip>=0.2.5",
     "pytest>=8",
-    "pytest-asyncio>=0.23",
     "ruff>=0.6",
 ]
 

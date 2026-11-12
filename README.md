@@ -6,7 +6,7 @@
 > review against the parts' datasheets, sourcing, manufacturing outputs,
 > signal-integrity calculations, RF design, and more.
 
-**143 MCP tools in 11 on-demand sets · 933 tests (864 fast, 63 acceptance, 6 network) · headless from idea to gerbers**
+**143 MCP tools in 11 on-demand sets · 934 tests (865 fast, 63 acceptance, 6 network) · headless from idea to gerbers**
 
 The server edits `.kicad_sch` / `.kicad_pcb` / `.kicad_pro` files directly, in
 KiCAD 10's own formatting — one added wire is a ten-line git diff, not a
@@ -42,7 +42,7 @@ files. You verify the result by opening KiCAD.
 
 - Python 3.10+ and [`uv`](https://docs.astral.sh/uv/)
 - KiCAD 10.x (with `kicad-cli` installed) — files are written in the formats KiCAD 10.0.8 writes; KiCAD 10 or newer is supported
-- Java 21+ (for autorouting via Freerouting; Java 24 works, Java 25 needed for the very latest Freerouting)
+- Java 25+ (for autorouting via Freerouting 2.5.0)
 - *Optional*: `ngspice` or LTspice (for SPICE simulation); DigiKey / Mouser / Farnell / TME API keys (live sourcing and datasheet lookup — the JLCPCB source needs no key)
 
 ### Install
@@ -54,11 +54,11 @@ uv sync
 cp .env.example .env       # fill API keys when ready (optional, sourcing only)
 ```
 
-Download Freerouting 2.1.0 to `third_party/freerouting.jar` (only needed for `autoroute_pcb`):
+Download Freerouting 2.5.0 to `third_party/freerouting.jar` (only needed for `autoroute_pcb`):
 
 ```bash
 mkdir -p third_party
-curl -L https://github.com/freerouting/freerouting/releases/download/v2.1.0/freerouting-2.1.0.jar \
+curl -L https://github.com/freerouting/freerouting/releases/download/v2.5.0/freerouting-2.5.0.jar \
   -o third_party/freerouting.jar
 ```
 
@@ -96,44 +96,52 @@ then restart Claude Code.
 
 ### Wire into Claude Code
 
-Add to `~/.claude/settings.json`:
+Register the server for your user (all projects):
+
+```bash
+claude mcp add --scope user kicad -- \
+  uv run --frozen --directory /ABSOLUTE/PATH/TO/kicad-claude-mcp python server.py
+claude mcp add --scope user kicad-dev -- \
+  uv run --frozen --directory /ABSOLUTE/PATH/TO/kicad-claude-mcp-dev python server.py
+```
+
+`uv run --directory` runs the checkout's own `.venv`, so the system Python
+never needs the dependencies. On Windows give the path as
+`C:/path/to/kicad-claude-mcp` (forward slashes work). Restart Claude Code, run `/mcp` to confirm
+`kicad` is connected, then ask for `Use the kicad ping tool`.
+
+The second entry is optional — it is the branch checkout from the previous
+section, exposed under its own name. Drop it if you only run one.
+
+Other MCP clients take the same command as JSON (for Claude Code's project
+scope, a `.mcp.json` in the project root):
 
 ```json
 {
   "mcpServers": {
     "kicad": {
-      "command": "/ABSOLUTE/PATH/TO/kicad-claude-mcp/.venv/bin/python",
-      "args": ["server.py"],
-      "cwd": "/ABSOLUTE/PATH/TO/kicad-claude-mcp"
-    },
-    "kicad-dev": {
-      "command": "/ABSOLUTE/PATH/TO/kicad-claude-mcp-dev/.venv/bin/python",
-      "args": ["server.py"],
-      "cwd": "/ABSOLUTE/PATH/TO/kicad-claude-mcp-dev"
+      "command": "uv",
+      "args": ["run", "--frozen", "--directory", "/ABSOLUTE/PATH/TO/kicad-claude-mcp",
+               "python", "server.py"]
     }
   }
 }
 ```
 
-> The `command` MUST be the absolute path to `.venv/bin/python` — the system
-> Python doesn't have the dependencies. On Windows that path is
-> `.venv\Scripts\python.exe`. Reload Claude Code, run `/mcp` to confirm
-> `kicad` is connected, then ask for `Use the kicad ping tool`.
-
-The second entry is optional — it is the branch checkout from the previous
-section, exposed under its own name. Drop it if you only run one.
-
 The server starts with the `core` tool set only and the model loads the rest
 with `load_toolset` (see [Tool sets](#tool-sets)). To register everything at
-startup instead, add `"env": {"KICAD_MCP_TOOLSETS": "all"}` to the entry.
+startup instead, add `-e KICAD_MCP_TOOLSETS=all` to `claude mcp add` (JSON:
+`"env": {"KICAD_MCP_TOOLSETS": "all"}`).
 
 ### First run
 
 ```
 > Index KiCAD's libraries  (one-time, ~60 s)
 > Create a project at /tmp/test for a voltage divider
-> ... etc
 ```
+
+For a full design session, see
+[Example workflow: designing a board](#example-workflow-designing-a-board).
 
 ---
 
@@ -147,7 +155,7 @@ all sets together about 20k, against 36.6k before the rework).
 
 | Set | Contents |
 |---|---|
-| `core` | `ping`, project create/open/state, `list_components`, `run_erc`, `run_drc`, `clear_stale_lock`, `help`, `list_toolsets`, `load_toolset`, `unload_toolset` |
+| `core` | `ping`, `create_project`, `set_project`, `get_project_state`, `list_components`, `run_erc`, `run_drc`, `clear_stale_lock`, `help`, `list_toolsets`, `load_toolset`, `unload_toolset` |
 | `sch` | schematic edit and query, sheets, buses, fields, nets, annotation, update PCB from schematic |
 | `pcb` | board edit and query, layers, zones, diff pairs, meanders, multi-board, autorouting, RF stitching |
 | `rules` | design rules, fab presets, net classes, custom DRC rules |
@@ -184,17 +192,17 @@ all sets together about 20k, against 36.6k before the rework).
 - **Pins landing mid-wire**: KiCAD does not connect a pin to a wire's interior without a junction. `add_symbol` / `add_power_symbol` add the junction and report it (`junctions_added`).
 - **Power ports**: any net name works (`add_power_symbol(net="GND_USB")`, built on a stock base symbol with the Value overridden, `base_symbol=` to choose it); the `#PWR` / `#FLG` reference is hidden as in KiCAD. `PWR_FLAG` never names a net.
 - **Fields**: `move_item` carries the fields with the symbol (rotation included); `set_field_position`, `set_symbol_property`, `remove_symbol_property`, `get_symbol_properties`, `set_symbol_flags` (dnp / in_bom / on_board / exclude_from_sim)
-- **Editing and deletion**: `remove_item` (wire / bus / junction / no-connect by position, or any item by uuid), `add_junction`, `move_item` (a symbol by reference or any item by uuid), `rename_label`, `add_text` / `set_text`, `remove_items_in_box` (both endpoints must be inside, so a crossing wire survives), and `remove_symbol(remove_connected_wires=True)` to drop the stubs left on the removed pins
+- **Editing and deletion**: `remove_item` (wire / bus / junction / no-connect by position, or any item by uuid), `add_junction`, `move_item` (a symbol by reference or any item by uuid), `rename_label`, `add_text` / `set_text` / `list_texts`, `remove_items_in_box` (both endpoints must be inside, so a crossing wire survives), and `remove_symbol(remove_connected_wires=True)` to drop the stubs left on the removed pins
 - **Connectivity model**: `list_sch_nets`, `trace_net`, `get_pin_net`, `find_dangling` — the same connectivity KiCAD uses (net names from power symbols with a `power_in` pin, labels, hierarchy)
 - **Grid discipline**: every placement snaps to KiCAD's 1.27 mm grid unless you pass `snap_to_grid=False`, so endpoints actually connect
 - **Hierarchical sheets**: `add_sheet`, `set_active_sheet` (the root sheet by its file name too), `get_active_sheet`, `add_hierarchical_label`, `add_sheet_pin`, `list_sheets`; `list_components(sheet=…)` lists one sheet without switching
 - **Buses**: `add_bus`, `add_bus_entry`, `add_bus_alias` — visual grouping of address/data lines
 - **Annotation**: `annotate_schematic` — auto-numbers `R?` → `R1, R2, ...` across the whole hierarchy, nested sheets included. A sheet used twice gets one reference per instance (KiCAD's `(instances … (path … (reference …)))`), the next free number counts every instance's reference, and the units of one multi-unit part share a number (U1A / U1B). A locked project is refused before any sheet is written.
-- **Custom symbols**: `create_symbol` with full pin specifications and arbitrary fields; `refresh_lib_symbols` updates a sheet's cached library symbols
+- **Custom symbols**: `create_symbol` with full pin specifications and arbitrary fields; `refresh_lib_symbols` updates a sheet's cached library symbols, `list_lib_symbols` lists them
 
 ### Library management
 
-- **KiCAD's libraries indexed** — `index_libraries` (project tables and KiCAD's global `sym-lib-table` / `fp-lib-table`, with `${VAR}` expansion), `search_symbol`, `search_footprint`, `get_symbol_details`. Search ranks exact name, then prefix, then substring, then fuzzy matches.
+- **KiCAD's libraries indexed** — `index_libraries` (project tables and KiCAD's global `sym-lib-table` / `fp-lib-table`, with `${VAR}` expansion), `list_libraries`, `search_symbol`, `search_footprint`, `get_symbol_details`. Search ranks exact name, then prefix, then substring, then fuzzy matches.
 - **External parts**: `find_or_fetch_symbol`, `import_vendor_zip` (SnapEDA / Ultra Librarian), `list_vendor_parts`
 - **Custom footprints**: `create_footprint` with auto-courtyard and silk outline
 
@@ -210,7 +218,7 @@ all sets together about 20k, against 36.6k before the rework).
 ### PCB layout
 
 - **2 to 32 copper layers** with auto-generated stackup (`set_layer_count`)
-- **Footprint placement**: `add_footprint`, `move_footprint`, `place_footprints_grid`
+- **Footprint placement**: `add_footprint`, `move_footprint`, `place_footprints_grid`, `remove_footprint`
 - **Routing**: `add_track`, `add_via`, `add_via_array`, `add_meander` (length tuning); `remove_board_items` removes one track / arc / via / zone by uuid (DRC reports carry them) or rips up a net, optionally on one layer, with `dry_run`
 - **Copper pours**: `add_zone`, `add_ground_plane` (auto-extracts board outline, rounded corners included)
 - **Mechanical**: `add_mounting_hole` (M2/M2.5/M3/M4/M5), `add_fiducial`, `add_silk_text`
@@ -222,14 +230,14 @@ all sets together about 20k, against 36.6k before the rework).
 
 ### Autorouting
 
-- **Freerouting integration** — `autoroute_pcb` runs the full pipeline (DSN export → routing → SES import) with timeout, parses stats from output
+- **Freerouting integration** — `autoroute_pcb` runs the full pipeline (DSN export → routing → SES import) with timeout; returns the passes run, the final score, unrouted connections and violations from Freerouting's log; `export_dsn` / `import_ses` run the two halves by hand (route the DSN in Freerouting's GUI, then apply the session)
 - **Diff pair coupling** — auto-detected by net naming (`_P/_N`, `+/-`, `DP/DM`); routed coupled when net class has `diff_pair_width`/`gap` set
 
 ### Validation
 
 - **ERC and DRC** — `run_erc`, `run_drc` shell out to `kicad-cli` and parse the JSON (every sheet's violations); `run_drc(summary=True)` returns counts by type and severity, `max_violations=N` caps the lists
 - **Custom DRC rules** — `add_drc_rule` writes `.kicad_dru` with constraint types (clearance, track_width, length, skew, diff_pair_gap, …) and conditions in KiCAD's expression language; `list_drc_rules`, `remove_drc_rule`, `clear_drc_rules`
-- **Net classes + fab presets** — `apply_fab_preset` with `jlcpcb_2l_default`, `jlcpcb_2l_advanced`, `jlcpcb_4l`, `aisler_2l`, `aisler_4l`, `pcbway_default`, `oshpark_4l`, `permissive_prototype` (`list_fab_presets`). When the preset conflicts with the project's own rules it changes nothing and returns the conflicts with `decision_required`; the caller picks `mode="project"`, `"preset"` or `"stricter"` (per-rule stricter value wins); `dry_run=True` previews. `add_net_class`, `add_diff_pair_class`, `assign_net_class`
+- **Net classes + fab presets** — `apply_fab_preset` with `jlcpcb_2l_default`, `jlcpcb_2l_advanced`, `jlcpcb_4l`, `aisler_2l`, `aisler_4l`, `pcbway_default`, `oshpark_4l`, `permissive_prototype` (`list_fab_presets`). When the preset conflicts with the project's own rules it changes nothing and returns the conflicts with `decision_required`; the caller picks `mode="project"`, `"preset"` or `"stricter"` (per-rule stricter value wins); `dry_run=True` previews. `add_net_class`, `add_diff_pair_class`, `assign_net_class`, `list_net_classes`, `remove_net_class`; board minimums (clearance, track, via, hole) with `set_design_rules`
 
 ### Design review (from KiCAD's own netlist and the parts' datasheets)
 
@@ -314,7 +322,7 @@ Parts of the rule vocabulary (pin-name sets, non-regulator exclusions) and the s
 
 - **Signal integrity** — `calc_impedance`: microstrip / stripline (IPC-2141A), differential, and CPWG (conductor-backed CPW, Ghione & Naldi, checked against exact elliptic integrals) impedance from a width, or the width for a target Z₀, for every geometry
 - **Thermal capacity** — `calc_trace_current`: IPC-2152 amps for a width or width for a current; `analyze_pcb_current_capacity` per-net audit identifying the weakest segment
-- **Thermal network** — lumped-element junction temperature solver (Rjc + Rca → Tj)
+- **Thermal network** — `simulate_thermal_steady_state`: lumped-element junction temperature solver (Rjc + Rca → Tj)
 - **Board thermal review** — `analyze_board_thermal`: per-part junction temperature on the active board. Power comes from the `review_part_ratings` model (same `loads`, `rail_voltages`, `efficiency` …), Rθ_JA from the extracted datasheet (a JEDEC test board, used as is) or the package-typical estimate corrected by the thermal vias under the exposed pad (vias on the pad's net in 1.5× its box, drill-weighted against the count recommended for the pad area: good ×0.50, adequate ×0.65, insufficient ×0.80, none ×1.0). Then class-II MLCCs and electrolytics within 10 mm of a part rising ≥ 20 K. Rules:
 
   | Rule | Severity | Meaning |
@@ -323,7 +331,7 @@ Parts of the rule vocabulary (pin-name sets, non-regulator exclusions) and the s
   | `TH-VIAS` | warning, info | Exposed pad with fewer than the recommended thermal vias: a part above 0.5 W / any other fitted U, IC, Q with a thermal pad (≥ 2 mm², on ground or a supply; a switch-node tab gets no via advice). A pad drawn on both sides counts once |
   | `TH-MLCC-HOT`, `TH-ELCO-HOT` | info, warning / info | Class-II MLCC (capacitance drift) / electrolytic (life halves per 10 K) within 10 mm of a part whose board under it runs ≥ 20 K above ambient: Tj rise − ψjb·P from the spec cache (`thermal.psi_jb`), an upper bound for the cap. Without ψjb only the junction rise bounds it, and `TH-ELCO-HOT` is then info |
   | `TH-NODATA` | info | A part above 50 mW with no Rθ_JA (unknown package) or no Tj max |
-- **Crosstalk** — closed-form NEXT/FEXT for parallel microstrips
+- **Crosstalk** — `estimate_crosstalk`: closed-form NEXT/FEXT for parallel microstrips
 - **Return path continuity** — `check_return_path_continuity` checks each signal segment against the filled ground on the adjacent layer(s), skipping pad / via ends and power nets
 - **EMC sanity checks** — `analyze_ground_coverage` (filled zone area on board outlines with rounded corners), `find_long_traces` (antenna detection), `validate_decoupling_caps` (cap placement distance)
 
@@ -404,6 +412,135 @@ Runs on the board's real filled copper: every zone's filled polygons are rasteri
 
 ---
 
+## Example workflow: designing a board
+
+A USB-C powered sensor board (USB-C input, 3.3 V buck, MCU, I2C sensor),
+from an empty folder to a board that passes the release gate. Each phase
+shows the prompt you give Claude Code and the tool calls it makes. You
+answer the decisions (part choice, fixes), Claude runs the tools.
+
+**0. Project and tool sets**
+
+```
+> Create a project at D:/work/sensor and load what we need for schematic work.
+
+create_project   path="D:/work/sensor"  name="sensor"
+load_toolset     toolsets=["library", "sch", "datasheets", "sourcing"]
+```
+
+**1. Part selection**: pick parts from KiCAD's libraries and check that they can be bought.
+
+```
+> Find a symbol and footprint for a TPS62162 buck, an STM32G031 and an SHT40.
+> Check stock for each.
+
+index_libraries                                   # one-time, ~60 s
+search_symbol       query="TPS62162"
+get_symbol_details  lib_id="Regulator_Switching:TPS62162DSG"
+search_footprint    query="WSON-8 2x2"
+check_availability  mpn="TPS62162DSGR"  sources=["digikey", "mouser", "jlcpcb"]
+```
+
+**2. Schematic capture**: place, wire, annotate, ERC.
+
+```
+> Draw the schematic: USB-C 5V into the buck, 3V3 to the MCU and the sensor,
+> I2C between them with pull-ups. Put the MPN on every part.
+
+add_symbol        lib_id="Regulator_Switching:TPS62162DSG" reference="U?" value="TPS62162"
+                  x_mm=101.6 y_mm=76.2 footprint="Package_SON:WSON-8-1EP_2x2mm_P0.5mm_EP0.9x1.6mm"
+                  fields={"MPN": "TPS62162DSGR", "Manufacturer": "Texas Instruments"}
+add_power_symbol  net="+5V"   x_mm=88.9  y_mm=63.5
+add_power_symbol  net="GND"   x_mm=101.6 y_mm=101.6
+list_pins         reference="U?"                  # pin numbers and names
+get_pin_position  reference="U?" pin="1"          # exact wire endpoints
+add_wire          x1_mm=88.9 y1_mm=63.5 x2_mm=88.9 y2_mm=73.66
+add_label         net="I2C_SDA" x_mm=152.4 y_mm=88.9
+add_no_connect    reference="U?" pin="8"            # PG unused
+annotate_schematic                                # U? → U1, R? → R1 …
+find_dangling     scope="all"
+run_erc                                           # repeat until 0 errors
+```
+
+**3. Datasheets**: the review checks need the parts' real limits, not general knowledge.
+
+```
+> Download the datasheets and extract the specs of the ICs.
+
+sync_datasheets               download=True       # datasheets/ + manifest
+get_datasheet_extraction_task mpn="TPS62162DSGR"  # pages, pins, schema, PDF SHA-256
+save_datasheet_extraction     mpn="TPS62162DSGR"  extraction={…}  pdf_sha256="…"
+get_datasheet_specs                               # coverage and quality per MPN
+```
+
+Claude reads the pages the task returns and fills the record; the server
+checks every number against the cited page before it is cached.
+
+**4. Schematic review**: run the checks, fix, re-run.
+
+```
+> Review the schematic. VBUS is 5 V, the board draws 150 mA from 3V3 at 50 °C.
+
+load_toolset         toolsets=["review", "sim"]
+analyze_power_tree   rail_voltages={"/VBUS": 5}
+review_connectivity  derating_profile="industrial"
+review_circuits      groups=["power", "digital"]  i2c_mode="fast"
+review_part_ratings  loads={"+3V3": 0.15}  ambient_c=50
+simulate_subcircuits types=["divider", "rc", "lc"]
+what_if              changes={"R3": "180k"}      # try a fix before you write it
+```
+
+Each finding has a rule ID (tables above). Fix it in the schematic,
+run the tool again, and stop when no errors are left.
+
+**5. Layout**: stackup, fab rules, net classes, placement, routing.
+
+```
+> Make a 40×25 mm 4-layer board for JLCPCB. USB D+/D- as a 90 Ω pair.
+> Connector on the left edge, buck close to it, GND plane on In1.Cu.
+
+load_toolset         toolsets=["pcb", "rules", "emc_si"]
+set_layer_count      n=4
+set_board_outline    width_mm=40 height_mm=25
+apply_fab_preset     preset="jlcpcb_4l"  dry_run=True     # then without dry_run
+calc_impedance       kind="differential" dielectric_height_mm=0.2 target_ohms=90 gap_mm=0.15
+add_diff_pair_class  name="USB" diff_pair_width_mm=0.2 diff_pair_gap_mm=0.15
+assign_net_class     net_pattern="/USB_D*"  class_name="USB"
+update_pcb_from_schematic                                 # footprints + nets
+move_footprint       reference="J1" x_mm=2 y_mm=12.5 rotation=90
+add_ground_plane     layer="In1.Cu"  net="GND"
+autoroute_pcb        passes=20
+list_unrouted        summary=True
+run_drc              refill_zones=True  schematic_parity=True
+```
+
+**6. Layout review and DFM**: EMC, thermal, assembly, lifecycle.
+
+```
+> Review the layout for EMC, heat and assembly at JLCPCB, -40…85 °C parts.
+
+analyze_emc            standard="cispr-class-b"  fsw={"U1": 2.25e6}
+analyze_board_thermal  loads={"+3V3": 0.15}  ambient_c=50
+review_assembly        dfm_preset="jlcpcb_4l"
+audit_lifecycle        sources=["digikey", "mouser"]  temp_range_c=[-40, 85]
+```
+
+**7. Release gate and change review**
+
+```
+> Is the board ready for fab? Show what changed since main.
+
+fab_release_gate  preset="jlcpcb_4l"  loads={"+3V3": 0.15}  check_lifecycle=True
+diff_designs      old="git:main"
+diff_bom          old="git:main"
+```
+
+`fab_release_gate` returns `FAB-READY` or `NOT FAB-READY` with the
+blockers. Open the result in KiCAD and commit it. The fab outputs
+(`export_fab_package`, `export_fab_bom`) are in the `fab` and `sourcing` sets.
+
+---
+
 ## A non-trivial example, end to end
 
 ```
@@ -421,15 +558,15 @@ add_wire ...  add_wire ...  add_wire ...
 # 2. PCB with JLCPCB rules + USB diff pair + GND plane
 set_board_outline width_mm=50 height_mm=30
 set_layer_count   n=4
-apply_fab_preset  preset="jlcpcb_2l_default"
+apply_fab_preset  preset="jlcpcb_4l"
 add_diff_pair_class name="USB" diff_pair_width_mm=0.20 diff_pair_gap_mm=0.18
 add_net_class       name="Power" track_width_mm=0.5 clearance_mm=0.25
 assign_net_class    net_pattern="USB_*"  class_name="USB"
 assign_net_class    net_pattern="+5V"    class_name="Power"
 
-add_footprint   lib_id="Resistor_SMD:R_0603_1608Metric" reference="R1" ...
-add_footprint   lib_id="Resistor_SMD:R_0603_1608Metric" reference="R2" ...
-update_pcb_from_schematic                                  # nets propagate
+update_pcb_from_schematic                                  # footprints + nets
+move_footprint    reference="R1" x_mm=20 y_mm=15
+move_footprint    reference="R2" x_mm=20 y_mm=18
 add_ground_plane  layer="B.Cu"  net="GND"
 autoroute_pcb     passes=20
 
@@ -437,7 +574,7 @@ autoroute_pcb     passes=20
 run_erc                                                    # 0 errors
 run_drc           refill_zones=True  schematic_parity=True  # 0 errors
 export_fab_package  include_render=True
-enrich_bom_with_sourcing  sources="mouser,digikey,tme,farnell"
+enrich_bom_with_sourcing  sources=["mouser", "digikey", "tme", "farnell"]
 ```
 
 ---
@@ -475,6 +612,8 @@ kicad-claude-mcp/
 │   │   ├── sch_netlist.py             # schematic connectivity model
 │   │   ├── pcb_editor.py              # PCB tree mutations
 │   │   ├── pcb_geometry.py            # outlines, zones, polygons
+│   │   ├── pcb_layers.py              # layer table and stackup blocks
+│   │   ├── pcb_netlist.py             # copper connectivity (ratsnest)
 │   │   ├── kicad_cli.py               # subprocess wrapper for kicad-cli
 │   │   ├── kicad_python.py            # bridge to KiCAD's bundled Python (pcbnew)
 │   │   ├── freerouting.py             # JAR runner with timeout + log parser
@@ -515,7 +654,7 @@ kicad-claude-mcp/
 │   ├── indexer/                       # KiCAD library indexing (~10 MB cache)
 │   ├── templates/                     # blank project / sheet / PCB
 │   └── utils/                         # logging, geometry (mm, grid snap), paths
-├── tests/                             # 864 fast + 63 acceptance + 6 network tests
+├── tests/                             # 865 fast + 63 acceptance + 6 network tests
 └── docs/open_points.md                # the open-items queue
 ```
 
@@ -530,9 +669,9 @@ Open work and new field reports live in [`docs/open_points.md`](./docs/open_poin
 - **Coordinates are KiCAD-native everywhere** — millimetres, Y down, origin at the page's top-left, the numbers the KiCAD GUI shows (`utils/geometry.py`). Schematic placements snap to the 1.27 mm grid.
 - **`kicad-cli` is found automatically**, from `KICAD_CLI`, then `PATH`, then the standard install paths (`%ProgramFiles%\KiCad\<version>\bin` newest first on Windows, the app bundle on macOS, `/usr/bin` on Linux). `run_erc` / `run_drc` report which binary they used in `cli_path`.
 - **Backups** go to `<project>/.backups/<timestamp>_<file>`; the newest 10 per file are kept. Add `.backups/` to `.gitignore`.
-- **Freerouting needs Java 21+.** Freerouting 2.2.x requires Java 25; we ship 2.1.0 because it works on Java 21–24.
+- **Freerouting 2.5.0 needs Java 25+.** It is the tested version; the pass count goes in `--router.autorouter.max_passes` (2.5 deprecates `-mp`) and the stats are read from its log format.
 - **Closed-form analyses are estimators.** Impedance / current / crosstalk / thermal / return-path tools give ballpark numbers good for early design. Production hardware needs Ansys / Sonnet / Saturn PCB / Icepak for sign-off.
-- **Design review is only as good as its inputs.** Datasheet checks run only for parts with an extracted spec record; a net's voltage is known only from regulator outputs, series links, resistor dividers and the `rail_voltages` you pass — nodes behind switches are skipped (see `docs/open_points.md`).
+- **Design review is only as good as its inputs.** Datasheet checks run only for parts with an extracted spec record; a net's voltage is known only from regulator outputs, series links, the DC operating-point model (resistor networks, clamps, zeners, switch scenarios) and the `rail_voltages` you pass. The model is static: the accepted limits are listed in OP-13 of `docs/open_points.md`.
 
 ---
 
@@ -540,7 +679,7 @@ Open work and new field reports live in [`docs/open_points.md`](./docs/open_poin
 
 ```bash
 uv run mcp dev server.py                          # MCP Inspector (browser UI)
-uv run pytest -m "not slow and not network" -q    # 864 fast tests, ~1 min
+uv run pytest -m "not slow and not network" -q    # 865 fast tests, ~1 min
 uv run pytest -m "slow" -q                        # 63 acceptance tests via kicad-cli (~8 min)
 uv run pytest -m "network" -q                     # 6 live distributor tests
 ```
@@ -556,7 +695,6 @@ the Search one works here).
 
 Built on top of:
 
-- [`kicad-skip`](https://github.com/psychogenic/kicad-skip) for some schematic operations
 - [`sexpdata`](https://pypi.org/project/sexpdata/) for parsing KiCAD's S-expression format
 - [`Freerouting`](https://github.com/freerouting/freerouting) for autorouting
 - KiCAD's bundled `pcbnew` Python API for Specctra DSN/SES interchange and netlist application

@@ -72,7 +72,7 @@ def register(mcp) -> None:
         """Full autoroute pipeline: export DSN → Freerouting → import SES.
 
         Args:
-            passes: Freerouting `-mp` value. Higher = better routes, slower.
+            passes: Freerouting `router.autorouter.max_passes`. Higher = better routes, slower.
             timeout_seconds: Hard kill if Freerouting runs longer than this.
             threads: optional `-mt` threads count.
         """
