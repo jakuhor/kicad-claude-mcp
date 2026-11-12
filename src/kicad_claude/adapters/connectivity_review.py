@@ -481,9 +481,12 @@ def _abs_keys_for(pin_name: str, keys: list[str]) -> list[str]:
     return hits
 
 
-def check_pin_abs_max(nl: Netlist, findings: list, specs: dict, volts: dict) -> list[dict]:
+def check_pin_abs_max(nl: Netlist, findings: list, specs: dict, volts: dict,
+                      ic_abs: float = 0.9) -> list[dict]:
     """Each pin whose name matches an `absolute_max` key (VIN <-> IN, EN <->
-    EN/UV, CC <-> CC1 ...) against its net's DC voltage (rails, dividers)."""
+    EN/UV, CC <-> CC1 ...) against its net's DC voltage (rails, dividers);
+    within the limit but beyond `ic_abs` x limit (derating profile) is
+    CR-PIN-DERATE."""
     from kicad_claude.adapters.power_review import _net_voltage
 
     out = []
@@ -516,6 +519,15 @@ def check_pin_abs_max(nl: Netlist, findings: list, specs: dict, volts: dict) -> 
                                        f"absolute maximum {k} {lo if lo is not None else '-'}.."
                                        f"{hi if hi is not None else '-'} V "
                                        f"({rec['pdf']['file']} p.{sv.get('page')})."))
+                    continue
+                lim = (hi if hi is not None and hi > 0 and v > ic_abs * hi else
+                       lo if lo is not None and lo < 0 and v < ic_abs * lo else None)
+                if lim is not None:
+                    findings.append(_f("warning", "CR-PIN-DERATE", ref,
+                                       f"Pin {row['pin']} on {p.net} at {v:.4g} V is "
+                                       f"{v / lim:.0%} of absolute maximum {k} {lim:g} V "
+                                       f"(derating limit {ic_abs:.0%}; "
+                                       f"{rec['pdf']['file']} p.{sv.get('page')})."))
     return out
 
 
@@ -577,15 +589,19 @@ def _rating(comp: dict, field: str) -> float | None:
     return None
 
 
-def check_cap_voltage(nl: Netlist, findings: list, volts: dict, derating: float = 0.8,
-                      field: str = "Voltage", specs: dict | None = None) -> dict:
+def check_cap_voltage(nl: Netlist, findings: list, volts: dict, derating: float | None = None,
+                      field: str = "Voltage", specs: dict | None = None,
+                      profile: str = "commercial") -> dict:
     """DC voltage across each fitted capacitor (rails, dividers) against its
     rating: the fitted MPN's extracted datasheet (`absolute_max.V`) when
     there is one, else the symbol `field`. Error above the rating, warning
-    above `derating` x rating; a field that disagrees with the datasheet is
-    CR-CAP-FIELD."""
+    above the derating fraction - `derating` when given, else the
+    `profile`'s fraction for the capacitor's dielectric family; a field
+    that disagrees with the datasheet is CR-CAP-FIELD."""
     from kicad_claude.adapters import datasheet_specs as dss
+    from kicad_claude.adapters import derating as drt
     specs = specs or {}
+    fractions = drt.profile(profile)["cap"]
     from kicad_claude.adapters.power_review import _net_voltage
 
     rows, unknown, no_rating = [], [], []
@@ -614,20 +630,25 @@ def check_cap_voltage(nl: Netlist, findings: list, volts: dict, derating: float 
             continue
         v = abs(va - vb)
         use = v / rating
+        family = drt.cap_family(comp, specs.get(ref))
+        limit = derating if derating is not None else fractions[family]
         row = {"ref": ref, "value": comp["value"], "rating": rating, "rating_source": src,
-               "volts": round(v, 3), "use": round(use, 3), "nets": [pins[0].net, pins[1].net]}
+               "volts": round(v, 3), "use": round(use, 3), "nets": [pins[0].net, pins[1].net],
+               "family": family, "derating": limit}
         rows.append(row)
         if use > 1:
             findings.append(_f("error", "CR-CAP-V", ref,
                                f"{comp['value']} rated {rating:g} V ({src}) sees "
                                f"{v:.4g} V ({pins[0].net} / {pins[1].net})."))
-        elif use > derating:
+        elif use > limit:
+            how = "cap_derating" if derating is not None else f"{profile} profile, {family}"
             findings.append(_f("warning", "CR-CAP-DERATE", ref,
                                f"{comp['value']} rated {rating:g} V ({src}) at {v:.4g} V = {use:.0%} of "
-                               f"rating (> {derating:.0%} derating). Ceramic X5R/X7R also lose "
+                               f"rating (> {limit:.0%} derating, {how}). Ceramic X5R/X7R also lose "
                                "capacitance under DC bias - check the MPN's curve."))
     return {"checked": rows, "voltage_unknown": unknown, "no_rating": no_rating,
-            "derating": derating, "rating_field": field}
+            "derating": derating if derating is not None else {"profile": profile, **fractions},
+            "rating_field": field}
 
 
 def _nat(s: str) -> tuple:
@@ -639,7 +660,8 @@ CHECKS = ("power_pins", "decoupling", "open_drain", "i2c", "datasheet_pins", "pi
 
 
 def analyze(nl: Netlist, checks: tuple[str, ...] = CHECKS, specs: dict | None = None,
-            volts: dict | None = None, cap_derating: float = 0.8) -> dict:
+            volts: dict | None = None, cap_derating: float | None = None,
+            profile: str = "commercial") -> dict:
     """`specs`: {ref: spec record} from the datasheet cache; `volts`: {net:
     (volts, source)} from the power tree. The `datasheet_pins` and
     `pin_abs_max` checks need them; I2C uses `specs` for fixed addresses."""
@@ -657,10 +679,12 @@ def analyze(nl: Netlist, checks: tuple[str, ...] = CHECKS, specs: dict | None = 
     if "datasheet_pins" in checks:
         result["datasheet_pins"] = check_datasheet_pins(nl, findings, specs)
     if "pin_abs_max" in checks:
-        result["pin_abs_max"] = check_pin_abs_max(nl, findings, specs, volts or {})
+        from kicad_claude.adapters import derating as drt
+        result["pin_abs_max"] = check_pin_abs_max(nl, findings, specs, volts or {},
+                                                  drt.profile(profile)["ic_abs"])
     if "cap_voltage" in checks:
         result["cap_voltage"] = check_cap_voltage(nl, findings, volts or {}, cap_derating,
-                                                  specs=specs)
+                                                  specs=specs, profile=profile)
     result["specs_used"] = sorted(f"{r}={s.get('mpn')}" for r, s in specs.items())
     order = {"error": 0, "warning": 1, "info": 2}
     findings.sort(key=lambda f: (order[f["severity"]], f["rule"], f["ref"]))

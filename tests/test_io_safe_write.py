@@ -333,6 +333,7 @@ RAW_WRITERS_ALLOWED = {
     "adapters/digikey.py",            # OAuth token cache
     "adapters/kicad_python.py",       # pad map handed to KiCAD's Python
     "adapters/spice_auto.py",         # generated SPICE decks
+    "adapters/spice_backends.py",     # SPICE decks in a temp / fab folder
     "indexer/kicad_libs.py",          # library index cache
     "templates/blank.py",             # new project / sheet files, refuses to overwrite
     "tools/sim.py",                   # SPICE driver deck

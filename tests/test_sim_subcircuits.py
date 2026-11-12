@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+import os
 import random
+from pathlib import Path
 
 import pytest
 
@@ -133,7 +135,7 @@ def test_no_ngspice(tmp_path):
     nl = _board(tmp_path)
     lad = sa.find_ladders(nl, {"SW"}, {"+5V": "regulator U1"})[0]
     rec = sa.analyze_ladder(nl, lad, [1e6], None, 0, random.Random(1), {})
-    assert rec["error"] == "ngspice not found on PATH" and "deck" in rec
+    assert rec["error"] == sa.NOSIM and "deck" in rec
 
 
 # ---- op-amp stages, crystals, parasitics, spec tolerance ------------------------ #
@@ -275,8 +277,8 @@ def test_opamp_model_roles_and_errors(tmp_path):
                                           "Sim.Pins": "1=OUT 2=IN- 3=IN+"})
     m = sa.model_from_fields(nl, "U1")
     assert m["subckt"] == "OPA" and m["sim_pins"] == {"1": "OUT", "2": "IN-", "3": "IN+"}
-    r = sa.analyze(nl, ("opamp",), ngspice="")                     # no simulator
-    assert all("ideal" in s.get("model", "") or "ngspice" in s.get("model", "")
+    r = sa.analyze(nl, ("opamp",), sim="")                         # no simulator
+    assert all("ideal" in s.get("model", "") or sa.NOSIM in s.get("model", "")
                for s in r["opamp_stages"])
 
 
@@ -286,3 +288,114 @@ def test_strip_inductance():
     wide = sa.strip_inductance_h(1.0, 2.0, 0.2)
     assert wide < sa.strip_inductance_h(1.0, 0.2, 0.2) and wide > 0
     assert sa.strip_inductance_h(0, 1, 1) == 0.0
+
+
+# ---- simulator backends (ngspice / LTspice) ---------------------------------- #
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def test_ltspice_raw_reader():
+    from kicad_claude.adapters import spice_backends as sb
+
+    raw = sb.read_raw(FIXTURES / "ltspice_rc_ac.raw")       # 1k / 159.155n RC, 10 Hz-100 kHz
+    assert raw["plot"] == "AC Analysis" and "complex" in raw["flags"]
+    assert raw["variables"][:3] == ["frequency", "V(n0)", "V(n1)"]
+    f = [z.real for z in raw["data"]["frequency"]]
+    v = raw["data"]["V(n1)"]
+    assert len(f) == 21 and f[0] == pytest.approx(10)
+    i = min(range(len(f)), key=lambda k: abs(f[k] - 1000))   # corner 1 kHz: -3 dB
+    assert 20 * math.log10(abs(v[i])) == pytest.approx(-3.01, abs=0.05)
+
+
+def test_simulator_discovery_order(tmp_path, monkeypatch):
+    from kicad_claude.adapters import spice_backends as sb
+
+    env = tmp_path / "env" / "LTspice.exe"
+    onpath = tmp_path / "bin" / "LTspice.exe"
+    for p in (env, onpath):
+        p.parent.mkdir()
+        p.write_bytes(b"")
+    monkeypatch.setenv("LTSPICE_PATH", str(env))
+    monkeypatch.setenv("PATH", f".{os.pathsep}{onpath.parent}")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "none"))
+    assert sb.find_ltspice() == str(env)
+    monkeypatch.delenv("LTSPICE_PATH")
+    assert sb.find_ltspice() == str(onpath)
+    # a relative PATH entry is never searched, even with an LTspice.exe in the cwd
+    monkeypatch.setenv("PATH", ".")
+    monkeypatch.chdir(onpath.parent)
+    cands = [str(p) for p in sb._ltspice_candidates()]
+    assert not any(c.startswith(".") or c == "LTspice.exe" for c in cands)
+    monkeypatch.setattr(sb, "find_ngspice", lambda: "/x/ngspice")
+    monkeypatch.setattr(sb, "find_ltspice", lambda: "/y/LTspice.exe")
+    assert sb.detect("auto").name == "ngspice" and sb.detect("ltspice").name == "ltspice"
+    monkeypatch.setattr(sb, "find_ngspice", lambda: None)
+    assert sb.detect("auto").name == "ltspice" and sb.detect("ngspice") is None
+    with pytest.raises(ValueError):
+        sb.detect("xyce")
+
+
+@pytest.mark.slow
+def test_ltspice_matches_ngspice():
+    from kicad_claude.adapters import spice_backends as sb
+
+    lt, ng = sb.find_ltspice(), sb.find_ngspice()
+    if not lt or not ng:
+        pytest.skip("needs both LTspice and ngspice")
+    deck = (FIXTURES / "ltspice_rc_ac.cir").read_text(encoding="utf-8")
+    a = sb.LtspiceBackend(lt).run_ac(deck, ["n1"])["n1"]
+    b = sb.NgspiceBackend(ng).run_ac(deck, ["n1"])["n1"]
+    for f, db in a:
+        ref = min(b, key=lambda x: abs(math.log10(x[0] / f)))
+        assert db == pytest.approx(ref[1], abs=0.5), f
+
+
+# ---- behavioural models from datasheet specs ---------------------------------- #
+
+OPX = {"mpn": "OPX1", "category": "opamp",
+       "electrical": {"GBW": {"typ": 1e6, "unit": "Hz", "page": 5},
+                      "Aol": {"typ": 120, "unit": "dB", "page": 6}}}
+
+
+def test_behavioural_models_need_their_keys():
+    from kicad_claude.adapters import spice_models as sm
+
+    gen = sm.opamp(OPX)
+    assert gen["subckt"] == "OPAMP_OPX1" and gen["source"] == "behavioural, from datasheet OPX1 p.5"
+    assert gen["aol"] == pytest.approx(1e6) and ".subckt OPAMP_OPX1 inp inn out vcc vee" in gen["text"]
+    assert sm.opamp({"mpn": "X", "electrical": {"GBW": {"typ": 1e6, "page": 1}}})["missing"] == \
+        ["electrical.Aol (dB or V/V)"]
+    ldo = {"mpn": "LDO1", "regulator": {"vref": {"typ": 1.2, "page": 3},
+                                        "dropout": {"max": 0.3, "page": 4}},
+           "electrical": {"IQ": {"typ": 5e-5, "page": 4}}}
+    g = sm.ldo(ldo)
+    assert g["nodes"] == ["vin", "vout", "gnd", "fb"] and "min(V(vin, gnd) - 0.3" in g["text"]
+    assert sm.ldo({"mpn": "L", "regulator": {"vref": {"typ": 1.2, "page": 3}}})["missing"] == \
+        ["regulator.dropout"]
+    assert sm.vref({"mpn": "R", "regulator": {"vref": {"typ": 2.5, "page": 2}}})["nodes"] == \
+        ["out", "gnd"]
+
+
+def test_opamp_ideal_names_missing_keys(tmp_path):
+    nl = _opamp_nl(tmp_path)
+    specs = {"U1": {"mpn": "OPY", "electrical": {"GBW": {"typ": 1e6, "unit": "Hz", "page": 5}}}}
+    r = sa.analyze(nl, ("opamp",), specs=specs, sim="")
+    a = next(s for s in r["opamp_stages"] if s["channel"] == "A")
+    assert a["model"].startswith("ideal") and "electrical.Aol" in a["model"]
+
+
+@pytest.mark.slow
+def test_behavioural_opamp_bandwidth(tmp_path):
+    from kicad_claude.adapters import spice_backends as sb
+
+    sim = sb.detect("auto")
+    if sim is None:
+        pytest.skip("no SPICE simulator")
+    nl = _opamp_nl(tmp_path)
+    r = sa.analyze(nl, ("opamp",), specs={"U1": OPX}, supplies={"U1": {"V+": 15, "V-": -15}},
+                   sim=sim)
+    b = next(s for s in r["opamp_stages"] if s["channel"] == "B")     # inverting, NG 3
+    assert b["model"] == "behavioural, from datasheet OPX1 p.5: OPAMP_OPX1"
+    assert b["simulated"]["gain_lf"] == pytest.approx(2.0, rel=0.01)
+    assert b["simulated"]["f_3db_hz"] == pytest.approx(1e6 / 3, rel=0.15)    # GBW / NG

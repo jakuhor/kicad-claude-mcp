@@ -109,3 +109,46 @@ def test_rf_and_certification(tmp_path):
     assert ("RF-MATCH", "U1") in got and r["rf"][0]["matching"] == "pi"
     assert ("RF-DCBLOCK", "U1") in got
     assert ("CERT-RADIO", "-") in got
+
+
+def _can(tmp_path, term):
+    """MCU -> transceiver U1 (CANH / CANL) -> connector J1; `term` options."""
+    comps = [_comp("U1", "TCAN1042"), _comp("J1", "CAN", lib="Connector:Conn_01x03")]
+    h = [("U1", "7", "CANH", "bidirectional"), ("J1", "1", "", "passive")]
+    lo = [("U1", "6", "CANL", "bidirectional"), ("J1", "2", "", "passive")]
+    extra = []
+    gnd = [("U1", "2", "GND", "power_in"), ("J1", "3", "", "passive")]
+    for i in range(term.count("single")):
+        r = f"R{i + 1}"
+        comps.append(_comp(r, "120"))
+        h.append((r, "1", "", "passive"))
+        lo.append((r, "2", "", "passive"))
+    if "split" in term:
+        comps += [_comp("R8", "60"), _comp("R9", "60"), _comp("C9", "4.7n")]
+        h.append(("R8", "1", "", "passive"))
+        lo.append(("R9", "2", "", "passive"))
+        extra.append(_net(5, "CAN_MID", ("R8", "2", "", "passive"), ("R9", "1", "", "passive"),
+                          ("C9", "1", "", "passive")))
+        gnd.append(("C9", "2", "", "passive"))
+    if "tvs" in term:
+        comps.append(_comp("D1", "PESD2CAN", lib="Power_Protection:PESD2CAN"))
+        h.append(("D1", "1", "", "passive"))
+        lo.append(("D1", "2", "", "passive"))
+        gnd.append(("D1", "3", "", "passive"))
+    nets = [_net(1, "CAN_H", *h), _net(2, "CAN_L", *lo), _net(3, "GND", *gnd), *extra]
+    return _run(tmp_path, comps, nets, ("interfaces",))
+
+
+def test_can_termination(tmp_path):
+    import pytest
+    for term, want in (("single tvs", None), ("tvs", "warning"), ("single single tvs", None),
+                       ("single single single tvs", "error"), ("split tvs", None)):
+        r, got = _can(tmp_path, term)
+        sev = {f["severity"] for f in r["findings"] if f["rule"] == "CAN-TERM"}
+        assert sev == ({want} if want else set()), term
+        assert ("CAN-ESD", "U1") not in got
+    r, got = _can(tmp_path, "split tvs")
+    assert r["can"][0]["terminations"][0]["type"] == "split"
+    assert r["can"][0]["terminations"][0]["ohm"] == pytest.approx(120)
+    r, got = _can(tmp_path, "single")
+    assert ("CAN-ESD", "U1") in got

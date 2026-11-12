@@ -23,6 +23,7 @@ import httpx
 logger = logging.getLogger("kicad-claude.adapters.farnell")
 
 from kicad_claude.utils.logging import quiet_http  # noqa: E402
+from kicad_claude.adapters import temp_grade  # noqa: E402
 
 quiet_http()
 
@@ -147,4 +148,5 @@ def _summarize_part(p: dict) -> dict:
         "product_url": f"https://{_store()}/{sku}" if sku else "",
         "sku": sku,
         "lifecycle": p.get("productStatus") or "",
+        "operating_temp": temp_grade.attr_text(p.get("attributes") or []),
     }

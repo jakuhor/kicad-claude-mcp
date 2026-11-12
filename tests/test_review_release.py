@@ -221,6 +221,107 @@ def test_audit_lifecycle_classification(tmp_path, monkeypatch):
     assert r["counts"]["error"] == 1
 
 
+def test_audit_lifecycle_temperature(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from mcp.server.fastmcp import FastMCP
+
+    from kicad_claude import state
+    from kicad_claude.adapters import temp_grade
+    from kicad_claude.tools.review import release as release
+    from kicad_claude.tools.sourcing import distributors as sourcing
+
+    assert temp_grade.parse_range("-40°C ~ 85°C (TA)") == (-40, 85)
+    assert temp_grade.parse_range("- 55 C ~ + 125 C") == (-55, 125)
+    assert temp_grade.classify(-40, 125) == "automotive"
+    assert temp_grade.classify(0, 70) == "commercial"
+    nl_path = tmp_path / "t.net"
+    comps = [("U1", "MCU", "COMM-1"), ("U2", "LDO", "IND-1"), ("U3", "SENS", "SPEC-1"),
+             ("R1", "10k", "RES-1")]
+    body = " ".join(f'(comp (ref "{r}") (value "{v}") (footprint "") (libsource (lib "x") '
+                    f'(part "x") (description "")) (fields (field (name "MPN") "{m}")))'
+                    for r, v, m in comps)
+    nl_path.write_text(f'(export (version "E") (components {body}) (nets))', encoding="utf-8")
+    data = {("digikey", "COMM-1"): {"lifecycle": "Active", "stock": 5,
+                                    "operating_temp": "0°C ~ 70°C (TA)"},
+            ("digikey", "IND-1"): {"lifecycle": "Active", "stock": 5,
+                                   "operating_temp": "-40°C ~ 85°C"},
+            # the datasheet wins over the distributor field
+            ("digikey", "SPEC-1"): {"lifecycle": "Active", "stock": 5,
+                                    "operating_temp": "0°C ~ 70°C"},
+            ("digikey", "RES-1"): {"lifecycle": "Active", "stock": 5}}
+    monkeypatch.setattr(sourcing, "search_source",
+                        lambda name, mpn, limit=5: [{"mpn": mpn, **data[(name, mpn)]}]
+                        if (name, mpn) in data else [])
+    specs = tmp_path / "datasheets" / "specs"
+    specs.mkdir(parents=True)
+    (specs / "SPEC-1.json").write_text(json.dumps({
+        "mpn": "SPEC-1", "pdf": {"file": "x.pdf", "sha256": ""},
+        "recommended": {"T_A": {"min": -40, "max": 125, "unit": "C", "page": 3}}}),
+        encoding="utf-8")
+    monkeypatch.setattr(state, "get_active", lambda: SimpleNamespace(path=tmp_path))
+    mcp = FastMCP("t")
+    release.register(mcp)
+    fn = mcp._tool_manager.get_tool("audit_lifecycle").fn
+    r = fn(sources=["digikey"], temp_range_c=[-40, 85], netlist_path=str(nl_path))
+    got = {(f["rule"], f["ref"]) for f in r["findings"]}
+    assert ("LC-TEMP", "U1") in got and ("LC-TEMP", "U2") not in got
+    assert ("LC-TEMP", "U3") not in got and ("LC-TEMP-NODATA", "R1") in got
+    parts = {p["mpn"]: p for p in r["parts"]}
+    assert parts["SPEC-1"]["temperature"]["grade"] == "automotive"
+    assert parts["SPEC-1"]["temperature"]["source"].startswith("datasheet SPEC-1 p.3")
+    assert parts["COMM-1"]["temperature"]["grade"] == "commercial"
+    with pytest.raises(ValueError):
+        fn(sources=["digikey"], temp_range_c=[85, -40], netlist_path=str(nl_path))
+
+
+def test_audit_lifecycle_alternatives(tmp_path, monkeypatch):
+    from mcp.server.fastmcp import FastMCP
+
+    from kicad_claude.tools.review import release as release
+    from kicad_claude.tools.sourcing import distributors as sourcing
+
+    nl_path = tmp_path / "a.net"
+    body = " ".join(f'(comp (ref "{r}") (value "x") (footprint "") (libsource (lib "x") '
+                    f'(part "x") (description "")) (fields (field (name "MPN") "{m}")))'
+                    for r, m in (("U1", "LM1117IMP-3.3"), ("U2", "ZZ9000-OLD")))
+    nl_path.write_text(f'(export (version "E") (components {body}) (nets))', encoding="utf-8")
+    ti = "Texas Instruments"
+    exact = {
+        ("digikey", "LM1117IMP-3.3"): [{"mpn": "LM1117IMP-3.3", "lifecycle": "Obsolete",
+                                        "stock": 0, "manufacturer": ti,
+                                        "description": "IC REG LINEAR 3.3V SOT-223-4"}],
+        ("mouser", "LM1117IMP-3.3"): [{"mpn": "LM1117IMP-3.3", "lifecycle": "Obsolete",
+                                       "stock": 0, "manufacturer": ti,
+                                       "suggested_replacement": "LM1117IMPX-3.3/NOPB"}],
+        ("digikey", "ZZ9000-OLD"): [{"mpn": "ZZ9000-OLD", "lifecycle": "Obsolete", "stock": 0}],
+        ("digikey", "LM1117"): [
+            {"mpn": "LM1117MPX-3.3/NOPB", "lifecycle": "Active", "stock": 900,
+             "manufacturer": ti, "description": "IC REG LINEAR 3.3V SOT-223-4"},
+            {"mpn": "LM1117DT-3.3", "lifecycle": "Active", "stock": 50,
+             "manufacturer": "STMicroelectronics", "description": "LDO SOT-223"},
+            {"mpn": "LM1117MP-5.0", "lifecycle": "Obsolete", "stock": 0,
+             "manufacturer": ti, "description": "SOT-223-4"},
+            {"mpn": "LM1117DTX-3.3/NOPB", "lifecycle": "Active", "stock": 10,
+             "manufacturer": ti, "description": "IC REG LINEAR TO-252-3"}],
+    }
+    monkeypatch.setattr(sourcing, "search_source",
+                        lambda name, q, limit=5: exact.get((name, q), []))
+    mcp = FastMCP("t")
+    release.register(mcp)
+    r = mcp._tool_manager.get_tool("audit_lifecycle").fn(sources=["digikey", "mouser"],
+                                                         netlist_path=str(nl_path))
+    parts = {p["mpn"]: p for p in r["parts"]}
+    alts = parts["LM1117IMP-3.3"]["alternatives"]
+    assert [a["mpn"] for a in alts] == ["LM1117IMPX-3.3/NOPB", "LM1117MPX-3.3/NOPB"]
+    assert alts[0]["why"] == "suggested replacement"
+    assert alts[1]["stock"] == 900 and alts[1]["source"] == "digikey"
+    assert parts["ZZ9000-OLD"]["alternatives"] == []
+    eol = next(f for f in r["findings"] if f["rule"] == "LC-EOL" and f["ref"] == "U1")
+    assert "LM1117MPX-3.3/NOPB" in eol["message"]
+
+
 # ---- assembly review + cross-verify ------------------------------------------- #
 
 
@@ -367,3 +468,143 @@ def test_what_if_emc(tmp_path, monkeypatch):
         rail_voltages={"VIN": 12.0}, netlist_path=str(tmp_path / "s.net"))
     assert w["dividers"] and w["emc"]["note"].startswith("board copper unchanged")
     assert isinstance(w["emc"]["findings_new"], list)
+
+
+def _dfm_board(tmp_path, track_w=0.2, via=(0.6, 0.3), extra=""):
+    pads = ('(pad "1" smd rect (at -0.8 0) (size 0.8 0.9) (layers "F.Cu") (net "A")) '
+            '(pad "2" smd rect (at 0.8 0) (size 0.8 0.9) (layers "F.Cu") (net "B"))')
+    text = ('(kicad_pcb (version 20260206) (layers (0 "F.Cu" signal) (2 "B.Cu" signal)) '
+            '(gr_rect (start 0 0) (end 30 30) (layer "Edge.Cuts")) '
+            f'(footprint "R:R_0603" (layer "F.Cu") (at 10 10) (property "Reference" "R1") {pads}) '
+            f'(segment (start 10.8 10) (end 20 10) (width {track_w}) (layer "F.Cu") (net "B")) '
+            f'(via (at 20 20) (size {via[0]}) (drill {via[1]}) (layers "F.Cu" "B.Cu") (net "B")) '
+            + extra + ")")
+    p = tmp_path / "d.kicad_pcb"
+    p.write_text(text, encoding="utf-8")
+    from kicad_claude.adapters import sch_io
+    return sch_io.parse_file(p)
+
+
+def test_dfm_against_preset(tmp_path):
+    from kicad_claude.adapters import dfm
+    from kicad_claude.adapters import project_settings as ps
+
+    rules = ps.FAB_PRESETS["jlcpcb_2l_default"]["rules"]
+    ok = dfm.analyze(_dfm_board(tmp_path), "jlcpcb_2l_default", rules)
+    assert ok["counts"] == {"error": 0, "warning": 0} and ok["dfm_score"] == 100
+    thin = dfm.analyze(_dfm_board(tmp_path, track_w=0.1), "jlcpcb_2l_default", rules)
+    assert {f["rule"] for f in thin["findings"]} == {"DFM-TRACK"}
+    assert thin["dfm_score"] == 90 and thin["deductions"][0]["rule"] == "DFM-TRACK"
+    # small via (drill, diameter, ring), a track 0.1 mm from net A's pad, copper at the edge,
+    # a via in an SMD pad, silk across a pad
+    extra = ('(segment (start 9.2 10.55) (end 9.2 14) (width 0.2) (layer "F.Cu") (net "C")) '
+             '(segment (start 0.1 5) (end 0.1 8) (width 0.2) (layer "F.Cu") (net "D")) '
+             '(via (at 9.2 10) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net "A")) '
+             '(footprint "X:Y" (layer "F.Cu") (at 25 25) (property "Reference" "D1") '
+             '(fp_line (start -2 0) (end 2 0) (layer "F.SilkS")) '
+             '(pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "E")))')
+    bad = dfm.analyze(_dfm_board(tmp_path, via=(0.35, 0.15), extra=extra), "jlcpcb_2l_default",
+                      rules)
+    rules_hit = {f["rule"] for f in bad["findings"]}
+    assert {"DFM-DRILL", "DFM-VIA", "DFM-RING", "DFM-SPACING", "DFM-EDGE",
+            "DFM-VIA-IN-PAD", "DFM-SILK"} <= rules_hit
+    assert bad["dfm_score"] < thin["dfm_score"]
+    assert any("solder-mask web" in n for n in bad["not_checked"])
+
+
+def test_review_assembly_dfm_preset(tmp_path, monkeypatch):
+    from mcp.server.fastmcp import FastMCP
+
+    from kicad_claude import state
+    from kicad_claude.tools.review import release as release
+
+    _dfm_board(tmp_path, track_w=0.1)
+    monkeypatch.setattr(state, "get_active_board_path", lambda: tmp_path / "d.kicad_pcb")
+    mcp = FastMCP("t")
+    release.register(mcp)
+    fn = mcp._tool_manager.get_tool("review_assembly").fn
+    r = fn(dfm_preset="jlcpcb_2l_default", heights=False, cross_verify=False)
+    assert r["dfm"]["dfm_score"] == 90
+    assert any(f["rule"] == "DFM-TRACK" for f in r["findings"])
+    assert "dfm" not in fn(heights=False, cross_verify=False)
+    with pytest.raises(ValueError):
+        fn(dfm_preset="nope", heights=False, cross_verify=False)
+
+
+def test_assembly_complexity_orders_boards(tmp_path):
+    from kicad_claude.adapters import assembly_review as ar
+    from kicad_claude.adapters import sch_io
+
+    def board(name, fps):
+        p = tmp_path / name
+        p.write_text('(kicad_pcb (version 20260206) (layers (0 "F.Cu" signal) (2 "B.Cu" signal)) '
+                     + " ".join(fps) + ")", encoding="utf-8")
+        return sch_io.parse_file(p)
+
+    def fp(ref, lib, side="F", attr="smd", mpn=None):
+        lay = f"{side}.Cu"
+        return (f'(footprint "{lib}" (layer "{lay}") (at 5 5) (property "Reference" "{ref}") '
+                f'(property "Value" "{mpn or ref}") (attr {attr}) '
+                f'(pad "1" smd rect (at 0 0) (size 0.5 0.5) (layers "{lay}")))')
+    simple = board("s.kicad_pcb", [fp(f"R{i}", "Resistor_SMD:R_1206_3216Metric", mpn="10k")
+                                   for i in range(5)])
+    hard = board("h.kicad_pcb", [
+        fp("U1", "Package_BGA:BGA-256_17x17mm_Layout16x16_P1.0mm"),
+        fp("U2", "Package_DFN_QFN:QFN-48-1EP_7x7mm_P0.4mm"),
+        fp("C1", "Capacitor_SMD:C_0201_0603Metric"),
+        fp("C2", "Capacitor_SMD:C_0402_1005Metric", side="B"),
+        fp("J1", "Connector:Conn_01x04", attr="through_hole")])
+    a, b = ar.complexity(simple), ar.complexity(hard)
+    assert a["score"] < b["score"]
+    assert a["unique_parts"] == 1 and a["smallest_passive"] == "1206" and a["sides"] == ["F"]
+    assert b["smallest_passive"] == "0201" and b["sides"] == ["B", "F"] and b["tht"] == 1
+    assert b["fine_pitch"] == [{"ref": "U2", "pitch_mm": 0.4}]
+    assert set(b["bga_or_exposed_pad"]) == {"U1", "U2"}
+    assert {f["factor"] for f in b["factors"]} >= {"both sides populated", "THT with SMD"}
+
+
+def test_fab_release_gate_blocks_on_dfm_and_thermal(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from mcp.server.fastmcp import FastMCP
+
+    from kicad_claude import state
+    from kicad_claude.adapters import kicad_cli
+    from kicad_claude.tools.review import release as release
+    from tests.test_emc_si_board_thermal import _qfn
+    from tests.test_review_ratings_circuits_bom import _buck
+
+    _buck(tmp_path)                                            # s.net
+    _dfm_board(tmp_path, track_w=0.1, extra=_qfn(20, 25, 0))    # d.kicad_pcb + QFN U1
+    proj = SimpleNamespace(path=tmp_path, name="p", sch_path=tmp_path / "p.kicad_sch")
+    monkeypatch.setattr(state, "get_active", lambda: proj)
+    monkeypatch.setattr(state, "get_active_board_path", lambda: tmp_path / "d.kicad_pcb")
+    monkeypatch.setattr(kicad_cli, "run_erc", lambda *a, **k: {"errors": 0, "warnings": 0})
+    monkeypatch.setattr(kicad_cli, "run_drc", lambda *a, **k: {"errors": 0, "warnings": 0})
+    mcp = FastMCP("t")
+    release.register(mcp)
+    fn = mcp._tool_manager.get_tool("fab_release_gate").fn
+    r = fn(preset="jlcpcb_2l_default", loads={"+5V": 3.0}, rail_voltages={"VIN": 12, "+5V": 5},
+           netlist_path=str(tmp_path / "s.net"))
+    assert r["verdict"] == "NOT FAB-READY"
+    assert any(b.startswith("DFM-TRACK") for b in r["blockers"])
+    assert r["gates"]["dfm"]["dfm_score"] < 100
+    assert any(w.startswith("TH-VIAS U1") for w in r["warnings"])    # thermal ran
+    assert "thermal" in r["gates"]
+    plain = fn(rail_voltages={"VIN": 12}, netlist_path=str(tmp_path / "s.net"))
+    assert "dfm" not in plain["gates"] and "thermal" not in plain["gates"]
+
+
+def test_dfm_round_pads_are_round(tmp_path):
+    """TO-92 pads (1.3 mm circles on a 1.27 mm diagonal pitch) are 0.5 mm apart:
+    as squares their corners would touch."""
+    from kicad_claude.adapters import dfm
+    from kicad_claude.adapters import project_settings as ps
+
+    pads = " ".join(f'(pad "{n}" thru_hole circle (at {x} {y}) (size 1.3 1.3) (drill 0.75) '
+                    f'(layers "*.Cu") (net "N{n}"))'
+                    for n, x, y in (("1", 0, 0), ("2", 1.27, -1.27), ("3", 2.54, 0)))
+    extra = f'(footprint "P:TO-92" (layer "F.Cu") (at 15 20) (property "Reference" "Q1") {pads})'
+    r = dfm.analyze(_dfm_board(tmp_path, extra=extra), "jlcpcb_2l_default",
+                    ps.FAB_PRESETS["jlcpcb_2l_default"]["rules"])
+    assert not [f for f in r["findings"] if f["rule"] == "DFM-SPACING"]

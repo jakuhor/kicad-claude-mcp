@@ -23,6 +23,9 @@ a current focus — do not extend them unless asked.
   (OP-n, numbers never reused). New field reports and gaps go straight in as
   the next OP. Decisions taken with the user are marked *(decided, date)* —
   do not re-ask them.
+- A large item may have a self-contained plan in `docs/plans/<op>.md`, linked
+  from its OP; follow it and tick its Progress log. Delete the plan with the
+  item.
 - When an item is done: delete it from `open_points.md` and document the
   finished capability in `README.md` (Capabilities; the rule-ID table for new
   review rules). History lives in git, not in docs.
@@ -31,7 +34,7 @@ a current focus — do not extend them unless asked.
 
 ## Layout
 - `server.py` — entry point; creates `FastMCP("kicad-claude")`, registers
-  `ping` and calls `toolsets.install(mcp)`. 142 tools total.
+  `ping` and calls `toolsets.install(mcp)`. 143 tools total.
 - `src/kicad_claude/toolsets.py` — the tool sets (`core`, `sch`, `pcb`, …).
   Set `<name>` is the module or package `tools/<name>` with `register(mcp)`;
   a package's `__init__` registers its submodules. Only `core` loads at

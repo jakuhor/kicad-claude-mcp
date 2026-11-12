@@ -16,6 +16,7 @@ CircuitGroup = Literal["power", "analog", "digital", "misc", "interfaces",
 ConnectivityCheck = Literal["power_pins", "decoupling", "open_drain", "i2c",
                             "datasheet_pins", "pin_abs_max", "cap_voltage"]
 SubcircuitType = Literal["divider", "rc", "lc", "opamp", "crystal"]
+DeratingProfile = Literal["commercial", "industrial", "automotive", "military"]
 
 
 def clean(items: Iterable[str] | None, default: Iterable[str] = ()) -> list[str]:

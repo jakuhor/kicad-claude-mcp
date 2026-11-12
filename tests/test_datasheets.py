@@ -163,11 +163,44 @@ def test_validate():
                         PAGES)[0]
 
 
-def test_number_scaling():
-    assert dss._number_on_page(0.075, "dropout 75 mV")
-    assert dss._number_on_page(500000, "500 kHz")
-    assert dss._number_on_page(2.2e-6, "2.2 µH")
-    assert not dss._number_on_page(0.81, "VFB 800 mV")
+@pytest.mark.parametrize("v, unit, page, symmetric, found", [
+    (0.075, "V", "dropout 75 mV", False, True),
+    (0.075, "V", "dropout 0.075 V", False, True),
+    (0.075, "V", "dropout 75", False, False),             # other scale needs its unit
+    (500000, "Hz", "fSW 450 500 550 kHz", False, True),
+    (2.2e-6, "H", "2.2 µH", False, True),
+    (2.2e-6, "H", "2.2 μH", False, True),                 # Greek mu
+    (0.81, "V", "VFB 800 mV", False, False),
+    (-40, "C", "TJ −40 to 125 °C", False, True),          # Unicode minus
+    (-40, "C", "TJ –40 to 125 ℃", False, True),           # en dash, ℃
+    (125, "C", "TJ -40 to 125 °C", False, True),
+    (-15, "V", "VIN ± 15 V", True, True),
+    (15, "V", "VIN ±15 V", True, True),
+    (1.5, "A", "ILIM 1,500 mA", False, True),             # thousands separator
+    (0.5, "A", "ILIM 1,500 mA", False, False),
+    (5.5, "V", "VIN 2.7–5.5 V", False, True),             # range dash is not a sign
+    (1e6, "V/s", "SR 1 V/µs", False, True),
+    (40, "C/W", "RθJA 40 K/W", False, True),
+    (55, "V", "VIN max 5.5 V", False, False),
+    (40, "C", "TA −40 °C", False, False),
+    (15, "V", "VIN ±15 V", False, False),                 # one-sided vs ±
+    (1e-5, "A", "IQ 10 A", False, False),
+    (10, "A", "IQ 10 µA", False, False),
+])
+def test_value_on_page(v, unit, page, symmetric, found):
+    assert dss._value_on_page(v, unit, page, symmetric) is found
+
+
+def test_validate_symmetric_and_wrapped():
+    pages = ["Supply voltage VS ±15 V; output short-circuit pro-\ntection 40 mA"]
+    rec = {"category": "opamp",
+           "absolute_max": {"VS": {"min": -15, "max": 15, "unit": "V", "page": 1}},
+           "electrical": {"ISC": {"typ": 0.04, "unit": "A", "page": 1,
+                                  "quote": "short-circuit protection 40 mA"}}}
+    assert dss.validate(rec, pages) == ([], [])
+    rec["absolute_max"]["VS"] = {"max": 15, "unit": "V", "page": 1}
+    _, warnings = dss.validate(rec, pages)
+    assert any("absolute_max.VS" in w for w in warnings)
 
 
 def test_select_pages():
@@ -190,20 +223,30 @@ def test_extraction_roundtrip(tmp_path, ds_dir, monkeypatch):
     assert task["pdf"].endswith("8471fd.pdf") and task["page_count"] == 2
     assert task["schematic"]["pins"]["U2"]["8"] == {"name": "FB1", "net": "FB"}
     assert "SV (spec value)" in task["schema"]
+    sha = task["pdf_sha256"]
+    assert sha == dsi.sha256(ds_dir / "8471fd.pdf")
 
-    bad = t["save_datasheet_extraction"]("LT8471IUFD#TRPBF", {"category": "x"},
+    bad = t["save_datasheet_extraction"]("LT8471IUFD#TRPBF", {"category": "x"}, sha,
                                          dest_dir=str(ds_dir))
     assert bad["saved"] is False and bad["errors"]
-    ok = t["save_datasheet_extraction"]("LT8471IUFD#TRPBF", _good(), dest_dir=str(ds_dir))
+    with pytest.raises(ValueError, match="0" * 64) as ex:
+        t["save_datasheet_extraction"]("LT8471IUFD#TRPBF", _good(), "0" * 64,
+                                       dest_dir=str(ds_dir))
+    assert sha in str(ex.value)
+    ok = t["save_datasheet_extraction"]("LT8471IUFD#TRPBF", _good(), sha, dest_dir=str(ds_dir))
     assert ok["saved"] is True
     with pytest.raises(FileExistsError):
-        t["save_datasheet_extraction"]("LT8471IUFD#TRPBF", _good(), dest_dir=str(ds_dir))
+        t["save_datasheet_extraction"]("LT8471IUFD#TRPBF", _good(), sha, dest_dir=str(ds_dir))
     spec = t["get_datasheet_specs"]("LT8471IUFD#TRPBF", dest_dir=str(ds_dir))
     assert spec["found"] and spec["stale"] is False and spec["pdf"]["file"] == "8471fd.pdf"
     assert t["get_datasheet_specs"](dest_dir=str(ds_dir))["counts"]["extracted"] == 1
 
     (ds_dir / "8471fd.pdf").write_bytes(b"%PDF-1.4 revised")
     assert t["get_datasheet_specs"]("LT8471IUFD#TRPBF", dest_dir=str(ds_dir))["stale"] is True
+    # PDF replaced between task and save: the old task's hash is refused.
+    with pytest.raises(ValueError, match="changed since the extraction task"):
+        t["save_datasheet_extraction"]("LT8471IUFD#TRPBF", _good(), sha, overwrite=True,
+                                       dest_dir=str(ds_dir))
 
 
 def test_power_tree_uses_specs(tmp_path, monkeypatch):
@@ -447,8 +490,8 @@ def test_names_match():
 
 
 def test_number_digit_spaced():
-    assert dss._number_on_page(30, "VBUS_IN and VDC_OUT pins –– 3 0 V")
-    assert dss._number_on_page(26.7, "SMF24A BZ IZ 26.70 29.50")
+    assert dss._value_on_page(30, "V", "VBUS_IN and VDC_OUT pins –– 3 0 V")
+    assert dss._value_on_page(26.7, "V", "SMF24A BZ IZ 26.70 29.50")
 
 
 def test_pin_pair_limits(tmp_path):
@@ -518,7 +561,8 @@ def test_cap_voltage(tmp_path):
     p.write_text(f'(export (version "E") (components {" ".join(comps)}) (nets {" ".join(nets)}))',
                  encoding="utf-8")
     nl = pr.parse_netlist(p)
-    r = cr.analyze(nl, ("cap_voltage",), volts={"+20V": (20.0, "c"), "+5V": (5.0, "c")})
+    r = cr.analyze(nl, ("cap_voltage",), volts={"+20V": (20.0, "c"), "+5V": (5.0, "c")},
+                   cap_derating=0.8)
     cv = r["cap_voltage"]
     rows = {x["ref"]: x for x in cv["checked"]}
     assert rows["C3"]["rating"] == 50 and rows["C4"]["rating"] == 6
@@ -555,3 +599,46 @@ def test_manifest_entry_cannot_point_outside_datasheets(tmp_path, ds_dir, bad):
     t = _tools()
     with pytest.raises(ValueError, match="points outside"):
         t["get_datasheet_extraction_task"]("X1", dest_dir=str(ds_dir))
+
+
+def test_page_selection_toc_and_sections():
+    pages = ["LT9999 buck regulator, features",
+             "Table of Contents\nPin Configuration ........ 4\nAbsolute Maximum Ratings ....... 5\n"
+             "Electrical Characteristics ...... 6\nTypical Application ...... 12",
+             "Description", "", "", "", "", "",
+             "Thermal Information  RθJA 45 °C/W", "", "", "", "", "", ""]
+    # printed page numbers sit one PDF page late (cover offset); the target pages here are
+    # image-only tables (no text), so the TOC numbers are used as printed
+    got = dss.page_reasons(pages, limit=8)
+    assert got[1] == "front page"
+    assert {4, 5, 6, 12} <= set(got) and got[5] == "table of contents: abs_max"
+    assert got[9] == "heading: thermal"
+    # a heading found one page after the printed number moves the TOC target
+    pages2 = list(pages)
+    pages2[5] = "Absolute Maximum Ratings  VIN -0.3 6 V"          # PDF page 6
+    assert dss.page_reasons(pages2, limit=8).get(6) == "table of contents: abs_max"
+    assert dss.select_pages(pages2, limit=8) == sorted(dss.page_reasons(pages2, limit=8))
+
+
+def test_extraction_quality():
+    sv = lambda **k: {"page": 1, **k}                                  # noqa: E731
+    full = {"mpn": "LDO1", "category": "regulator_linear",
+            "pins": [{"number": str(i), "name": n} for i, n in
+                     enumerate(("IN", "GND", "EN", "OUT", "NC"), 1)],
+            "absolute_max": {"VIN": sv(max=6, unit="V"), "TJ": sv(max=150, unit="C")},
+            "recommended": {"VIN": sv(min=2, max=5.5, unit="V"), "IOUT": sv(max=0.3, unit="A")},
+            "electrical": {"IQ": sv(typ=1e-5, unit="A"), "PSRR": sv(typ=70, unit="dB"),
+                           "VOUT_acc": sv(max=2, unit="%")},
+            "regulator": {"vref": sv(typ=1.2, unit="V"), "dropout": sv(max=0.2, unit="V")},
+            "thermal": {"rth_ja": sv(typ=200, unit="C/W"), "tj_max": sv(max=125, unit="C")}}
+    q = dss.quality(full, symbol_pins=5)
+    assert q["score"] == 100 and q["missing"] == [] and "finding" not in q
+    sparse = {"mpn": "LDO2", "category": "regulator_linear",
+              "pins": [{"number": "1", "name": "IN"}], "electrical": {}}
+    q2 = dss.quality(sparse, symbol_pins=5)
+    assert q2["score"] < 50 and q2["finding"]["rule"] == "DQ-LOW"
+    assert "pins: 1 of the symbol's 5" in q2["missing"]
+    assert any("regulator.dropout" in m for m in q2["missing"])
+    cap = {"mpn": "C1", "category": "capacitor", "electrical": {"C": sv(typ=1e-6, unit="F")},
+           "absolute_max": {"V": sv(max=50, unit="V")}}
+    assert "pins" not in dss.quality(cap)["parts"]          # passives: no pin table needed

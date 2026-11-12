@@ -232,14 +232,14 @@ def register(mcp) -> None:
         esd_max_mm: float = 10.0,
         diff_skew_ps: float = 25.0,
         resolution_mm: float = 0.5,
+        harmonic_limits: dict | None = None,
         netlist_path: str = "",
     ) -> dict:
-        """EMC pre-compliance review of the active board on its filled copper
-        (refill zones first). `groups` (default all): ground, switching,
-        decoupling, io, thermal; findings carry `EM-*` rule IDs (see help).
-        Pass `fsw={"U1": 500e3}` (never taken from datasheets), optionally `iout`,
-        `rail_voltages`, `pdn` targets. Always returns `test_plan`. First-pass
-        estimator, not sign-off.
+        """EMC pre-compliance review of the active board's filled copper (refill
+        first). `groups` (default all): ground, switching, decoupling, io,
+        thermal; `EM-*` IDs. Pass `fsw={"U1": 500e3}`, optionally `iout`,
+        `rail_voltages`, `pdn`, `harmonic_limits` (your limit profile).
+        Returns `test_plan`. First-pass estimator.
 
         Details:
 
@@ -286,6 +286,15 @@ def register(mcp) -> None:
         switchers' harmonics in the conducted and radiated bands, near-field
         probe points (switch nodes, connectors) and the top risks.
 
+        `harmonic_limits` (a screen against your own limits; none are
+        shipped): {"name": "where the limits come from", "unit": "dBuV/m"
+        (with "distance_m") | "dBuA", "bands": [{"name", "f_start_hz",
+        "f_stop_hz", "limit_db", "limit_stop_db" (optional: sloped in log
+        f)}]}. Each switcher's trapezoid harmonic envelope (the radiation
+        estimate's: Ott E at distance_m, or the harmonic current) gives the
+        worst margin per band in `harmonic_screen` (`screening_only: true`);
+        a negative margin is EM-HARM-LIMIT. An invalid profile is an error.
+
         `fsw={"U1": 500e3, "U2/ch1": 1.8e6}` — switching frequencies; not
         taken from the datasheet because it depends on RT/SYNC (the spec value
         is shown as a hint). `iout` — load currents (default: the datasheet
@@ -312,7 +321,8 @@ def register(mcp) -> None:
             resolution_mm=resolution_mm, power=power, nl=nl, specs=specs, fsw=fsw or {},
             iout=iout or {}, standard=standard, rise_time_s=rise_time_s,
             decap_max_mm=decap_max_mm, cap_via_max_mm=cap_via_max_mm, pdn=pdn or {},
-            edge_keepout_mm=edge_keepout_mm, esd_max_mm=esd_max_mm, diff_skew_ps=diff_skew_ps)
+            edge_keepout_mm=edge_keepout_mm, esd_max_mm=esd_max_mm, diff_skew_ps=diff_skew_ps,
+            harmonic_limits=harmonic_limits)
         result["note"] = ("First-pass EMC estimator on the board file; confirm with "
                           "measurement or a field solver before sign-off.")
         return result

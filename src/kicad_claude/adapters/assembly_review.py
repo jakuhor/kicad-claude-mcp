@@ -486,3 +486,90 @@ def cross_verify(tree: list, nl) -> dict:
     findings.sort(key=lambda x: (order[x["severity"]], x["rule"], x["ref"]))
     return {"pad_mismatches": pad_rows, "findings": findings,
             "counts": {k: sum(1 for x in findings if x["severity"] == k) for k in order}}
+
+
+# ---- assembly complexity ---------------------------------------------------- #
+
+# Package difficulty for machine placement and inspection. Scope and weights
+# follow kicad-happy 3.0.1 (MIT, © 2025 Andrew Klofas):
+# kicad/scripts/schematic/system_analyses.py:analyze_assembly_complexity.
+_HARD = ("bga", "wlcsp", "ucsp", "flip_chip", "qfn", "dfn", "mlp", "son", "lga")
+_MEDIUM = ("tssop", "msop", "ssop", "lqfp", "tqfp", "qfp")
+_PASSIVE = re.compile(r"(?<!\d)(01005|0201|0402|0603|0805|1206|1210|1812|2010|2220|2512)"
+                      r"(?:_\d{4,5}Metric)?", re.I)
+_PASSIVE_RANK = ("01005", "0201", "0402", "0603", "0805", "1206", "1210", "1812", "2010",
+                 "2220", "2512")
+_PITCH = re.compile(r"_P(\d+(?:\.\d+)?)mm", re.I)
+
+
+def _difficulty(fp: dict) -> tuple[str, str]:
+    name = fp["lib"].split(":")[-1]
+    low = name.lower()
+    if "through_hole" in fp["attrs"]:
+        return "THT", "easy"
+    m = _PASSIVE.search(name)
+    if m:
+        pkg = m.group(1)
+        return pkg, ("hard" if pkg in ("01005", "0201", "0402") else
+                     "medium" if pkg in ("0603", "0805") else "easy")
+    for k in _HARD:
+        if re.search(rf"(?<![a-z]){k}", low):
+            return k.upper(), "hard"
+    for k in _MEDIUM:
+        if k in low:
+            return k.upper(), "medium"
+    return "other", "medium" if "smd" in fp["attrs"] else "easy"
+
+
+def complexity(tree: list) -> dict:
+    """Assembly complexity 0-100 with its factors: package difficulty mix
+    (hard 80 / medium 40 / easy 10, weighted by placements), unique parts
+    above 15 (+2 each, at most 20), both sides populated (+10), THT next to
+    SMD (+5), fine pitch < 0.5 mm and BGA / exposed-pad parts (+2 each, at
+    most 10)."""
+    fps = footprints(tree)
+    placed = [f for f in fps if "exclude_from_pos_files" not in f["attrs"]
+              and "exclude_from_bom" not in f["attrs"] and f["ref"][:3] not in ("FID", "MH", "H")
+              and f["pads"]]
+    dnp = [f["ref"] for f in placed if "dnp" in f["attrs"]]
+    fitted = [f for f in placed if "dnp" not in f["attrs"]]
+    if not fitted:
+        return {"score": 0, "placements": 0, "factors": [], "dnp": len(dnp)}
+    diff = {"hard": 0, "medium": 0, "easy": 0}
+    pkgs: dict[str, int] = {}
+    fine, ep_bga, sizes = [], [], []
+    for f in fitted:
+        pkg, d = _difficulty(f)
+        diff[d] += 1
+        pkgs[pkg] = pkgs.get(pkg, 0) + 1
+        if pkg in _PASSIVE_RANK:
+            sizes.append(pkg)
+        m = _PITCH.search(f["lib"])
+        if m and float(m.group(1)) < 0.5:
+            fine.append({"ref": f["ref"], "pitch_mm": float(m.group(1))})
+        if re.search(r"BGA|WLCSP|\d*EP(?![A-Za-z])|ThermalVias|ExposedPad", f["lib"], re.I):
+            ep_bga.append(f["ref"])
+    unique = {(f["props"].get("MPN") or f["props"].get("Value", ""), f["lib"]) for f in fitted}
+    sides = sorted({f["side"] for f in fitted})
+    tht = [f["ref"] for f in fitted if "through_hole" in f["attrs"]]
+    n = len(fitted)
+    factors = [{"factor": "package mix", "points": round((diff["hard"] * 80 + diff["medium"] * 40
+                                                           + diff["easy"] * 10) / n, 1),
+                "detail": diff}]
+    if len(unique) > 15:
+        factors.append({"factor": "unique parts", "points": min(20, (len(unique) - 15) * 2),
+                        "detail": len(unique)})
+    if len(sides) == 2:
+        factors.append({"factor": "both sides populated", "points": 10, "detail": sides})
+    if tht and len(tht) < n:
+        factors.append({"factor": "THT with SMD", "points": 5, "detail": len(tht)})
+    special = len(fine) + len(set(ep_bga) - {x["ref"] for x in fine})
+    if special:
+        factors.append({"factor": "fine pitch / BGA / exposed pad", "points": min(10, 2 * special),
+                        "detail": special})
+    score = min(100, round(sum(x["points"] for x in factors)))
+    smallest = min(sizes, key=_PASSIVE_RANK.index) if sizes else None
+    return {"score": score, "factors": factors, "placements": n, "unique_parts": len(unique),
+            "sides": sides, "tht": len(tht), "fine_pitch": fine, "bga_or_exposed_pad": ep_bga,
+            "smallest_passive": smallest, "dnp": len(dnp), "packages": pkgs}
+

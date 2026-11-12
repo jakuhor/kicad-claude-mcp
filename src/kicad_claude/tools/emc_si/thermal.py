@@ -1,9 +1,11 @@
 """Thermal / current-capacity tools (IPC-2152).
 
-Tools (3):
+Tools (4):
     calc_trace_current             — amps for a width, or width for a current
     analyze_pcb_current_capacity   — per-track scan of the active PCB
     simulate_thermal_steady_state  — junction temps via a lumped resistive model
+    analyze_board_thermal          — per-part Tj with the layout's thermal vias,
+                                     hot spots near MLCCs / electrolytics
 """
 
 from __future__ import annotations
@@ -12,7 +14,13 @@ import logging
 from typing import Literal
 
 from kicad_claude import state
-from kicad_claude.tools.common import on_board
+from kicad_claude.arg_types import DeratingProfile
+from kicad_claude.tools.common import (
+    datasheet_values,
+    on_board,
+    project_netlist,
+    specs_by_ref,
+)
 from kicad_claude.adapters import electrical_calc as ec
 from kicad_claude.adapters import pcb_editor as pcb_ed
 from kicad_claude.adapters import sch_io, thermal_emc
@@ -161,3 +169,67 @@ def register(mcp) -> None:
             "max_junction_temp_c": round(max_t, 2),
             "components": results,
         }
+
+    @mcp.tool()
+    @on_board
+    def analyze_board_thermal(
+        loads: dict[str, float] | None = None,
+        rail_voltages: dict[str, float] | None = None,
+        efficiency: dict[str, float] | None = None,
+        default_efficiency: float = 0.85,
+        ambient_c: float | None = None,
+        fsw: dict[str, float] | None = None,
+        tj_margin_c: float | None = None,
+        derating_profile: DeratingProfile = "commercial",
+        netlist_path: str = "",
+    ) -> dict:
+        """Per-part junction temperature on the active board: P from the
+        `review_part_ratings` model (same `loads` etc.), Rθ_JA from the
+        datasheet or the package-typical estimate corrected by the thermal
+        vias under the exposed pad. TH-TJ, TH-VIAS, TH-MLCC-HOT /
+        TH-ELCO-HOT (caps within 10 mm of a part rising >= 20 K), TH-NODATA.
+
+        Details:
+
+        Tj = Ta + P x Rθ_eff (`ambient_c`, default 40 C as in
+        review_part_ratings). Rθ_JA: the extracted datasheet `thermal.rth_ja`
+        (a JEDEC test board, not reduced), else the package-typical table
+        (`rth_source: package_typical (assumed)`) times the board correction
+        for the main exposed pad's thermal vias - vias on the pad's net
+        inside 1.5x its box, drill-weighted Σ(d / 0.3 mm)², against the
+        count recommended for the pad area (< 10 mm²: 5 / 9, < 25 mm²:
+        9 / 16, else 0.5 / 0.8 per mm²): good x0.50, adequate x0.65,
+        insufficient x0.80, none x1.0.
+
+        TH-TJ: above Tj max (error; warning when Rθ is the estimate), within
+        `tj_margin_c` (default from `derating_profile`: 25 / 25 / 30 / 40 C)
+        - warning. TH-VIAS: a part above 0.5 W whose exposed pad has fewer
+        vias than the minimum. TH-MLCC-HOT: class-II MLCC (not C0G / NP0)
+        within 10 mm of a part whose rise P x Rθ_eff is >= 20 K;
+        TH-ELCO-HOT: electrolytic there. TH-NODATA: a part above 50 mW with
+        no Rθ (unknown package) or Tj max. Resistors get a rise (table Rθ by
+        size) for the hot-spot check, no Tj. Copper pours and inner planes
+        are not modelled beyond the via count. First-pass estimate.
+        """
+        from kicad_claude.adapters import board_thermal, part_ratings, power_review
+        from kicad_claude.adapters import derating as drt
+
+        nl = power_review.parse_netlist(project_netlist(netlist_path))
+        pt = power_review.analyze(nl, datasheet=datasheet_values(nl),
+                                  rail_voltages=rail_voltages or {})
+        specs = specs_by_ref(nl)
+        ratings = part_ratings.check(nl, pt, specs, loads or {}, efficiency,
+                                     default_efficiency, ambient_c, fsw, tj_margin_c,
+                                     derating_profile)
+        margin = tj_margin_c if tj_margin_c is not None else \
+            drt.profile(derating_profile)["tj_margin_c"]
+        tree = sch_io.parse_file(state.get_active_board_path())
+        result = board_thermal.analyze(tree, nl, specs, ratings,
+                                       ratings["assumptions"]["ambient_c"], margin)
+        result["assumptions"].update(ambient_source=ratings["assumptions"]["ambient_source"],
+                                     loads=ratings["assumptions"]["loads"],
+                                     derating_profile=derating_profile)
+        if not loads:
+            result["note"] = ("No loads given: only what the schematic implies dissipates "
+                              "(LED strings, dividers). Pass loads={rail: amps}.")
+        return result

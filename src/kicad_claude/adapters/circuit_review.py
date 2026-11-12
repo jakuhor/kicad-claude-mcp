@@ -17,7 +17,11 @@ Groups and rules:
            (reset nets: pull-up, filter cap, MR), PW-FB-IB (FB bias current
            x divider vs Vout, from the spec cache), PW-FB-Z (divider
            impedance), PW-CONN-GND (connector with supply pins, no ground
-           pin), PW-ESD (external connector signal nets without a clamp);
+           pin), PW-ESD (external connector signal nets without a clamp),
+           PW-REVPOL (connector supply reaching ICs with no series diode,
+           drain-upstream FET or ideal-diode IC), PW-INRUSH (hot-plug peak
+           into the input capacitance, USB VBUS > 10 uF, soft-start charge
+           current);
   analog   AU-BIAS (op-amp input with no DC path), AU-HPF (coupling cap +
            bias resistor corner vs the audio band), AU-BLEED (output
            coupling cap to a connector with no bleed resistor), AU-UNUSED
@@ -29,9 +33,11 @@ Groups and rules:
            LS-* (level shifter: both sides on one rail, OE floating);
   digital  DG-FLOAT (input pin on a net with nothing that drives it),
            DG-BOOT (boot / mode strap pin without a resistor), DG-I2C-RPU
-           (pull-up below the 3 mA sink limit of the I2C spec), DG-SPI-CS
+           (pull-up below the mode's sink limit of the I2C spec),
+           DG-I2C-RISE (rise time 0.8473 R C vs the mode limit), DG-SPI-CS
            (chip select shared / no pull-up), DG-USB-ESD, DG-LEVEL (driver
-           supply vs receiver supply), DG-CLK-TERM (clock with several loads
+           supply vs receiver supply), DG-UART-LEVEL (TX -> RX through series
+           resistors across supply domains), DG-CLK-TERM (clock with several loads
            and no series resistor), DG-SWD (debug pins not brought out);
   misc     LE-NORES (LED with no current limit), LE-ISET (LED driver set
            pin open), DS-CAP (display charge-pump / VCOMH pins without a
@@ -312,6 +318,260 @@ def check_supply_entry(nl: Netlist, findings: list, specs: dict,
                 findings.append(_f("warning", "PW-VBUS-TVS", j, f"Supply net {n} from {j} has "
                                    "no TVS / clamp: hot-plug and ESD transients reach the input."))
     return out
+
+
+IDEAL_DIODE_TEXT = re.compile(r"ideal.?diode|reverse.?(polarity|current|battery)|LM74\d0|"
+                              r"LM5050|LTC435\d|LTC4376|MAX4020\d|LM66100|TPS2121|AP7400", re.I)
+
+
+def _diode_ends(nl: Netlist, ref: str) -> tuple[str, str] | None:
+    """(anode net, cathode net) from pin names A / K, else KiCAD's Device:D
+    numbering (1 = K, 2 = A)."""
+    pins = nl.pins.get(ref, [])
+    if len(pins) != 2:
+        return None
+    by = {pn(p): p.net for p in pins}
+    if "A" in by and "K" in by:
+        return by["A"], by["K"]
+    num = {p.number: p.net for p in pins}
+    return (num["2"], num["1"]) if {"1", "2"} <= set(num) else None
+
+
+def _revpol_path(nl: Netlist, net: str, specs: dict) -> tuple[dict | None, set]:
+    """Walk downstream from a connector supply net through series parts
+    (<= 1 Ohm R, L, ferrite, fuse, jumper) and return the first
+    reverse-polarity element met - a series diode (anode upstream), a FET
+    with its drain upstream (body diode blocks a reversed input), an
+    ideal-diode / reverse-protection IC, or a shunt diode (cathode on the
+    rail, anode on ground) - and the nets reached."""
+    from kicad_claude.adapters.dc_model import switch_dies
+
+    seen, frontier = {net}, [net]
+    shunt = None
+    for _ in range(6):
+        nxt = []
+        for n in frontier:
+            for p in nl.nets.get(n, []):
+                ref, k = p.ref, kind(p.ref)
+                if not fitted(nl, ref):
+                    continue
+                c = nl.components.get(ref, {})
+                text = f"{c.get('value', '')} {c.get('lib_id', '')} {c.get('description', '')}"
+                if k == "D" and not is_clamp(nl, ref, specs) and not LED_TEXT.search(text):
+                    ends = _diode_ends(nl, ref)
+                    if not ends:
+                        continue
+                    a, kk = ends
+                    if a == n and not is_ground(kk):
+                        return {"type": "series diode", "ref": ref, "net": n}, seen | {kk}
+                    if kk == n and is_ground(a):
+                        shunt = shunt or {"type": "shunt diode (reverse input clamped; needs "
+                                                  "a fuse upstream)", "ref": ref, "net": n}
+                    continue
+                if k in ("Q", "M"):
+                    for d in switch_dies(nl, ref):
+                        dn, sn = d["main"]
+                        if dn == n and not is_ground(sn) and sn not in seen:
+                            return {"type": "series FET (drain toward the input: its body diode "
+                                            "blocks a reversed supply)", "ref": ref, "net": n}, \
+                                seen | {sn}
+                        if sn == n and not is_ground(dn) and dn not in seen:
+                            seen.add(dn)
+                            nxt.append(dn)          # load switch: body diode conducts reverse
+                    continue
+                cat = (specs.get(ref) or {}).get("category", "")
+                if is_active(nl, ref) and (IDEAL_DIODE_TEXT.search(text) or IDEAL_DIODE_TEXT.search(
+                        (specs.get(ref) or {}).get("description", ""))):
+                    return {"type": "ideal-diode / reverse-protection IC", "ref": ref,
+                            "net": n}, seen
+                if cat == "load_switch":
+                    continue
+                if k in ("R", "L", "FB", "FL", "F", "FU", "JP", "SJ", "NT"):
+                    if k == "R" and (parse_value(c.get("value", "")) or 1e9) > 1.0:
+                        continue
+                    o = other_end(nl, ref, n)
+                    if o and o not in seen and not is_ground(o) and not is_unconnected(o):
+                        seen.add(o)
+                        nxt.append(o)
+        frontier = nxt
+    return shunt, seen
+
+
+def check_reverse_polarity(nl: Netlist, findings: list, specs: dict,
+                           board_sourced: set | None = None,
+                           internal: set | None = None) -> list[dict]:
+    """PW-REVPOL: a supply that enters through a connector and reaches an
+    active part with no reverse-polarity element in its path. USB
+    connectors (keyed), board-to-board connectors (`internal`) and supplies
+    the board drives out are skipped."""
+    board_sourced = board_sourced or set()
+    internal = internal or set()
+    out = []
+    for j in _connectors(nl):
+        c = nl.components[j]
+        if j in internal or re.search(r"USB", f"{c.get('lib_id', '')} {c.get('value', '')}",
+                                      re.I):
+            continue
+        sup = sorted({p.net for p in nl.pins.get(j, [])
+                      if re.fullmatch(r"VIN|V\+|VCC|PWR|\+?\d+V\d*|VDD|VBAT|BAT\+?|DC|DCIN|"
+                                      r"VDC|V_?IN\d*", pn(p))
+                      and not is_unconnected(p.net) and not is_ground(p.net)})
+        for n in sup:
+            if n in board_sourced or _outbound(nl, n, board_sourced) or re.search(
+                    r"VBUS", n, re.I):
+                continue
+            prot, reached = _revpol_path(nl, n, specs)
+            loads = sorted({p.ref for m in reached for p in nl.nets.get(m, [])
+                            if p.ref != j and fitted(nl, p.ref) and is_active(nl, p.ref)})
+            if not loads and not prot:
+                continue
+            out.append({"connector": j, "net": n, "protection": prot, "loads": loads})
+            if prot is None:
+                findings.append(_f("warning", "PW-REVPOL", j,
+                                   f"Supply {n} from {j} reaches {', '.join(loads[:4])}"
+                                   f"{' ...' if len(loads) > 4 else ''} with no series diode, "
+                                   "P-FET or ideal-diode controller: a reversed input is "
+                                   "applied to them."))
+    return out
+
+
+USB_VBUS_MAX_C = 10e-6   # USB 2.0 spec 7.2.4.1: at most 10 uF across VBUS at attach
+
+
+def _downstream(nl: Netlist, net: str) -> tuple[set, list]:
+    """Nets fed from `net` through series parts up to the first regulator:
+    <= 1 Ohm R, L, ferrite, fuse, jumper, diode, FET channel. Returns (nets,
+    fuse refs on the way)."""
+    from kicad_claude.adapters.dc_model import switch_dies
+
+    seen, frontier, fuses = {net}, [net], []
+    for _ in range(6):
+        nxt = []
+        for n in frontier:
+            for p in nl.nets.get(n, []):
+                ref, k = p.ref, kind(p.ref)
+                if not fitted(nl, ref):
+                    continue
+                outs = []
+                if k in ("L", "FB", "FL", "F", "FU", "JP", "SJ", "NT", "D") or (
+                        k == "R" and (parse_value(nl.components[ref]["value"]) or 1e9) <= 1.0):
+                    if k == "D" and is_clamp(nl, ref, {}):
+                        continue
+                    outs = [other_end(nl, ref, n)]
+                    if k in ("F", "FU"):
+                        fuses.append(ref)
+                elif k in ("Q", "M"):
+                    outs = [b if a == n else a for d in switch_dies(nl, ref)
+                            for a, b in [d["main"]] if n in (a, b)]
+                for o in outs:
+                    if o and o not in seen and not is_ground(o) and not is_unconnected(o):
+                        seen.add(o)
+                        nxt.append(o)
+        frontier = nxt
+    return seen, fuses
+
+
+def _cap_sum(nl: Netlist, nets: set, specs: dict) -> tuple[float, list[str]]:
+    total, refs = 0.0, []
+    for n in nets:
+        for r, o in parts_on(nl, n, "C"):
+            if not is_ground(o) or not fitted(nl, r):
+                continue
+            c = dss.rated(specs.get(r), "electrical", "C", prefer="typ")
+            v = c[0] if c else parse_value(nl.components[r]["value"])
+            if v:
+                total += v
+                refs.append(r)
+    return total, sorted(refs)
+
+
+def check_inrush(nl: Netlist, findings: list, specs: dict, volts: dict, pt: dict,
+                 board_sourced: set | None = None, source_ohm: float | None = None,
+                 limit_a: float | None = None) -> dict:
+    """PW-INRUSH. Per connector supply: the capacitance downstream up to the
+    first regulator, and the hot-plug peak V / `source_ohm` (source + cable +
+    contact resistance, from the caller) against `limit_a`, the connector's
+    rating and a fuse's trip / rated current in the path; a USB VBUS with
+    more than 10 uF (USB 2.0 7.2.4.1). Per regulator with a soft-start time
+    in its spec record (`regulator.t_ss`): output capacitance C x Vout / t_ss
+    against `limit_a`. Unknown source resistance -> info."""
+    board_sourced = board_sourced or set()
+    entries, regs_out = [], []
+    for j in _connectors(nl):
+        c = nl.components[j]
+        usb = bool(re.search(r"USB", f"{c.get('lib_id', '')} {c.get('value', '')}", re.I))
+        for n in sorted({p.net for p in nl.pins.get(j, []) if re.fullmatch(
+                r"VBUS|VIN|V\+|VCC|PWR|\+?\d+V\d*|VDD|VBAT|BAT\+?|DC|DCIN|VDC|V_?IN\d*", pn(p))
+                and not is_unconnected(p.net) and not is_ground(p.net)}):
+            if n in board_sourced or _outbound(nl, n, board_sourced):
+                continue
+            nets, fuses = _downstream(nl, n)
+            cap, refs = _cap_sum(nl, nets, specs)
+            if not cap:
+                continue
+            v = volts.get(n) or next((volts[m] for m in nets if volts.get(m)), None)
+            row = {"connector": j, "net": n, "capacitance_uf": round(cap * 1e6, 3),
+                   "caps": refs, "volts": v, "fuses": fuses}
+            entries.append(row)
+            if usb and re.search(r"VBUS", f"{n} " + " ".join(
+                    pn(p) for p in nl.pins.get(j, []) if p.net == n), re.I) and cap > USB_VBUS_MAX_C:
+                findings.append(_f("warning", "PW-INRUSH", j, f"{cap * 1e6:.3g} uF on VBUS "
+                                   f"({n}) before the first regulator: USB 2.0 (7.2.4.1) allows "
+                                   "10 uF at attach - add a load switch / soft start."))
+            limits = []
+            if limit_a is not None:
+                limits.append((float(limit_a), "inrush_limit_a"))
+            rec = specs.get(j)
+            pins_n = sum(1 for p in nl.pins.get(j, []) if p.net == n)
+            tot = dss.rated(rec, "electrical", "I_rated_total", prefer="max")
+            per = dss.rated(rec, "electrical", "I_rated", "I_contact", prefer="max")
+            if tot or per:
+                limits.append((tot[0] if tot else per[0] * pins_n,
+                               f"{j} rating ({rec.get('mpn')} p.{(tot or per)[1]})"))
+            for fz in fuses:
+                fr = dss.rated(specs.get(fz), "electrical", "I_trip", "I_rated", prefer="max")
+                if fr:
+                    limits.append((fr[0], f"{fz} {fr[2]} ({specs[fz].get('mpn')} p.{fr[1]}; "
+                                   "its I2t decides - screen only)"))
+            if v is None or source_ohm is None:
+                row["peak_a"] = None
+                findings.append(_f("info", "PW-INRUSH", j, f"{cap * 1e6:.3g} uF on {n} before "
+                                   "the first regulator: hot-plug peak not estimated - pass "
+                                   "source_ohm (source + cable + contacts) and rail_voltages."))
+                continue
+            peak = abs(v) / float(source_ohm)
+            row.update(peak_a=round(peak, 3), tau_us=round(float(source_ohm) * cap * 1e6, 2))
+            over = [(lim, why) for lim, why in limits if peak > lim]
+            if over:
+                lim, why = min(over)
+                findings.append(_f("warning", "PW-INRUSH", j, f"Hot-plug peak {peak:.3g} A "
+                                   f"({abs(v):g} V / {source_ohm:g} Ohm into {cap * 1e6:.3g} uF, "
+                                   f"tau {float(source_ohm) * cap * 1e6:.3g} us) above {lim:g} A "
+                                   f"({why})."))
+    for r in pt.get("regulators", []):
+        rec = specs.get(r["ref"]) or {}
+        tss = dss.rated(rec, "regulator", "t_ss", prefer="min") or dss.rated(
+            rec, "electrical", "t_ss", "tSS", prefer="min")
+        out_n = r.get("output_net")
+        vout = volts.get(out_n) if out_n else None
+        if not out_n or vout is None:
+            continue
+        cap, refs = _cap_sum(nl, {out_n}, specs)
+        if not cap:
+            continue
+        row = {"regulator": r["name"], "output_net": out_n, "capacitance_uf": round(cap * 1e6, 3),
+               "vout": vout, "t_ss_s": tss[0] if tss else None}
+        regs_out.append(row)
+        if not tss:
+            continue
+        i = cap * abs(vout) / tss[0]
+        row["charge_current_a"] = round(i, 4)
+        if limit_a is not None and i > limit_a:
+            findings.append(_f("warning", "PW-INRUSH", r["name"], f"Soft-start charges "
+                               f"{cap * 1e6:.3g} uF to {vout:g} V in {tss[0] * 1e3:g} ms "
+                               f"(t_ss min, {rec.get('mpn')} p.{tss[1]}): {i:.3g} A, above "
+                               f"inrush_limit_a {limit_a:g} A."))
+    return {"entries": entries, "regulator_outputs": regs_out}
 
 
 def check_esd_audit(nl: Netlist, findings: list, specs: dict, internal: set) -> list[dict]:
@@ -757,8 +1017,45 @@ def check_boot(nl: Netlist, findings: list, reg_refs: set | None = None) -> list
     return out
 
 
-def check_i2c_pullup(nl: Netlist, findings: list, volts: dict) -> list[dict]:
-    """Pull-up strength vs the I2C spec's 3 mA low-level sink (VOL 0.4 V)."""
+# I2C-bus specification, NXP UM10204 rev. 7: maximum rise time (30 % -> 70 %
+# VDD) and the low-level sink current at VOL 0.4 V, per mode.
+I2C_MODES = {"standard": {"tr_ns": 1000.0, "sink_a": 0.003},
+             "fast": {"tr_ns": 300.0, "sink_a": 0.003},
+             "fast_plus": {"tr_ns": 120.0, "sink_a": 0.020}}
+I2C_CIN_KEYS = ("C_in", "C_I", "CI", "Cin", "C_IN", "C_io", "CIO", "C_pin")
+
+
+def _i2c_cap(nl: Netlist, net: str, specs: dict, caller: dict) -> dict:
+    """Bus capacitance on one line: each active part's input capacitance
+    from its spec record plus the caller's `i2c_bus_capacitance_pf` for the
+    net (wiring, connectors, off-board devices)."""
+    total, parts, missing = 0.0, {}, []
+    for ref in sorted({p.ref for p in nl.nets.get(net, []) if is_active(nl, p.ref)
+                       and fitted(nl, p.ref)}):
+        c = dss.rated(specs.get(ref), "electrical", *I2C_CIN_KEYS)
+        if c:
+            total += c[0]
+            parts[ref] = {"pf": round(c[0] * 1e12, 2), "source": f"{specs[ref].get('mpn')} "
+                          f"p.{c[1]}"}
+        else:
+            missing.append(ref)
+    tail = net.split("/")[-1]
+    extra = next((v for k, v in caller.items() if k in (net, tail) or k.lstrip("/") == tail),
+                 None)
+    if extra is not None:
+        total += float(extra) * 1e-12
+    return {"c_f": total, "parts": parts, "missing": missing, "caller_pf": extra}
+
+
+def check_i2c_pullup(nl: Netlist, findings: list, volts: dict, specs: dict | None = None,
+                     mode: str = "fast", bus_pf: dict | None = None) -> list[dict]:
+    """Pull-up strength vs the mode's low-level sink (VOL 0.4 V: 3 mA, 20 mA
+    for Fast-mode Plus) and rise time tr = 0.8473 R C (30 -> 70 % of VDD)
+    against the mode's limit (UM10204)."""
+    if mode not in I2C_MODES:
+        raise ValueError(f"i2c_mode {mode!r} not in {list(I2C_MODES)}")
+    lim = I2C_MODES[mode]
+    specs, bus_pf = specs or {}, bus_pf or {}
     out = []
     for net in sorted(nl.nets):
         names = {pn(p) for p in nl.nets[net]}
@@ -766,17 +1063,46 @@ def check_i2c_pullup(nl: Netlist, findings: list, volts: dict) -> list[dict]:
             "SCL" if any(re.search(r"SCL", n) for n in names) else None
         if not line:
             continue
+        pullups = []
         for r, o in parts_on(nl, net, "R"):
             v = volts.get(o)
             ohm = parse_value(nl.components[r]["value"])
-            if v is None or not ohm or is_ground(o):
+            if v is None or not ohm or is_ground(o) or not fitted(nl, r):
                 continue
+            pullups.append(ohm)
             i = (v - 0.4) / ohm
             out.append({"net": net, "ref": r, "ohms": ohm, "rail_v": v, "sink_ma": round(i * 1e3, 2)})
-            if i > 0.003:
+            if i > lim["sink_a"]:
                 findings.append(_f("error", "DG-I2C-RPU", r, f"{line} pull-up {r} "
                                    f"{nl.components[r]['value']} to {v:g} V needs {i * 1e3:.1f} mA "
-                                   "to pull low: above the 3 mA standard / fast-mode sink."))
+                                   f"to pull low: above the {lim['sink_a'] * 1e3:g} mA {mode} "
+                                   "sink."))
+        if not pullups:
+            continue
+        rp = 1 / sum(1 / x for x in pullups)
+        cap = _i2c_cap(nl, net, specs, bus_pf)
+        row = {"net": net, "line": line, "mode": mode, "r_pullup": round(rp, 1),
+               "c_bus_pf": round(cap["c_f"] * 1e12, 2), "c_parts": cap["parts"],
+               "c_caller_pf": cap["caller_pf"], "c_missing": cap["missing"],
+               "tr_limit_ns": lim["tr_ns"]}
+        out.append(row)
+        if cap["c_f"] <= 0 or (cap["missing"] and cap["caller_pf"] is None):
+            row["tr_ns"] = None
+            findings.append(_f("info", "DG-I2C-RISE", net, f"{line} ({net}) rise time not "
+                               "computed: no input capacitance extracted for "
+                               f"{', '.join(cap['missing']) or 'any device'}; pass "
+                               "i2c_bus_capacitance_pf={net: pF} for the bus."))
+            continue
+        tr = 0.8473 * rp * cap["c_f"] * 1e9
+        row["tr_ns"] = round(tr, 1)
+        if tr > lim["tr_ns"]:
+            findings.append(_f("warning", "DG-I2C-RISE", net,
+                               f"{line} ({net}) rise time 0.8473 x {rp:.0f} Ohm x "
+                               f"{cap['c_f'] * 1e12:.0f} pF = {tr:.0f} ns, above the {mode} "
+                               f"limit {lim['tr_ns']:g} ns (UM10204): use a lower pull-up "
+                               "or a slower mode"
+                               + (f"; no C_in for {', '.join(cap['missing'])} (lower bound)"
+                                  if cap["missing"] else "") + "."))
     return out
 
 
@@ -834,6 +1160,61 @@ def check_levels(nl: Netlist, findings: list, volts: dict) -> list[dict]:
                     findings.append(_f("warning", "DG-LEVEL", r.ref,
                                        f"{net}: {d.ref} at {vd:g} V drives {r.ref} at {vr:g} V: "
                                        "a CMOS VIH of 0.7 VDD is not reached."))
+    return out
+
+
+UART_TX = re.compile(r"^(U\d?|UART\d?_?|USART\d?_?|SCI\d?_?)?TXD?\d?$")
+UART_RX = re.compile(r"^(U\d?|UART\d?_?|USART\d?_?|SCI\d?_?)?RXD?\d?$")
+
+
+def check_uart_levels(nl: Netlist, findings: list, volts: dict) -> list[dict]:
+    """DG-UART-LEVEL: a TX pin reaching another part's RX pin through series
+    resistors (direct connections are DG-LEVEL) across supply domains: the
+    driver's high level above the receiver's supply (+0.3 V) or below its
+    0.7 VDD. A series resistor into a clamp diode is a current limit, not
+    a level shifter - check the receiver's injection-current rating."""
+    out = []
+    for net, pins in sorted(nl.nets.items()):
+        for d in pins:
+            if not (UART_TX.match(pn(d)) and is_active(nl, d.ref) and fitted(nl, d.ref)
+                    and btype(d) in ("output", "bidirectional", "tri_state", "passive")):
+                continue
+            seen, frontier, via = {net}, [(net, [])], {}
+            for _ in range(2):
+                nxt = []
+                for n, path in frontier:
+                    for p in nl.nets.get(n, []):
+                        if kind(p.ref) != "R" or not fitted(nl, p.ref):
+                            continue
+                        o = other_end(nl, p.ref, n)
+                        if o and o not in seen and not is_ground(o) and not _is_rail(nl, o, volts):
+                            seen.add(o)
+                            via[o] = path + [p.ref]
+                            nxt.append((o, path + [p.ref]))
+                frontier = nxt
+            for o, path in via.items():
+                for r in nl.nets.get(o, []):
+                    if r.ref == d.ref or not UART_RX.match(pn(r)) or not is_active(nl, r.ref):
+                        continue
+                    vd, vr = supply_v(nl, d.ref, volts), supply_v(nl, r.ref, volts)
+                    if vd is None or vr is None:
+                        continue
+                    row = {"tx": f"{d.ref}.{d.name}", "rx": f"{r.ref}.{r.name}", "via": path,
+                           "v_tx": vd, "v_rx": vr}
+                    out.append(row)
+                    if vd > vr + 0.3:
+                        findings.append(_f("warning", "DG-UART-LEVEL", r.ref,
+                                           f"UART {d.ref}.{d.name} ({vd:g} V) drives "
+                                           f"{r.ref}.{r.name} ({vr:g} V) through "
+                                           f"{', '.join(path)}: above the receiver's supply - "
+                                           "a series resistor only limits the clamp current "
+                                           "(check the input is tolerant or its injection "
+                                           "rating)."))
+                    elif vd < 0.7 * vr:
+                        findings.append(_f("warning", "DG-UART-LEVEL", r.ref,
+                                           f"UART {d.ref}.{d.name} at {vd:g} V drives "
+                                           f"{r.ref}.{r.name} at {vr:g} V through "
+                                           f"{', '.join(path)}: VIH 0.7 VDD is not reached."))
     return out
 
 
@@ -1043,7 +1424,9 @@ def check_buttons(nl: Netlist, findings: list) -> list[dict]:
 
 def analyze(nl: Netlist, pt: dict, specs: dict | None = None, groups: tuple = GROUPS,
             internal_connectors: set | None = None, audio_f_low_hz: float = 20.0,
-            fb_z_max: float = 100e3) -> dict:
+            fb_z_max: float = 100e3, i2c_mode: str = "fast",
+            i2c_bus_capacitance_pf: dict | None = None, source_ohm: float | None = None,
+            inrush_limit_a: float | None = None) -> dict:
     specs = specs or {}
     volts = {n: v["volts"] for n, v in pt["rail_voltages"].items()}
     findings: list[dict] = []
@@ -1051,6 +1434,10 @@ def analyze(nl: Netlist, pt: dict, specs: dict | None = None, groups: tuple = GR
     if "power" in groups:
         res["usb_c"] = check_usbc(nl, findings, specs, volts)
         res["supply_entry"] = check_supply_entry(nl, findings, specs, board_sourced(pt))
+        res["reverse_polarity"] = check_reverse_polarity(nl, findings, specs, board_sourced(pt),
+                                                         internal_connectors)
+        res["inrush"] = check_inrush(nl, findings, specs, volts, pt, board_sourced(pt),
+                                     source_ohm, inrush_limit_a)
         res["esd"] = check_esd_audit(nl, findings, specs, internal_connectors or set())
         res["sequencing"] = check_sequencing(nl, findings, pt)
         res["reset"] = check_reset(nl, findings)
@@ -1063,9 +1450,11 @@ def analyze(nl: Netlist, pt: dict, specs: dict | None = None, groups: tuple = GR
     if "digital" in groups:
         res["floating_inputs"] = check_floating(nl, findings, specs)
         res["boot_pins"] = check_boot(nl, findings, {r["ref"] for r in pt["regulators"]})
-        res["i2c_pullups"] = check_i2c_pullup(nl, findings, volts)
+        res["i2c_pullups"] = check_i2c_pullup(nl, findings, volts, specs, i2c_mode,
+                                              i2c_bus_capacitance_pf)
         res["spi"] = check_spi(nl, findings)
         res["levels"] = check_levels(nl, findings, volts)
+        res["uart_levels"] = check_uart_levels(nl, findings, volts)
         res["clocks"] = check_clocks(nl, findings)
         res["debug"] = check_debug(nl, findings)
     if "misc" in groups:

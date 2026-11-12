@@ -62,6 +62,23 @@ def schematic_parts(netlist: Path, mpn_field: str, skip_prefixes) -> tuple[dict,
     return parts, no_mpn
 
 
+def _symbol_pins(refs: list[str]) -> int | None:
+    """Pin count of the MPN's symbol from the project's last netlist export
+    (`fab/<name>-netlist.net`; no new export), None when there is none."""
+    proj = state.get_active_or_none()
+    if proj is None or not refs:
+        return None
+    path = proj.path / "fab" / f"{proj.name}-netlist.net"
+    if not path.is_file():
+        return None
+    try:
+        nl = power_review.parse_netlist(path)
+    except Exception:  # noqa: BLE001 - a stale or broken export only drops the count
+        return None
+    counts = [len({p.number for p in nl.pins.get(r, [])}) for r in refs if r in nl.pins]
+    return max(counts) if counts else None
+
+
 def register(mcp) -> None:
     @mcp.tool()
     def sync_datasheets(
@@ -231,11 +248,13 @@ def register(mcp) -> None:
         (or `pages="3,5-7"`), up to `max_chars`, the schematic context (refs,
         each ref's pin names and nets), the schema and the rules.
 
-        Then call `save_datasheet_extraction(mpn, extraction)`.
+        Then call `save_datasheet_extraction(mpn, extraction, pdf_sha256)`
+        with the returned `pdf_sha256`.
         """
         ds_dir = _ds_dir(dest_dir)
         e, pdf = _entry(ds_dir, mpn)
-        all_pages = dsi.pdf_pages(pdf, e.get("sha256"))
+        sha = dsi.sha256(pdf)
+        all_pages = dsi.pdf_pages(pdf, sha)
         if pages:
             sel = []
             for part in pages.split(","):
@@ -262,9 +281,10 @@ def register(mcp) -> None:
             context = {"error": str(ex)}
         existing = dss.load(ds_dir, mpn)
         return {
-            "mpn": mpn, "pdf": str(pdf), "page_count": len(all_pages),
+            "mpn": mpn, "pdf": str(pdf), "pdf_sha256": sha, "page_count": len(all_pages),
             "pages": text, "pages_included": used,
-            "pages_suggested": dss.select_pages(all_pages, limit=15),
+            "pages_suggested": [{"page": k, "reason": r} for k, r in
+                                dss.page_reasons(all_pages, limit=15).items()],
             "schematic": {"refs": e.get("refs", []), "value": e.get("value", ""),
                           "manufacturer": e.get("manufacturer", ""), "pins": context},
             "existing_extraction": existing,
@@ -288,12 +308,18 @@ def register(mcp) -> None:
     def save_datasheet_extraction(
         mpn: str,
         extraction: dict,
+        pdf_sha256: str,
         extracted_by: str = "calling agent",
         overwrite: bool = False,
         dest_dir: str = "",
     ) -> dict:
         """Validate a spec record for `mpn` and cache it in
-        `<project>/datasheets/specs/<MPN>.json`.
+        `<project>/datasheets/specs/<MPN>.json`. `pdf_sha256`: the hash
+        `get_datasheet_extraction_task` returned; refused when the PDF changed
+        since. Structural errors reject; numbers not on the cited page warn.
+        Returns `quality` (0-100 and what is missing).
+
+        Details:
 
         Rejected (nothing written) on structural errors: unknown keys or
         category, non-SI unit, missing page, min > typ / typ > max, page
@@ -304,29 +330,37 @@ def register(mcp) -> None:
         """
         ds_dir = _ds_dir(dest_dir)
         e, pdf = _entry(ds_dir, mpn)
+        sha = dsi.sha256(pdf)
+        if pdf_sha256.strip().lower() != sha:
+            raise ValueError(f"{pdf.name} changed since the extraction task: task sha256 "
+                             f"{pdf_sha256!r}, file now {sha!r}; rerun "
+                             "get_datasheet_extraction_task")
         if dss.specs_path(ds_dir, mpn).exists() and not overwrite:
             raise FileExistsError(f"specs for {mpn} exist; pass overwrite=True to replace")
-        sha = dsi.sha256(pdf)
         errors, warnings = dss.validate(extraction, dsi.pdf_pages(pdf, sha))
         if extraction.get("mpn") not in (None, mpn):
             errors.append(f"mpn: record says {extraction.get('mpn')!r}, call says {mpn!r}")
         if errors:
             return {"saved": False, "errors": errors, "warnings": warnings}
         path = dss.save(ds_dir, mpn, extraction, pdf.name, sha, extracted_by)
-        return {"saved": True, "path": str(path), "warnings": warnings}
+        q = dss.quality({**extraction, "mpn": mpn}, _symbol_pins(e.get("refs", [])))
+        return {"saved": True, "path": str(path), "warnings": warnings, "quality": q}
 
     @mcp.tool()
     def get_datasheet_specs(mpn: str = "", dest_dir: str = "") -> dict:
-        """Cached spec record for `mpn` (with `stale` if its PDF changed).
-        Without `mpn`: coverage — every manifest MPN with `extracted`,
-        `stale`, `missing`, and the refs it serves."""
+        """Cached spec record for `mpn` (with `stale` if its PDF changed) and its
+        `quality` (0-100, what is missing; DQ-LOW below 50). Without `mpn`:
+        coverage — every manifest MPN with `extracted`, `stale`, `missing`,
+        quality, and the refs it serves."""
         ds_dir = _ds_dir(dest_dir)
         if mpn:
             rec = dss.load(ds_dir, mpn)
             if rec is None:
                 return {"mpn": mpn, "found": False,
                         "hint": "get_datasheet_extraction_task then save_datasheet_extraction"}
-            return {"found": True, **rec}
+            man = dsi.load_manifest(ds_dir)
+            refs = (man["parts"].get(mpn) or {}).get("refs", [])
+            return {"found": True, **rec, "quality": dss.quality(rec, _symbol_pins(refs))}
         man = dsi.load_manifest(ds_dir)
         rows = {}
         for m, e in man["parts"].items():
@@ -335,6 +369,8 @@ def register(mcp) -> None:
             rec = dss.load(ds_dir, m)
             rows[m] = {"refs": e.get("refs", []), "file": e.get("file"),
                        "state": "missing" if rec is None else "stale" if rec["stale"] else "extracted"}
+            if rec is not None:
+                rows[m]["quality"] = dss.quality(rec)["score"]
         counts = {s: sum(1 for r in rows.values() if r["state"] == s)
                   for s in ("extracted", "stale", "missing")}
         return {"counts": counts, "parts": rows}

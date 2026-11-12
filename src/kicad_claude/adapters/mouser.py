@@ -17,6 +17,7 @@ import httpx
 logger = logging.getLogger("kicad-claude.adapters.mouser")
 
 from kicad_claude.utils.logging import quiet_http  # noqa: E402
+from kicad_claude.adapters import temp_grade  # noqa: E402
 
 quiet_http()
 
@@ -150,4 +151,6 @@ def _summarize_part(p: dict) -> dict:
         "lead_time": p.get("LeadTime", ""),
         "lifecycle": p.get("LifecycleStatus") or "",
         "suggested_replacement": p.get("SuggestedReplacement") or "",
+        "operating_temp": temp_grade.attr_text(p.get("ProductAttributes") or [],
+                                          "AttributeName", "AttributeValue"),
     }

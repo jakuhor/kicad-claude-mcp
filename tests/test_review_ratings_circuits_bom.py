@@ -70,13 +70,23 @@ class TestSpecCurves:
 # ---- part ratings ---------------------------------------------------------- #
 
 
-def _buck(tmp_path):
+def _buck(tmp_path, shunt=False):
+    """J1 -> VIN -> buck U1 -> +5V; `shunt`: J1 feeds VIN through R9 0.1 Ohm."""
     comps = [_comp("J1", "PWR"), _comp("U1", "BUCK"), _comp("L1", "10u"),
              _comp("R1", "52.5k"), _comp("R2", "10k"), _comp("C1", "10u"), _comp("C2", "22u"),
              _comp("D1", "RED", lib="Device:LED"), _comp("R5", "1k")]
+    jn = "VRAW" if shunt else "VIN"
+    entry = [_net(1, jn, ("J1", "1", "VIN", "passive"), ("J1", "2", "VIN", "passive"),
+                  *([("R9", "1", "", "passive")] if shunt else []))]
+    if shunt:
+        comps.append(_comp("R9", "0.1"))
+        entry.append(_net(7, "VIN", ("R9", "2", "", "passive"), ("U1", "1", "VIN", "power_in"),
+                          ("C1", "1", "", "passive")))
+    else:
+        entry[0] = _net(1, "VIN", ("J1", "1", "VIN", "passive"), ("J1", "2", "VIN", "passive"),
+                        ("U1", "1", "VIN", "power_in"), ("C1", "1", "", "passive"))
     nets = [
-        _net(1, "VIN", ("J1", "1", "VIN", "passive"), ("J1", "2", "VIN", "passive"),
-             ("U1", "1", "VIN", "power_in"), ("C1", "1", "", "passive")),
+        *entry,
         _net(2, "GND", ("J1", "3", "GND", "passive"), ("U1", "9", "GND", "power_in"),
              ("R2", "2", "", "passive"), ("C1", "2", "", "passive"), ("C2", "2", "", "passive"),
              ("D1", "1", "K", "passive")),
@@ -134,6 +144,95 @@ class TestPartRatings:
         assert path["parts"] == []          # VIN is the connector net itself
 
 
+    def _tj(self, tmp_path, specs, footprint):
+        nl = _buck(tmp_path)
+        nl.components["U1"]["footprint"] = footprint
+        pt = pr.analyze(nl, vref={"U1": 0.8}, rail_voltages={"VIN": 12})
+        r = part_ratings.check(nl, pt, specs, {"+5V": 3.0}, ambient_c=25)
+        tj = [f for f in r["findings"] if f["rule"] == "RT-TJ" and f["ref"] == "U1"]
+        row = next(x for x in r["thermal"] if x["ref"] == "U1")
+        return tj, row, r
+
+    def test_tj_package_table(self, tmp_path):
+        tjmax = {"tj_max": _sv(max=125, unit="C")}
+        # no datasheet rth_ja: QFN 3x3 table value 50 C/W, error capped at warning
+        tj, row, _ = self._tj(tmp_path, {"U1": {"mpn": "BUCK1", "thermal": tjmax}},
+                              "Package_DFN_QFN:QFN-16-1EP_3x3mm_P0.5mm_EP1.7x1.7mm")
+        assert row["rth_ja"] == 50 and row["rth_source"] == "package_typical (assumed)"
+        assert [f["severity"] for f in tj] == ["warning"]
+        assert "package-typical" in tj[0]["message"]
+        # datasheet value wins over the table (10 C/W: 25 + 26.5 C, far below 125)
+        tj, row, _ = self._tj(tmp_path, {"U1": {"mpn": "BUCK1", "thermal": {
+            **tjmax, "rth_ja": _sv(typ=10, unit="C/W")}}}, "Package_DFN_QFN:QFN-16-1EP_3x3mm")
+        assert row["rth_ja"] == 10 and row["rth_source"] == "datasheet BUCK1 p.1" and tj == []
+        # unknown package: no estimate, RT-NODATA as before
+        tj, row, r = self._tj(tmp_path, {}, "Lib:CustomThing")
+        assert "rth_ja" not in row and tj == []
+        assert any(f["rule"] == "RT-NODATA" and f["ref"] == "U1" for f in r["findings"])
+
+    def test_dissipation(self, tmp_path):
+        specs = {"U1": {"mpn": "BUCK1", "thermal": {"rth_ja": _sv(typ=50, unit="C/W"),
+                                                    "tj_max": _sv(max=125, unit="C")}}}
+        r = self._run(tmp_path, {"+5V": 3.0}, specs, ambient_c=25)
+        d = {x["ref"]: x for x in r["dissipation"]}
+        # divider R1 52.5k / R2 10k on +5 V: FB at 0.8 V from the DC model
+        assert d["R1"]["p_w"] == pytest.approx(4.2 ** 2 / 52.5e3, rel=1e-3)
+        assert d["R2"]["p_w"] == pytest.approx(0.8 ** 2 / 10e3, rel=1e-3)
+        assert d["R1"]["method"].startswith("DC model")
+        # regulator unchanged: Pout (1 - eta) / eta = 15 * 0.15 / 0.85
+        assert d["U1"]["p_w"] == pytest.approx(15 * 0.15 / 0.85, rel=1e-3)
+        assert r["dissipation"][0]["ref"] == "U1"          # sorted by power
+
+    def test_shunt_dissipation(self, tmp_path):
+        nl = _buck(tmp_path, shunt=True)
+        pt = pr.analyze(nl, vref={"U1": 0.8}, rail_voltages={"VIN": 12})
+        r = part_ratings.check(nl, pt, {}, {"+5V": 3.0})
+        iin = 15 / (0.85 * 12)
+        d = {x["ref"]: x for x in r["dissipation"]}
+        assert d["R9"]["p_w"] == pytest.approx(iin ** 2 * 0.1, rel=1e-3)
+        assert d["R9"]["method"].startswith("I^2 R")
+
+    def test_tj_margin_follows_profile(self, tmp_path):
+        specs = {"U1": {"mpn": "BUCK1", "thermal": {"rth_ja": _sv(typ=50, unit="C/W"),
+                                                    "tj_max": _sv(max=125, unit="C")}}}
+        # P = 5 V * 1.47 A * 0.15 / 0.85 = 1.30 W -> Tj 25 + 65 = 90 C
+        com = self._run(tmp_path, {"+5V": 1.47}, specs, ambient_c=25)
+        mil = self._run(tmp_path, {"+5V": 1.47}, specs, ambient_c=25, profile="military")
+        assert not [f for f in com["findings"] if f["rule"] == "RT-TJ"]     # margin 25 C
+        assert [f["severity"] for f in mil["findings"] if f["rule"] == "RT-TJ"] == ["warning"]
+        assert mil["assumptions"]["tj_margin_c"] == 40
+
+    def test_resistor_power(self, tmp_path):
+        # shunt R9 0.1 Ohm at Iin 1.47 A: 0.216 W
+        def run(power):
+            nl = _buck(tmp_path, shunt=True)
+            if power:
+                nl.components["R9"]["fields"]["Power"] = power
+            pt = pr.analyze(nl, vref={"U1": 0.8}, rail_voltages={"VIN": 12})
+            r = part_ratings.check(nl, pt, {}, {"+5V": 3.0})
+            return {(f["rule"], f["ref"]): f["severity"] for f in r["findings"]}
+        assert run("1W").get(("RT-R-P", "R9")) is None
+        assert run("1/4W")[("RT-R-P", "R9")] == "warning"      # 86 % > 50 %
+        assert run("200mW")[("RT-R-P", "R9")] == "error"
+        assert run("")[("RT-NODATA", "R9")] == "info"          # >= 0.1 W, no rating
+
+    @pytest.mark.parametrize("fp, pkg, rth, ep", [
+        ("Package_TO_SOT_SMD:SOT-23-5", "SOT-23", 250, False),
+        ("Package_SO:SOIC-8_3.9x4.9mm_P1.27mm", "SOIC-8", 120, False),
+        ("Package_DFN_QFN:QFN-16-1EP_3x3mm_P0.5mm", "QFN-16-1EP_3x3", 50, True),
+        ("Package_TO_SOT_SMD:TO-252-2", "TO-252", 40, False),
+        ("Package_DFN_QFN:DFN-8-1EP_2x2mm_P0.5mm", "DFN-8-1EP_2x2", 70, True),
+        ("Lib:MyConnector", None, None, None),
+    ])
+    def test_package_classifier(self, fp, pkg, rth, ep):
+        from kicad_claude.adapters import thermal_pkg
+        got = thermal_pkg.classify(fp)
+        if pkg is None:
+            assert got is None
+        else:
+            assert (got["package"], got["rth_ja"], got["exposed_pad"]) == (pkg, rth, ep)
+
+
 # ---- circuit detectors ---------------------------------------------------- #
 
 
@@ -185,6 +284,82 @@ def _circuits(tmp_path):
         _net(22, "unconnected-(U6-VBAT-Pad3)", ("U6", "3", "VBAT", "power_in")),
     ]
     return _nl(tmp_path, comps, nets)
+
+
+def _entry(tmp_path, prot):
+    """Barrel jack J1 -> fuse F1 -> [protection] -> VIN -> buck U1 -> +5V."""
+    comps = [_comp("J1", "BARREL", lib="Connector:Barrel_Jack"), _comp("F1", "PTC"),
+             _comp("U1", "BUCK"), _comp("L1", "10u"), _comp("R1", "52.5k"), _comp("R2", "10k")]
+    gnd = [("J1", "2", "GND", "passive"), ("U1", "9", "GND", "power_in"),
+           ("R2", "2", "", "passive")]
+    nets = [_net(1, "VJ", ("J1", "1", "VIN", "passive"), ("F1", "1", "", "passive"))]
+    if prot == "diode":
+        comps.append(_comp("D1", "SS34", lib="Device:D_Schottky"))
+        nets += [_net(2, "VF", ("F1", "2", "", "passive"), ("D1", "2", "A", "passive")),
+                 _net(3, "VIN", ("D1", "1", "K", "passive"), ("U1", "1", "VIN", "power_in"))]
+    elif prot in ("pfet", "pfet_reversed"):
+        comps.append(_comp("Q1", "PMOS", lib="Device:Q_PMOS_GSD"))
+        d, s_ = ("VF", "VIN") if prot == "pfet" else ("VIN", "VF")
+        nets += [_net(2, "VF", ("F1", "2", "", "passive"),
+                      ("Q1", "3" if d == "VF" else "2", "D" if d == "VF" else "S", "passive")),
+                 _net(3, "VIN", ("Q1", "2" if d == "VF" else "3", "S" if d == "VF" else "D",
+                                 "passive"), ("U1", "1", "VIN", "power_in"))]
+        gnd.append(("Q1", "1", "G", "input"))
+    else:
+        nets += [_net(3, "VIN", ("F1", "2", "", "passive"), ("U1", "1", "VIN", "power_in"))]
+    nets += [_net(4, "GND", *gnd),
+             _net(5, "SW", ("U1", "2", "SW", "output"), ("L1", "1", "", "passive")),
+             _net(6, "+5V", ("L1", "2", "", "passive"), ("R1", "1", "", "passive")),
+             _net(7, "FB", ("U1", "3", "FB", "input"), ("R1", "2", "", "passive"),
+                  ("R2", "1", "", "passive"))]
+    return _nl(tmp_path, comps, nets)
+
+
+class TestProtection:
+    @pytest.mark.parametrize("prot, flagged, kind", [
+        ("none", True, None), ("diode", False, "series diode"),
+        ("pfet", False, "series FET"), ("pfet_reversed", True, None),
+    ])
+    def test_reverse_polarity(self, tmp_path, prot, flagged, kind):
+        nl = _entry(tmp_path, prot)
+        pt = pr.analyze(nl, vref={"U1": 0.8}, rail_voltages={"VJ": 12, "VIN": 12})
+        r = circuit_review.analyze(nl, pt, {}, ("power",))
+        got = [f for f in r["findings"] if f["rule"] == "PW-REVPOL"]
+        assert bool(got) is flagged
+        row = r["reverse_polarity"][0]
+        assert row["connector"] == "J1" and "U1" in row["loads"] or not flagged
+        if kind:
+            assert row["protection"]["type"].startswith(kind)
+
+    def test_usb_skipped(self, tmp_path):
+        nl = _entry(tmp_path, "none")
+        nl.components["J1"]["lib_id"] = "Connector:USB_B_Micro"
+        pt = pr.analyze(nl, vref={"U1": 0.8}, rail_voltages={"VJ": 12, "VIN": 12})
+        r = circuit_review.analyze(nl, pt, {}, ("power",))
+        assert not [f for f in r["findings"] if f["rule"] == "PW-REVPOL"]
+
+    @pytest.mark.parametrize("spec, field, sev", [
+        ({"I_hold": _sv(min=0.5, unit="A")}, "", "error"),          # 0.5 A < 1.47 A load
+        ({"I_hold": _sv(min=2.0, unit="A"), "I_trip": _sv(max=1.2, unit="A")}, "", "error"),
+        ({"I_hold": _sv(min=2.0, unit="A")}, "", None),
+        ({"I_hold": _sv(min=10.0, unit="A")}, "", None),            # > 5x: RT-OVERSPEC
+        ({}, "1A", "error"),                                        # Current field
+        ({}, "", "nodata"),
+    ])
+    def test_fuse_sizing(self, tmp_path, spec, field, sev):
+        nl = _entry(tmp_path, "none")
+        if field:
+            nl.components["F1"]["fields"]["Current"] = field
+        specs = {"F1": {"mpn": "PTC1", "category": "fuse", "electrical": spec}} if spec else {}
+        pt = pr.analyze(nl, vref={"U1": 0.8}, rail_voltages={"VJ": 12, "VIN": 12})
+        r = part_ratings.check(nl, pt, specs, {"+5V": 3.0})
+        got = {f["severity"] for f in r["findings"] if f["rule"] == "RT-FUSE"}
+        if sev == "nodata":
+            assert any(f["rule"] == "RT-NODATA" and f["ref"] == "F1" for f in r["findings"])
+        elif sev is None:
+            assert not got
+        else:
+            assert got == {sev}
 
 
 class TestCircuitReview:
@@ -299,3 +474,135 @@ class TestBomTools:
         assert again["change_count"] == 0
         with pytest.raises(ValueError):
             bom_tools.write_fields(sch, {"R1": {"Reference": "R5"}})
+
+
+class TestI2cRise:
+    def _bus(self, tmp_path):
+        comps = [_comp("U1", "MCU"), _comp("U2", "SENSOR"), _comp("R1", "4.7k"),
+                 _comp("R2", "4.7k")]
+        nets = [_net(1, "+3V3", ("U1", "1", "VDD", "power_in"), ("U2", "1", "VDD", "power_in"),
+                     ("R1", "1", "", "passive"), ("R2", "1", "", "passive")),
+                _net(2, "SDA", ("U1", "2", "SDA", "bidirectional"),
+                     ("U2", "2", "SDA", "bidirectional"), ("R1", "2", "", "passive")),
+                _net(3, "SCL", ("U1", "3", "SCL", "output"), ("U2", "3", "SCL", "input"),
+                     ("R2", "2", "", "passive")),
+                _net(4, "GND", ("U1", "4", "GND", "power_in"), ("U2", "4", "GND", "power_in"))]
+        return _nl(tmp_path, comps, nets)
+
+    def _rise(self, tmp_path, specs=None, **kw):
+        nl = self._bus(tmp_path)
+        pt = pr.analyze(nl, rail_voltages={"+3V3": 3.3})
+        r = circuit_review.analyze(nl, pt, specs or {}, ("digital",), **kw)
+        return {f["ref"]: f["severity"] for f in r["findings"] if f["rule"] == "DG-I2C-RISE"}, r
+
+    def test_rise_time_modes(self, tmp_path):
+        caps = {"SDA": 200, "SCL": 200}
+        # 0.8473 * 4.7k * 200 pF = 796 ns
+        fast, r = self._rise(tmp_path, i2c_bus_capacitance_pf=caps)
+        assert fast == {"SDA": "warning", "SCL": "warning"}
+        row = next(x for x in r["i2c_pullups"] if x.get("line") == "SDA")
+        assert row["tr_ns"] == pytest.approx(796.5, abs=1)
+        std, _ = self._rise(tmp_path, i2c_mode="standard", i2c_bus_capacitance_pf=caps)
+        assert std == {}
+
+    def test_rise_time_from_specs_and_missing(self, tmp_path):
+        missing, _ = self._rise(tmp_path)
+        assert missing == {"SDA": "info", "SCL": "info"}
+        cin = {"electrical": {"C_in": _sv(max=10e-12, unit="F")}}
+        specs = {"U1": {"mpn": "MCU1", **cin}, "U2": {"mpn": "SEN1", **cin}}
+        ok, r = self._rise(tmp_path, specs)
+        assert ok == {}                  # 0.8473 * 4.7k * 20 pF = 80 ns
+        row = next(x for x in r["i2c_pullups"] if x.get("line") == "SCL")
+        assert row["c_bus_pf"] == pytest.approx(20)
+
+
+class TestUartLevels:
+    def _uart(self, tmp_path, series_r):
+        """5 V MCU U1 TX -> 3.3 V module U2 RX, directly or through R1."""
+        comps = [_comp("U1", "MCU5V"), _comp("U2", "BLE_MODULE")]
+        tx = [("U1", "2", "TXD", "output")]
+        rx = [("U2", "2", "RXD", "input")]
+        nets = [_net(1, "+5V", ("U1", "1", "VCC", "power_in")),
+                _net(2, "+3V3", ("U2", "1", "VDD", "power_in")),
+                _net(5, "GND", ("U1", "4", "GND", "power_in"), ("U2", "4", "GND", "power_in"))]
+        if series_r:
+            comps.append(_comp("R1", "1k"))
+            nets += [_net(3, "MCU_TX", *tx, ("R1", "1", "", "passive")),
+                     _net(4, "MOD_RX", *rx, ("R1", "2", "", "passive"))]
+        else:
+            nets.append(_net(3, "UART_TX", *tx, *rx))
+        nl = _nl(tmp_path, comps, nets)
+        pt = pr.analyze(nl, rail_voltages={"+5V": 5.0, "+3V3": 3.3})
+        r = circuit_review.analyze(nl, pt, {}, ("digital",))
+        return {(f["rule"], f["ref"]) for f in r["findings"]}, r
+
+    def test_direct(self, tmp_path):
+        got, _ = self._uart(tmp_path, False)
+        assert ("DG-LEVEL", "U2") in got
+
+    def test_through_series_resistor(self, tmp_path):
+        got, r = self._uart(tmp_path, True)
+        assert ("DG-UART-LEVEL", "U2") in got
+        row = r["uart_levels"][0]
+        assert (row["tx"], row["rx"], row["via"]) == ("U1.TXD", "U2.RXD", ["R1"])
+
+
+class TestInrush:
+    def _usb(self, tmp_path, uf="100u"):
+        comps = [_comp("J1", "USB_C", lib="Connector:USB_C_Receptacle"), _comp("C1", uf),
+                 _comp("FB1", "600R"), _comp("C2", "1u"), _comp("U1", "LDO")]
+        nets = [_net(1, "VBUS", ("J1", "A4", "VBUS", "passive"), ("C1", "1", "", "passive"),
+                     ("FB1", "1", "", "passive")),
+                _net(2, "VB_F", ("FB1", "2", "", "passive"), ("C2", "1", "", "passive"),
+                     ("U1", "1", "VIN", "power_in")),
+                _net(3, "GND", ("J1", "A1", "GND", "passive"), ("C1", "2", "", "passive"),
+                     ("C2", "2", "", "passive"), ("U1", "2", "GND", "power_in"))]
+        return _nl(tmp_path, comps, nets)
+
+    def _run(self, nl, **kw):
+        pt = pr.analyze(nl, rail_voltages={"VBUS": 5.0})
+        r = circuit_review.analyze(nl, pt, {}, ("power",), **kw)
+        return [f for f in r["findings"] if f["rule"] == "PW-INRUSH"], r
+
+    def test_usb_inrush(self, tmp_path):
+        got, r = self._run(self._usb(tmp_path), source_ohm=0.1, inrush_limit_a=5)
+        row = r["inrush"]["entries"][0]
+        assert row["capacitance_uf"] == pytest.approx(101)       # C1 + C2 through FB1
+        assert row["peak_a"] == pytest.approx(50)                # 5 V / 0.1 Ohm
+        msgs = " ".join(f["message"] for f in got)
+        assert {f["severity"] for f in got} == {"warning"}
+        assert "USB 2.0" in msgs and "inrush_limit_a" in msgs
+
+    def test_unknown_source_is_info(self, tmp_path):
+        got, _ = self._run(self._usb(tmp_path, "4.7u"))
+        assert [f["severity"] for f in got] == ["info"]
+
+    def test_soft_start(self, tmp_path):
+        nl = _buck(tmp_path)
+        specs = {"U1": {"mpn": "BUCK1", "regulator": {"t_ss": _sv(min=1e-3, unit="s")}}}
+        pt = pr.analyze(nl, vref={"U1": 0.8}, rail_voltages={"VIN": 12})
+        r = circuit_review.analyze(nl, pt, specs, ("power",), inrush_limit_a=0.1)
+        row = r["inrush"]["regulator_outputs"][0]
+        assert row["charge_current_a"] == pytest.approx(22e-6 * 5 / 1e-3, rel=1e-3)
+        assert any(f["rule"] == "PW-INRUSH" and f["ref"] == "U1" for f in r["findings"])
+
+
+class TestOverspec:
+    def test_cases(self, tmp_path):
+        nl = _buck(tmp_path)
+        nl.components["C1"]["fields"]["Voltage"] = "100V"          # 12 V input cap
+        nl.components["C2"]["fields"]["Voltage"] = "10V"           # 5 V output cap: fine
+        specs = {"U1": {"mpn": "BUCK1", "recommended": {"IOUT": _sv(max=5, unit="A")}}}
+        pt = pr.analyze(nl, vref={"U1": 0.8}, rail_voltages={"VIN": 12})
+        r = part_ratings.check(nl, pt, specs, {"+5V": 0.3})
+        got = {f["ref"] for f in r["findings"] if f["rule"] == "RT-OVERSPEC"}
+        assert got == {"C1", "U1"}                                 # 100 V >= 4 x 12 V; 5 A >= 3 A
+        assert all(f["severity"] == "info" for f in r["findings"] if f["rule"] == "RT-OVERSPEC")
+
+    def test_fuse(self, tmp_path):
+        nl = _entry(tmp_path, "none")
+        specs = {"F1": {"mpn": "PTC1", "category": "fuse",
+                        "electrical": {"I_hold": _sv(min=10.0, unit="A")}}}
+        pt = pr.analyze(nl, vref={"U1": 0.8}, rail_voltages={"VJ": 12, "VIN": 12})
+        r = part_ratings.check(nl, pt, specs, {"+5V": 3.0})
+        assert ("RT-OVERSPEC", "F1") in {(f["rule"], f["ref"]) for f in r["findings"]}

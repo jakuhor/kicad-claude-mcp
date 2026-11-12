@@ -23,7 +23,11 @@ MENU_DESCRIPTION_MAX = 1300  # load_toolset: one line per set
 TOOL_MAX = 1600
 SET_BUDGET = {  # ~5-10 % above the sizes after the v2.0 merges (2026-11-11)
     "core": 5000, "sch": 22500, "pcb": 18700, "rules": 5500, "library": 4000,
-    "review": 9300, "emc_si": 7800, "sim": 2800, "datasheets": 3300,
+    # review +505: OP-17 A7 derating_profile x2, A3 i2c_mode / i2c_bus_capacitance_pf,
+    # A5 source_ohm / inrush_limit_a (measured +481, + 5 %)
+    "review": 9805,
+    "emc_si": 8940,  # +1140: OP-17 B3 analyze_board_thermal (measured 1085, + 5 %)
+    "sim": 2800, "datasheets": 3300,
     "sourcing": 5800, "fab": 2600,
 }
 
@@ -275,6 +279,8 @@ def test_argument_literals_match_the_adapters():
     assert get_args(at.CircuitGroup) == circuit_review.GROUPS
     assert get_args(at.ConnectivityCheck) == connectivity_review.CHECKS
     assert get_args(at.SubcircuitType) == spice_auto.TYPES
+    from kicad_claude.adapters import derating
+    assert get_args(at.DeratingProfile) == derating.PROFILE_NAMES
     assert get_args(at.Source) == sourcing.SOURCE_NAMES
 
 

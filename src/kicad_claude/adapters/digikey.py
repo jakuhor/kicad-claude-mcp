@@ -221,6 +221,9 @@ def _summarize_product(p: dict) -> dict:
         "lifecycle": (p.get("ProductStatus") or {}).get("Status", ""),
         "discontinued": bool(p.get("Discontinued")),
         "end_of_life": bool(p.get("EndOfLife")),
+        "operating_temp": next((q.get("ValueText") or "" for q in p.get("Parameters") or []
+                                if "operating temperature" in (q.get("ParameterText") or "").lower()),
+                               ""),
         "ecad_models": [
             m.get("Url") for m in media if "ECAD" in (m.get("Title") or "").upper()
         ],

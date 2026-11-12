@@ -11,7 +11,10 @@ License, Copyright (c) 2025 Andrew Klofas); the checks are this server's.
                     taps / unused pairs), ETH-CT (PHY-side centre tap without
                     a cap); HDMI-ESD, HDMI-DDC (DDC without pull-ups),
                     HDMI-HPD, HDMI-5V; LVDS-TERM (receiver pair without 100
-                    Ohm across it); MEM-WP / MEM-HOLD (flash protect / hold
+                    Ohm across it); CAN-TERM (CANH / CANL terminations:
+                    none with a connector, more than two, wrong value),
+                    CAN-ESD (bus at a connector without a clamp);
+                    MEM-WP / MEM-HOLD (flash protect / hold
                     pins floating), MEM-VREF (DDR VREF without divider / cap);
                     WL-ANT (radio module antenna pin not reaching an antenna
                     or connector), WL-MATCH (no pi pad on the antenna line);
@@ -228,6 +231,126 @@ def check_lvds(nl: Netlist, findings: list, specs: dict) -> list[dict]:
             elif not any(80 <= (parse_value(nl.components[r]["value"]) or 0) <= 120 for r in term):
                 findings.append(_f("warning", "LVDS-TERM", term[0], f"Termination across {b} is "
                                    f"{nl.components[term[0]]['value']}, not ~100 Ohm."))
+    return out
+
+
+CAN_H = re.compile(r"^CAN_?H\d*$|^CANH\d*$")
+CAN_NET_H = re.compile(r"(?<![A-Z])CAN\d*_?H(?![A-Z])", re.I)
+
+
+def _can_side(nl: Netlist, net: str) -> set[str]:
+    """`net` and the nets one series part (<= 10 Ohm R, L, ferrite) away,
+    plus the far side of a 4-pin common-mode choke on the pair."""
+    out, frontier = {net}, [net]
+    for _ in range(2):
+        nxt = []
+        for n in frontier:
+            for p in nl.nets.get(n, []):
+                k = kind(p.ref)
+                if k not in ("L", "FB", "R") or not fitted(nl, p.ref) or (
+                        k == "R" and (parse_value(nl.components[p.ref]["value"]) or 1e9) > 10):
+                    continue
+                o = cr.other_end(nl, p.ref, n)
+                if o and o not in out and not is_ground(o):
+                    out.add(o)
+                    nxt.append(o)
+        frontier = nxt
+    return out
+
+
+def _can_pairs(nl: Netlist) -> list[dict]:
+    """CAN buses: CANH / CANL pins of one part (transceiver), else nets named
+    ...CANH / ...CANL. Each side is widened through series parts and a
+    common-mode choke whose other two pins carry the connector side."""
+    pairs, seen = [], set()
+    for ref in sorted(nl.components):
+        pins = _pins(nl, ref)
+        for name, h in pins.items():
+            if not CAN_H.match(name):
+                continue
+            lname = name.replace("H", "L", 1) if name.startswith("CANH") else \
+                name.replace("_H", "_L", 1)
+            low = pins.get(lname)
+            if low and (h, low) not in seen and cr.is_active(nl, ref):
+                seen.add((h, low))
+                pairs.append({"transceiver": ref, "h": h, "l": low})
+    for n in sorted(nl.nets):
+        m = CAN_NET_H.search(n)
+        if not m:
+            continue
+        low = n[:m.start()] + m.group(0)[:-1] + ("L" if m.group(0)[-1] == "H" else "l") + \
+            n[m.end():]
+        if low in nl.nets and not any(n in (p["h"], p["l"]) for p in pairs):
+            seen.add((n, low))
+            pairs.append({"transceiver": None, "h": n, "l": low})
+    for bus in pairs:
+        hs, ls = _can_side(nl, bus["h"]), _can_side(nl, bus["l"])
+        for ref, c in nl.components.items():
+            if kind(ref) != "L" or not fitted(nl, ref):
+                continue
+            nets = [p.net for p in nl.pins.get(ref, [])]
+            if len(nets) == 4 and set(nets) & hs and set(nets) & ls:
+                rest = [x for x in nets if x not in hs | ls]
+                if len(rest) == 2:          # which one is H does not matter for a terminator
+                    hs.add(rest[0])
+                    ls.add(rest[1])
+        bus["h_nets"], bus["l_nets"] = sorted(hs), sorted(ls)
+    return pairs
+
+
+def check_can(nl: Netlist, findings: list, specs: dict) -> list[dict]:
+    """CAN-TERM: terminations across each CANH / CANL pair - one 100-150 Ohm
+    resistor, or a split pair of 50-75 Ohm resistors with a cap from their
+    midpoint to ground (ISO 11898-2: 120 Ohm at each end of the bus).
+    None on a board whose bus reaches a connector -> warning (info when a
+    DNP terminator is fitted for the end node); more than two -> error.
+    CAN-ESD: the bus reaches a connector with no clamp on either line."""
+    out = []
+    for bus in _can_pairs(nl):
+        hs, ls = set(bus["h_nets"]), set(bus["l_nets"])
+        terms, dnp, odd = [], [], []
+        for h in sorted(hs):
+            for r, o in parts_on(nl, h, "R"):
+                v = parse_value(nl.components[r]["value"]) or 0
+                if o in ls:
+                    if not fitted(nl, r):
+                        dnp.append(r)
+                    elif 100 <= v <= 150:
+                        terms.append({"type": "single", "refs": [r], "ohm": v})
+                    else:
+                        odd.append(r)
+                elif o and not is_ground(o) and 50 <= v <= 75 and fitted(nl, r):
+                    mates = [r2 for r2, o2 in parts_on(nl, o, "R") if r2 != r and o2 in ls
+                             and fitted(nl, r2) and 50 <= (parse_value(
+                                 nl.components[r2]["value"]) or 0) <= 75]
+                    caps = cr.caps_to_ground(nl, o)
+                    if mates and caps:
+                        terms.append({"type": "split", "refs": [r, mates[0]], "cap": caps[0],
+                                      "ohm": v + (parse_value(nl.components[mates[0]]["value"])
+                                                  or 0)})
+        conns = sorted({q.ref for n in hs | ls for q in nl.nets.get(n, [])
+                        if cr.is_connector(nl, q.ref)})
+        tag = bus["transceiver"] or bus["h"]
+        rec = {**bus, "terminations": terms, "dnp_terminators": sorted(dnp),
+               "connectors": conns}
+        out.append(rec)
+        for r in odd:
+            findings.append(_f("warning", "CAN-TERM", r, f"{r} {nl.components[r]['value']} "
+                               f"across CANH / CANL of {tag}: a terminator is 120 Ohm "
+                               "(100-150), or 2 x 60 Ohm with a cap to ground."))
+        if len(terms) > 2:
+            findings.append(_f("error", "CAN-TERM", tag, f"{len(terms)} terminations on one "
+                               f"bus ({', '.join('+'.join(t['refs']) for t in terms)}): a CAN "
+                               "bus has exactly two, one at each end."))
+        elif not terms and conns:
+            findings.append(_f("info" if dnp else "warning", "CAN-TERM", tag,
+                               f"No termination on CANH / CANL ({bus['h']} / {bus['l']}) - "
+                               + (f"DNP option {', '.join(sorted(dnp))}: fit it on the end nodes."
+                                  if dnp else "fine only if this node is never at a bus end; "
+                                  "add a 120 Ohm (or split 2 x 60 Ohm + cap) option.")))
+        if conns and not any(cr.clamped(nl, n, specs) for n in hs | ls):
+            findings.append(_f("warning", "CAN-ESD", tag, f"CAN bus reaches {', '.join(conns)} "
+                               "with no ESD / TVS clamp on CANH or CANL."))
     return out
 
 
@@ -705,6 +828,7 @@ def analyze(nl: Netlist, pt: dict, specs: dict, groups: tuple, findings: list,
         res["ethernet"] = check_ethernet(nl, findings)
         res["hdmi"] = check_hdmi(nl, findings, specs)
         res["lvds"] = check_lvds(nl, findings, specs)
+        res["can"] = check_can(nl, findings, specs)
         res["memory"] = check_memory(nl, findings)
         res["wireless"] = check_wireless(nl, findings)
     if "power_conversion" in groups:

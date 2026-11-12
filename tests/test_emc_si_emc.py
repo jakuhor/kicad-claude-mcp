@@ -208,6 +208,35 @@ def test_switching_needs_netlist():
         er.analyze(tree, ("ground",), standard="nope")
 
 
+def test_harmonic_limit_screen():
+    tree, nl, power = _sw_case()
+    profile = {"name": "test profile", "unit": "dBuV/m", "distance_m": 3,
+               "bands": [{"name": "B1", "f_start_hz": 30e6, "f_stop_hz": 88e6, "limit_db": -20},
+                         {"name": "B2", "f_start_hz": 88e6, "f_stop_hz": 216e6,
+                          "limit_db": 200, "limit_stop_db": 180}]}
+    r = er.analyze(tree, ("switching",), power=power, nl=nl, fsw={"U1": 1e6},
+                   iout={"U1": 1}, harmonic_limits=profile)
+    hs = r["harmonic_screen"]
+    assert hs["screening_only"] is True and hs["unit"] == "dBuV/m"
+    b1, b2 = hs["regulators"]["U1"]
+    assert b1["margin_db"] < 0 and b2["margin_db"] > 0          # below / far above the envelope
+    assert 30e6 <= b1["f_hz"] <= 88e6
+    assert "EM-HARM-LIMIT" in by_rule(r)
+    cur = er.analyze(tree, ("switching",), power=power, nl=nl, fsw={"U1": 1e6}, iout={"U1": 1},
+                     harmonic_limits={"name": "I", "unit": "dBuA",
+                                      "bands": [{"f_start_hz": 1e6, "f_stop_hz": 3e6,
+                                                 "limit_db": 300}]})
+    assert cur["harmonic_screen"]["regulators"]["U1"][0]["harmonic"] in (1, 2, 3)
+    for bad, msg in (({"unit": "dBuV/m"}, "name"),
+                     ({"name": "x", "unit": "V"}, "unit"),
+                     ({"name": "x", "unit": "dBuV/m", "bands": []}, "distance_m"),
+                     ({"name": "x", "unit": "dBuA", "bands": [{"f_start_hz": 5,
+                                                               "f_stop_hz": 1, "limit_db": 0}]},
+                      "f_start_hz")):
+        with pytest.raises(ValueError, match=msg):
+            er.analyze(tree, ("switching",), power=power, nl=nl, harmonic_limits=bad)
+
+
 # ---- decoupling & PDN ------------------------------------------------------------ #
 
 

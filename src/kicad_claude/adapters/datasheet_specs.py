@@ -21,6 +21,7 @@ Spec record (schema version 1):
                       "anyout": {"base": SV, "pins": {"12": SV, ...}}
                         (pin-strapped output: Vout = base + each listed pin
                         that is tied to ground; keys are pin NUMBERS),
+                      "t_ss": SV (soft-start time, s),
                       "light_load": "fccm" | "pfm" | "dcm" | "auto" (forced
                         PWM keeps the inductor in CCM at any load),
                       "input_pin": "C2" (the pin the channel's power flows
@@ -73,8 +74,15 @@ Conventional keys the analyzers read (use these names):
   - connector: electrical.I_rated (per contact) and / or I_rated_total
     (collective for the contacts of one rail, e.g. USB-C VBUS pins),
     absolute_max.V;
+  - fuse / PTC: electrical.I_hold (PTC: largest current that never
+    trips), I_trip (PTC: smallest current that always trips), I_rated
+    (fuse); absolute_max.V;
   - every part with a die: thermal.rth_ja, thermal.tj_max;
-  - opamp: electrical.GBW, SR; crystal: electrical.CL, ESR.
+  - opamp: electrical.GBW, SR, Aol (dB or V/V; with GBW it gives the
+    behavioural model when there is no vendor model), Vos, R_in;
+  - LDO / reference behavioural model: regulator.vref, dropout,
+    electrical.IQ, PSRR, Z_out;
+  - crystal: electrical.CL, ESR.
 
 SV (spec value): {"min", "typ", "max": number|null (at least one), "unit":
 SI base unit from UNITS, "page": 1-based PDF page, "conditions": str,
@@ -85,14 +93,18 @@ table, channel digits matched (D1-S1)}. Values are in SI
 base units: 500 kHz -> 500000 "Hz", 0.8 V -> 0.8 "V", 75 mV -> 0.075 "V".
 
 Checks: structure, units, min <= typ <= max, page within the PDF, and each
-number (at any SI scale: 0.075 V found as "75") present in the cited page's
-text — a miss is a warning (`unverified`), not a rejection, because tables
-and graphs do not always extract as text.
+number present in the cited page's text with its sign, decimal point and
+unit: 0.075 V is found as "75 mV" or "0.075 V" (another scale only with that
+scale's unit; a bare table cell only at base scale), -40 needs its minus,
+"±15 V" satisfies only a min -15 / max 15 pair. A miss is a warning
+(`unverified`), not a rejection, because tables and graphs do not always
+extract as text.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 
@@ -107,17 +119,11 @@ CATEGORIES = ("regulator_switching", "regulator_linear", "voltage_reference",
               "pd_controller", "load_switch", "mosfet", "bjt", "diode", "tvs",
               "zener", "led", "current_regulator", "inductor", "common_mode_choke",
               "ferrite", "capacitor", "resistor", "crystal", "oscillator",
-              "connector", "other")
+              "connector", "fuse", "other")
 SV_GROUPS = ("absolute_max", "recommended", "electrical")
 REGULATOR_ENUMS = {"en_active": {"high", "low"},
                    "light_load": {"fccm", "pfm", "dcm", "auto"},
                    "pg_output": {"open_drain", "push_pull", "none"}}
-# Section headings that hold the tables (weight 10) and softer hints (1).
-PAGE_HEADINGS = ("absolute maximum", "recommended operating", "electrical characteristics",
-                 "pin configuration", "pin functions", "pin description", "pin assignment",
-                 "ordering information", "thermal information", "i2c address",
-                 "slave address", "device comparison")
-PAGE_HINTS = ("feedback", "output voltage", "reference voltage", "enable threshold")
 _SV_KEYS = {"min", "typ", "max", "unit", "page", "conditions", "quote", "between"}
 
 
@@ -132,18 +138,99 @@ def specs_path(ds_dir: Path, mpn: str) -> Path:
 # ---- task ---------------------------------------------------------------- #
 
 
+# Page selection. Section patterns, the table-of-contents scan and the
+# keyword hints follow kicad-happy 3.0.1 (MIT, © 2025 Andrew Klofas):
+# datasheets/scripts/datasheet_page_selector.py:_find_toc_pages / _score_page.
+SECTIONS = {
+    "pinout": r"pin\s+(?:configuration|functions?|descriptions?|assignments?|definitions?|"
+              r"diagram)|pin\s*out\b",
+    "abs_max": r"absolute\s+maximum\s+rat",
+    "recommended": r"recommended\s+operating\s+cond",
+    "electrical": r"electrical\s+characteristics?",
+    "thermal": r"thermal\s+(?:information|characteristics|resistance|metrics)|"
+               r"r\s*[θΘ]\s*ja|theta\s*[-_]?\s*ja",
+    "application": r"typical\s+applications?|application\s+(?:circuit|information|schematic)",
+}
+SECTION_ORDER = ("pinout", "abs_max", "recommended", "electrical", "thermal", "application")
+_OTHER_HEADINGS = r"ordering\s+information|i2c\s+address|slave\s+address|device\s+comparison"
+_HINTS = {
+    "electrical": r"\b(?:min|typ|max)\b|feedback|reference\s+voltage|quiescent|dropout|"
+                  r"switching\s+frequency|enable\s+threshold|gain[- ]?bandwidth|slew\s+rate",
+    "pinout": r"\bpin\b.*\b(?:name|no\.|number|function)\b",
+    "application": r"\binductor\s+selection\b|\boutput\s+capacitor\b|\bschematic\b",
+    "recommended": r"\boperating\s+(?:temperature|voltage)\b",
+}
+
+
+def _section_scores(text: str) -> dict[str, float]:
+    low = text.lower()
+    out = {}
+    for sec, pat in SECTIONS.items():
+        n = len(re.findall(pat, low))
+        h = len(re.findall(_HINTS[sec], low)) if sec in _HINTS else 0
+        sc = 10.0 * min(n, 2) + min(h, 5) * 0.5
+        if sc:
+            out[sec] = sc
+    if re.search(_OTHER_HEADINGS, low):
+        out["other"] = 10.0
+    return out
+
+
+def find_toc(pages: list[str], scan: int = 3) -> dict[int, str]:
+    """{PDF page: section} from a table of contents in the first `scan`
+    pages ("Absolute Maximum Ratings ....... 4"). A printed page number is
+    moved to the nearest PDF page (n-1 .. n+3) that names the section, so a
+    cover-page offset does not misplace it."""
+    out: dict[int, str] = {}
+    for text in pages[:scan]:
+        low = text.lower()
+        for sec, pat in SECTIONS.items():
+            for m in re.finditer(r"(?:" + pat + r")[^\n\d]{0,60}?[\s.…·_-]{2,}(\d{1,3})\b", low):
+                n = int(m.group(1))
+                if not 1 <= n <= len(pages) + 3:
+                    continue
+                cands = [k for k in (n, n + 1, n + 2, n + 3, n - 1)
+                         if 1 <= k <= len(pages) and k > scan // 2
+                         and re.search(pat, pages[k - 1].lower())]
+                k = cands[0] if cands else (n if n <= len(pages) else None)
+                if k:
+                    out.setdefault(k, sec)
+    return out
+
+
+def page_reasons(pages: list[str], limit: int = 8) -> dict[int, str]:
+    """{1-based page: reason} for the pages worth reading first: page 1, the
+    table-of-contents targets, the best page of each section (pinout, abs
+    max, recommended, electrical, thermal, application), then the highest
+    scoring pages up to `limit`."""
+    if not pages:
+        return {}
+    chosen: dict[int, str] = {1: "front page"}
+    toc = find_toc(pages)
+    for sec in SECTION_ORDER + ("other",):
+        for k, s_ in sorted(toc.items()):
+            if s_ == sec and len(chosen) < limit:
+                chosen.setdefault(k, f"table of contents: {sec}")
+    scores = {i: _section_scores(t) for i, t in enumerate(pages, 1)}
+    for sec in SECTION_ORDER:
+        if any(r.endswith(sec) for r in chosen.values()):
+            continue
+        best = max(((sc.get(sec, 0.0), -i, i) for i, sc in scores.items()), default=(0, 0, 0))
+        if best[0] >= 10 and len(chosen) < limit:
+            chosen.setdefault(best[2], f"heading: {sec}")
+    rest = sorted(((sum(sc.values()), i) for i, sc in scores.items() if i not in chosen and sc),
+                  key=lambda x: (-x[0], x[1]))
+    for total, i in rest:
+        if len(chosen) >= limit:
+            break
+        top = max(scores[i], key=scores[i].get)
+        chosen[i] = f"keywords: {top} ({total:g})"
+    return dict(sorted(chosen.items()))
+
+
 def select_pages(pages: list[str], limit: int = 8) -> list[int]:
-    """1-based pages worth reading first: page 1 plus keyword hits, ranked."""
-    scored = []
-    for i, t in enumerate(pages, 1):
-        low = t.lower()
-        s = 10 * sum(k in low for k in PAGE_HEADINGS) + min(5, sum(low.count(k) for k in PAGE_HINTS))
-        if i == 1:
-            s += 100
-        if s:
-            scored.append((s, i))
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    return sorted(i for _, i in scored[:limit])
+    """1-based pages worth reading first (see `page_reasons`)."""
+    return list(page_reasons(pages, limit))
 
 
 def schema_text() -> str:
@@ -153,32 +240,107 @@ def schema_text() -> str:
 # ---- validation ------------------------------------------------------------ #
 
 
-def _num_forms(v: float) -> set[str]:
-    forms = set()
-    for k in range(-4, 5):
-        x = v * (1000 ** k)
-        for s in (f"{x:g}", f"{x:.1f}", f"{x:.2f}", f"{x:.3f}"):
-            s = s.rstrip("0").rstrip(".") if "." in s else s
-            if s not in ("0", "-0", ""):
-                forms.add(s.lstrip("-"))
-    return forms
+# Value check: the number must be on the cited page with its sign, decimal
+# point and unit. Behaviour follows kicad-happy's Deep Review quote gate.
+# Ported from kicad-happy 3.0.1 (MIT, © 2025 Andrew Klofas):
+# kicad/review/scripts/deep_review_gate.py:_norm_text / _quote_in_text
+_DASHES = re.compile("[‐‑‒–—―−﹣－]")
+_PREFIX = {"p": 1e-12, "n": 1e-9, "u": 1e-6, "µ": 1e-6, "μ": 1e-6, "m": 1e-3,
+           "k": 1e3, "K": 1e3, "M": 1e6, "G": 1e9}
+# printed symbol -> SI base unit of UNITS
+_SYMBOL = {"V": "V", "A": "A", "W": "W", "Hz": "Hz", "s": "s", "sec": "s", "Ω": "Ohm",
+           "ohm": "Ohm", "ohms": "Ohm", "Ohm": "Ohm", "F": "F", "H": "H", "°C": "C",
+           "C": "C", "%": "%", "dB": "dB", "bit": "bit", "bits": "bit", "B": "B", "J": "J",
+           "Wb": "Wb", "T": "T", "m": "m", "g": "g", "ppm": "ppm"}
+_DEN = {"°C": "C", "C": "C", "K": "C", "W": "W", "V": "V", "A": "A", "s": "s"}
+_NUM_RE = re.compile(r"(?<![\w.])(±)?(-)?(\d+(?:\.\d+)?|\.\d+)(?!\d)")
+_TOK_RE = re.compile(r"\s*([A-Za-zµμΩ°%][\w/°µμΩ%]*|\d+(?:\.\d+)?|\.\d+|[^\s\w])")
+_SKIP_WORDS = {"to", "and", "or"}
 
 
-def _number_on_page(v: float, page_text: str) -> bool:
+def _norm_text(text: str) -> str:
+    """Page text with Unicode variants, dashes, thousands separators and
+    line-wrap hyphenation normalised (NFKC: ℃ -> °C, Ω sign -> Ω)."""
+    import unicodedata
+
+    t = unicodedata.normalize("NFKC", text)
+    t = _DASHES.sub("-", t)
+    t = re.sub(r"(?<=[A-Za-z])-[ \t]*\r?\n\s*(?=[a-z])", "", t)    # over-\nvoltage
+    t = re.sub(r"±\s+", "±", t)                                   # "± 15 V"
+    t = re.sub(r"°\s+C\b", "°C", t)
+    t = re.sub(r"\b(\d{1,3})((?:,\d{3})+)(?![\d,])",
+               lambda m: m.group(1) + m.group(2).replace(",", ""), t)  # 1,500
+    t = re.sub(r"(?<=\d),(?=\d)", ".", t)                           # 5,5 V
+    return t
+
+
+def _unit_scale(tok: str) -> tuple[float, str] | None:
+    """(scale to SI, base unit) of a printed unit token, e.g. mV -> (1e-3, V),
+    V/µs -> (1e6, V/s), K/W -> (1, C/W); None when it is not a unit."""
+    def one(t: str, table: dict) -> tuple[float, str] | None:
+        if t in table:
+            return 1.0, table[t]
+        if len(t) > 1 and t[0] in _PREFIX and t[1:] in table:
+            return _PREFIX[t[0]], table[t[1:]]
+        return None
+    if "/" in tok:
+        num, _, den = tok.partition("/")
+        a, b = one(num, {**_SYMBOL, "K": "C"}), one(den, _DEN)
+        if not a or not b:
+            return None
+        return a[0] / b[0], f"{a[1]}/{b[1]}"
+    return one(tok, _SYMBOL)
+
+
+def _printed_unit(text: str, pos: int) -> tuple[float, str] | None:
+    """The unit a number ending at `pos` is printed in: the first unit token
+    after it in the same row (other numbers, dashes and 'to' skipped), or
+    None when a word or the end comes first (a bare table cell)."""
+    for _ in range(8):
+        m = _TOK_RE.match(text, pos)
+        if not m:
+            return None
+        tok, pos = m.group(1), m.end()
+        if tok[0].isdigit() or tok[0] == "." or tok.lower() in _SKIP_WORDS:
+            continue
+        if tok[0] in "°%" or tok[0].isalpha() or tok[0] in "µμΩ":
+            return _unit_scale(tok)
+        if tok in "-~±()[],;:|":
+            continue
+        return None
+    return None
+
+
+def _value_on_page(v: float, unit: str, page_text: str, symmetric: bool = False) -> bool:
+    """True when `v` (SI `unit`) is printed on the page with its sign, decimal
+    point and unit: 0.075 V as `75 mV` or `0.075 V` (a bare `0.075` cell
+    counts only at base scale), −40 as `-40` / `−40`, a `±15 V` only for a
+    symmetric min / max pair (`symmetric`). Digit-spaced cells (`3 0 V`)
+    are read joined too."""
     if v == 0:
         return True
-    text = page_text.replace("−", "-").replace(",", ".")
-    nums = set(re.findall(r"\d+(?:\.\d+)?", text))
-    # Table cells sometimes extract digit-spaced ("3 0" for 30).
-    nums |= set(re.findall(r"\d+(?:\.\d+)?", re.sub(r"(?<=\d) (?=\d)", "", text)))
-    nums |= {n.rstrip("0").rstrip(".") for n in nums if "." in n}   # 26.70 -> 26.7
-    nums |= {n.lstrip("0") or "0" for n in nums}
-    nums |= {("0" + n if n.startswith(".") else n) for n in nums}
-    return bool(_num_forms(v) & nums)
+    text = _norm_text(page_text)
+    for t in (text, re.sub(r"(?<=\b\d) (?=\d\b)", "", text)):
+        for m in _NUM_RE.finditer(t):
+            pm, neg, n = bool(m.group(1)), bool(m.group(2)), float(m.group(3))
+            if v < 0 and not (neg or (pm and symmetric)):
+                continue
+            if v > 0 and (neg or (pm and not symmetric)):
+                continue
+            pu = _printed_unit(t, m.end())
+            if unit == "" or pu is None:
+                scale = 1.0
+            elif pu[1] == unit:
+                scale = pu[0]
+            else:
+                continue
+            if math.isclose(n * scale, abs(v), rel_tol=1e-6):
+                return True
+    return False
 
 
 def _norm_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip().lower()
+    return re.sub(r"\s+", " ", _norm_text(s)).strip().lower()
 
 
 def _check_sv(path: str, sv, pages: list[str], errors: list, warnings: list) -> None:
@@ -217,7 +379,10 @@ def _check_sv(path: str, sv, pages: list[str], errors: list, warnings: list) -> 
     if not pages:
         return
     text = pages[page - 1]
-    missing = [v for v in present if not _number_on_page(float(v), text)]
+    symmetric = (vals["min"] is not None and vals["max"] is not None
+                 and vals["min"] == -vals["max"])
+    missing = [v for v in present
+               if not _value_on_page(float(v), unit or "", text, symmetric)]
     if missing and text.strip():
         warnings.append(f"{path}: value(s) {missing} not found in page {page} text "
                         "(unverified — check the page; tables/graphs may not extract)")
@@ -342,6 +507,115 @@ def validate(rec: dict, pages: list[str]) -> tuple[list[str], list[str]]:
     if not isinstance(notes, list) or any(not isinstance(n, str) for n in notes):
         errors.append("notes: list of strings")
     return errors, warnings
+
+
+# ---- quality ---------------------------------------------------------------- #
+
+# Keys the analyzers read, per category ("a|b": either). Mirrors the
+# conventional keys in the schema above.
+ANALYZER_KEYS = {
+    "regulator_switching": ["regulator.vref|regulator.vref_negative|regulator.anyout",
+                            "regulator.fsw", "recommended.VIN|absolute_max.VIN",
+                            "recommended.IOUT|electrical.ILIM|electrical.ICL",
+                            "regulator.en_threshold_rising|regulator.en_active"],
+    "regulator_linear": ["regulator.vref|regulator.anyout|regulator.set_current",
+                         "regulator.dropout", "recommended.VIN|absolute_max.VIN",
+                         "recommended.IOUT", "electrical.IQ|electrical.I_GND"],
+    "voltage_reference": ["regulator.vref", "recommended.VIN|absolute_max.VIN"],
+    "opamp": ["electrical.GBW", "electrical.SR", "recommended.VS|absolute_max.VS|"
+              "recommended.VCC|absolute_max.VCC"],
+    "capacitor": ["electrical.C", "absolute_max.V|electrical.V_rated"],
+    "inductor": ["electrical.L", "electrical.DCR", "electrical.Isat", "electrical.Irms*"],
+    "ferrite": ["electrical.Z_100MHz", "electrical.DCR", "electrical.I_rated|electrical.Irms*"],
+    "common_mode_choke": ["electrical.Z_cm", "electrical.DCR", "electrical.I_rated"],
+    "led": ["electrical.VF", "absolute_max.IF"],
+    "current_regulator": ["electrical.I_reg", "electrical.V_min"],
+    "connector": ["electrical.I_rated|electrical.I_rated_total"],
+    "fuse": ["electrical.I_hold|electrical.I_rated"],
+    "crystal": ["electrical.CL", "electrical.ESR"],
+    "mosfet": ["absolute_max.VDS", "electrical.RDS*", "electrical.ID|absolute_max.ID"],
+    "diode": ["electrical.VF", "absolute_max.IF|electrical.IF|electrical.IF_AV",
+              "absolute_max.VR|absolute_max.VRRM"],
+    "tvs": ["absolute_max.VWM|recommended.VWM|electrical.VBR", "electrical.VC"],
+    "zener": ["electrical.VZ"],
+}
+PASSIVE_CATEGORIES = {"capacitor", "resistor", "inductor", "ferrite", "common_mode_choke",
+                      "connector", "fuse", "crystal"}
+QUALITY_WEIGHTS = {"pins": 30, "ratings": 25, "electrical": 20, "thermal": 10, "analyzer_keys": 15}
+
+
+def _has(rec: dict, path: str) -> bool:
+    for alt in path.split("|"):
+        group, _, key = alt.partition(".")
+        grp = rec.get(group) or {}
+        if key.endswith("*"):
+            if any(k.upper().replace("(", "").replace(")", "").replace("_", "")
+                   .startswith(key[:-1].upper().replace("_", "")) for k in grp):
+                return True
+        elif key in grp:
+            return True
+    return False
+
+
+def quality(rec: dict, symbol_pins: int | None = None) -> dict:
+    """0-100 completeness of a spec record with what is missing: pin table
+    vs the symbol's pin count, voltage ratings (abs max, recommended, TJ),
+    electrical characteristics, thermal (rth_ja, tj_max), and the keys the
+    analyzers read for its category (`ANALYZER_KEYS`). Pins and thermal do
+    not count for passives. Below 50: DQ-LOW."""
+    cat = rec.get("category", "")
+    parts, missing = {}, []
+    passive = cat in PASSIVE_CATEGORIES
+    if not passive:
+        pins = [p for p in rec.get("pins") or [] if str(p.get("name", "")).strip()]
+        if symbol_pins:
+            parts["pins"] = min(1.0, len(pins) / symbol_pins)
+            if len(pins) < symbol_pins:
+                missing.append(f"pins: {len(pins)} of the symbol's {symbol_pins}")
+        else:
+            parts["pins"] = 1.0 if pins else 0.0
+            if not pins:
+                missing.append("pins: no pin table")
+    am, ro = rec.get("absolute_max") or {}, rec.get("recommended") or {}
+    r = 0.0
+    if any((sv or {}).get("unit") == "V" for sv in am.values()):
+        r += 0.5
+    else:
+        missing.append("absolute_max: no voltage rating")
+    if passive or any((sv or {}).get("unit") == "V" for sv in ro.values()):
+        r += 0.3
+    else:
+        missing.append("recommended: no operating voltage")
+    if passive or _has(rec, "absolute_max.TJ|thermal.tj_max|recommended.T_A|recommended.TA"):
+        r += 0.2
+    else:
+        missing.append("no TJ / temperature range")
+    parts["ratings"] = r
+    n_el = len(rec.get("electrical") or {}) + len(
+        {k: v for k, v in (rec.get("regulator") or {}).items() if isinstance(v, dict)})
+    parts["electrical"] = min(1.0, n_el / 3)
+    if n_el < 3:
+        missing.append(f"electrical: {n_el} value(s)")
+    if not passive:
+        th = rec.get("thermal") or {}
+        parts["thermal"] = 0.5 * ("rth_ja" in th) + 0.5 * bool(
+            "tj_max" in th or "TJ" in am)
+        if "rth_ja" not in th:
+            missing.append("thermal.rth_ja")
+    keys = ANALYZER_KEYS.get(cat)
+    if keys:
+        have = [k for k in keys if _has(rec, k)]
+        parts["analyzer_keys"] = len(have) / len(keys)
+        missing += [f"analyzer key {k}" for k in keys if k not in have]
+    w = {k: QUALITY_WEIGHTS[k] for k in parts}
+    score = round(100 * sum(parts[k] * w[k] for k in parts) / sum(w.values())) if w else 0
+    out = {"score": score, "parts": {k: round(v, 2) for k, v in parts.items()},
+           "missing": missing}
+    if score < 50:
+        out["finding"] = {"severity": "info", "rule": "DQ-LOW", "ref": rec.get("mpn", ""),
+                          "message": f"Extraction quality {score}/100: "
+                                     + "; ".join(missing[:6]) + "."}
+    return out
 
 
 # ---- store ---------------------------------------------------------------- #

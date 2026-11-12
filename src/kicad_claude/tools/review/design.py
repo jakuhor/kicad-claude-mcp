@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
-from kicad_claude.arg_types import CircuitGroup, ConnectivityCheck, clean
+from kicad_claude.arg_types import CircuitGroup, ConnectivityCheck, DeratingProfile, clean
 from kicad_claude.tools.common import datasheet_values, project_netlist, specs_by_ref
 from kicad_claude.adapters import connectivity_review, power_review
 
@@ -89,6 +89,10 @@ def register(mcp) -> None:
         internal_connectors: list[str] | None = None,
         audio_f_low_hz: float = 20.0,
         fb_z_max_ohm: float = 100e3,
+        i2c_mode: Literal["standard", "fast", "fast_plus"] = "fast",
+        i2c_bus_capacitance_pf: dict[str, float] | None = None,
+        source_ohm: float | None = None,
+        inrush_limit_a: float | None = None,
         netlist_path: str = "",
     ) -> dict:
         """Circuit-level detectors on the active schematic (whole hierarchy) from
@@ -108,7 +112,16 @@ def register(mcp) -> None:
             clamps on connector supply nets (PW-VBUS-TVS) and a ground pin
             (PW-CONN-GND), ESD clamps on external connector signal nets
             (PW-ESD; `internal_connectors="J2,J5"` excludes board-to-board
-            and test connectors), enable loops / self-enable (PW-SEQ-*), reset
+            and test connectors), reverse-polarity protection on connector
+            supplies that reach ICs - series diode, drain-upstream FET or
+            ideal-diode IC, found topology in `reverse_polarity`; USB and
+            internal connectors skipped (PW-REVPOL), inrush (PW-INRUSH:
+            capacitance before the first regulator; hot-plug peak V /
+            `source_ohm` vs `inrush_limit_a`, the connector rating and a fuse
+            in the path; USB VBUS above 10 uF, USB 2.0 7.2.4.1; soft-start
+            charge C x Vout / `regulator.t_ss`; info without source_ohm),
+            enable loops /
+            self-enable (PW-SEQ-*), reset
             nets (PW-RESET), FB divider impedance (PW-FB-Z, above
             `fb_z_max_ohm`) and FB bias current error (PW-FB-IB, spec cache);
           - `analog`: op-amp inputs with no DC path (AU-BIAS), input coupling
@@ -121,9 +134,14 @@ def register(mcp) -> None:
           - `digital`: inputs with nothing driving them (DG-FLOAT; pins the
             datasheet says may stay open are skipped, DG-PINTYPE when the
             datasheet calls the pin an output), boot / mode straps (DG-BOOT),
-            I2C pull-ups stronger than the 3 mA sink (DG-I2C-RPU), SPI chip
+            I2C pull-ups stronger than the `i2c_mode` sink (3 mA; 20 mA
+            fast_plus; DG-I2C-RPU) and rise time 0.8473 R C against the mode
+            limit (1000 / 300 / 120 ns, NXP UM10204; C = devices' extracted
+            C_in + `i2c_bus_capacitance_pf={net: pF}`; info when unknown;
+            DG-I2C-RISE), SPI chip
             selects shared / without pull-up (DG-SPI-CS), driver vs receiver
-            supply (DG-LEVEL), branched clocks without series R
+            supply (DG-LEVEL; UART TX -> RX through series resistors:
+            DG-UART-LEVEL), branched clocks without series R
             (DG-CLK-TERM), USB data ESD (DG-USB-ESD), SWD pins reachable
             (DG-SWD);
           - `misc`: LEDs without a current limit (LE-NORES), LED driver set
@@ -132,7 +150,9 @@ def register(mcp) -> None:
             matrices without diodes (KB-GHOST);
           - `interfaces`: Ethernet magnetics / Bob Smith / centre-tap caps
             (ETH-*), HDMI / DVI ESD, DDC pull-ups, HPD, +5V protection
-            (HDMI-*), LVDS receiver termination (LVDS-TERM), flash WP / HOLD
+            (HDMI-*), LVDS receiver termination (LVDS-TERM), CAN terminations
+            (CAN-TERM: 120 Ohm or split 2 x 60 Ohm + cap; none with a
+            connector / more than two) and CAN ESD (CAN-ESD), flash WP / HOLD
             and DDR VREF (MEM-*), radio-module antenna path and pi pad (WL-*);
           - `power_conversion`: charger set resistor and thermistor (CHG-*),
             BMS cell-sense RC and balancing (BMS-*), cell-protection sense
@@ -162,7 +182,8 @@ def register(mcp) -> None:
                                   rail_voltages=rail_voltages or {})
         internal = set(clean(internal_connectors))
         return circuit_review.analyze(nl, pt, specs_by_ref(nl), wanted, internal,
-                                      audio_f_low_hz, fb_z_max_ohm)
+                                      audio_f_low_hz, fb_z_max_ohm, i2c_mode,
+                                      i2c_bus_capacitance_pf, source_ohm, inrush_limit_a)
 
     @mcp.tool()
     def review_part_ratings(
@@ -172,7 +193,9 @@ def register(mcp) -> None:
         default_efficiency: float = 0.85,
         ambient_c: float | None = None,
         fsw: dict[str, float] | None = None,
-        tj_margin_c: float = 25.0,
+        tj_margin_c: float | None = None,
+        derating_profile: DeratingProfile = "commercial",
+        sleep_states: dict[str, str] | None = None,
         netlist_path: str = "",
     ) -> dict:
         """Check parts against datasheet ratings with a per-rail current model.
@@ -201,8 +224,31 @@ def register(mcp) -> None:
         regulators - channels of one IC summed -, FETs I^2 RDS(on), series
         diodes, CCRs; `ambient_c`, default 40 C stated as assumed); RT-FET-ID,
         RT-D-IF; RT-LED (LED current from series R and VF or a CCR's I_reg vs
-        IF max, CCR headroom); RT-MODEL (a regulator whose voltages are
-        unknown); RT-NODATA (carries current, nothing extracted).
+        IF max, CCR headroom); RT-FUSE (fuse / PTC I_hold, I_trip or
+        I_rated / `Current` field vs the rail current); RT-OVERSPEC (info:
+        cap >= 4x its voltage at >= 50 V, fuse >= 5x, regulator IOUT >= 10x
+        the load); RT-MODEL (a regulator whose voltages are unknown);
+        RT-NODATA (carries current, nothing extracted).
+
+        `derating_profile` (commercial / industrial / automotive / military,
+        policy values in `adapters/derating.py`) sets the Tj margin
+        (`tj_margin_c` default: 25 / 25 / 30 / 40 C) and the resistor power
+        fraction (50 %): RT-R-P compares each resistor's dissipation with its
+        rating (extracted datasheet or `Power` field; never by package).
+
+        `power_budget`: per rail voltage, current and power; per regulator
+        Iin / Iout / loss; input current and total input power at the root
+        rails. `sleep_current`: standby draw per rail - regulators' Iq (or
+        I_shdn when `sleep_states={"U4": "off"}`, its rails then at 0 V) from
+        the spec cache, and resistor currents leaving each rail in the sleep
+        DC operating point (`sleep_states` also sets switches, `{"Q3":
+        "off"}`); missing Iq in `nodata`.
+
+        `dissipation`: every part that heats, largest first, with the method -
+        regulators, FETs, diodes, CCRs from the checks above, resistors from
+        I^2 R (rail series path, shunts) or dV^2 / R (DC operating point).
+        Without an extracted rth_ja, Tj uses the package-typical value
+        (`rth_source: package_typical (assumed)`, finding at most a warning).
 
         First-pass estimate: rth_ja is the datasheet's test board, efficiency
         is a number you supply, ripple is computed for bucks only.
@@ -213,7 +259,8 @@ def register(mcp) -> None:
         pt = power_review.analyze(nl, datasheet=datasheet_values(nl),
                                   rail_voltages=rail_voltages or {})
         result = part_ratings.check(nl, pt, specs_by_ref(nl), loads or {}, efficiency,
-                                    default_efficiency, ambient_c, fsw, tj_margin_c)
+                                    default_efficiency, ambient_c, fsw, tj_margin_c,
+                                    derating_profile, sleep_states)
         if not loads:
             result["note"] = ("No loads given: every current is zero except what the "
                               "schematic implies (LED strings). Pass loads={rail: amps}.")
@@ -224,7 +271,8 @@ def register(mcp) -> None:
         checks: list[ConnectivityCheck] | None = None,
         netlist_path: str = "",
         rail_voltages: dict[str, float] | None = None,
-        cap_derating: float = 0.8,
+        cap_derating: float | None = None,
+        derating_profile: DeratingProfile = "commercial",
         switch_states: Literal["auto", "all", "single", "both", "on", "off", "none"] = "auto",
         switch_overrides: dict[str, str] | None = None,
         max_switch_combos: int = 16,
@@ -265,13 +313,19 @@ def register(mcp) -> None:
             `absolute_max` key (VIN~IN, EN~EN/UV, CC~CC1 ...) against its net
             voltage — rail voltages from `analyze_power_tree` (datasheet
             Vouts, plus `rail_voltages` for unregulated inputs) and resistor
-            dividers (CR-PIN-ABS);
+            dividers (CR-PIN-ABS; CR-PIN-DERATE beyond the derating
+            profile's fraction of the limit: 90 / 85 / 85 / 80 %);
           - `cap_voltage`: DC voltage across each fitted capacitor against its
             rating: the fitted MPN's extracted datasheet (`absolute_max.V`)
             when there is one, else the `Voltage` field (or a `/50V` suffix in
-            Value). CR-CAP-V above the rating, CR-CAP-DERATE above
-            `cap_derating` x rating, CR-CAP-FIELD when the field disagrees
-            with the datasheet.
+            Value). CR-CAP-V above the rating, CR-CAP-DERATE above the
+            derating fraction: `cap_derating` when given, else the
+            `derating_profile`'s fraction for the dielectric family read from
+            the symbol (ceramic / electrolytic / tantalum / unknown:
+            commercial 50 / 80 / 80 / 50 %, industrial 50 / 75 / 70 / 50,
+            automotive 50 / 70 / 60 / 50, military 40 / 60 / 50 / 40 - policy
+            values, `adapters/derating.py`), CR-CAP-FIELD when the field
+            disagrees with the datasheet.
 
         The pin -> rail map is returned so it can be checked against each
         datasheet; whether a rail is the *right* one is not judged here.
@@ -311,7 +365,7 @@ def register(mcp) -> None:
             volts = {n: (v["volts"], v["source"]) for n, v in pt["rail_voltages"].items()}
         if not need_v:
             result = connectivity_review.analyze(nl, wanted, specs=specs, volts=volts,
-                                                 cap_derating=cap_derating)
+                                                 cap_derating=cap_derating, profile=derating_profile)
         else:
             import itertools
 
@@ -338,7 +392,7 @@ def register(mcp) -> None:
                           "none": [None]}[mode]
             base = [c for c in wanted if c not in need_v]
             result = connectivity_review.analyze(nl, tuple(base), specs=specs, volts=volts,
-                                                 cap_derating=cap_derating)
+                                                 cap_derating=cap_derating, profile=derating_profile)
             findings = result["findings"]
             scen_out = {}
             seen: dict = {}
@@ -353,7 +407,7 @@ def register(mcp) -> None:
                 sv = {**dc["volts"], **volts} if swmap else {
                     **volts, **{n: v for n, v in dc["volts"].items() if n not in sw_nets}}
                 part = connectivity_review.analyze(nl, tuple(need_v), specs=specs, volts=sv,
-                                                   cap_derating=cap_derating)
+                                                   cap_derating=cap_derating, profile=derating_profile)
                 part["findings"] += dc_model.findings(dc)
                 if not swmap:
                     name = "as drawn"

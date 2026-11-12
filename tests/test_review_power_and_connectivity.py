@@ -228,3 +228,87 @@ def test_review_connectivity_tool(tmp_path):
     assert "power_pins" in res and "i2c_buses" not in res
     with pytest.raises(ValueError):
         fn(checks=["bogus"], netlist_path=str(_cr_netlist(tmp_path)))
+
+
+def _cap_nl(tmp_path, fp, volt):
+    p = tmp_path / "cap.net"
+    p.write_text(
+        '(export (version "E") (components '
+        f'(comp (ref "C1") (value "10u") (footprint "{fp}")'
+        ' (libsource (lib "Device") (part "C") (description ""))'
+        f' (fields (field (name "Voltage") "{volt}")))) (nets '
+        + _net(1, "+12V", ("C1", "1", "", "passive")) + " "
+        + _net(2, "GND", ("C1", "2", "", "passive")) + "))", encoding="utf-8")
+    return pr.parse_netlist(p)
+
+
+def test_derating_profiles_caps(tmp_path):
+    from kicad_claude.adapters import derating
+
+    v = {"+12V": (12.0, "c")}
+    # electrolytic 25 V at 12 V = 48 %: passes commercial (80 %) and military (60 %)
+    elco = _cap_nl(tmp_path, "Capacitor_THT:CP_Radial_D5.0mm", "25V")
+    for prof in derating.PROFILE_NAMES:
+        r = cr.analyze(elco, ("cap_voltage",), volts=v, profile=prof)
+        assert r["cap_voltage"]["checked"][0]["family"] == "electrolytic"
+        assert r["findings"] == [], prof
+    # tantalum 20 V at 12 V = 60 %: commercial 80 % passes, military 50 % fails
+    tant = _cap_nl(tmp_path, "Capacitor_Tantalum_SMD:CP_EIA-3528-21_Kemet-B", "20V")
+    assert cr.analyze(tant, ("cap_voltage",), volts=v)["findings"] == []
+    mil = cr.analyze(tant, ("cap_voltage",), volts=v, profile="military")["findings"]
+    assert [(f["rule"], f["severity"]) for f in mil] == [("CR-CAP-DERATE", "warning")]
+    assert "military profile, tantalum" in mil[0]["message"]
+    # an explicit cap_derating overrides the profile
+    assert cr.analyze(tant, ("cap_voltage",), volts=v, profile="military",
+                      cap_derating=0.9)["findings"] == []
+    with pytest.raises(ValueError):
+        cr.analyze(tant, ("cap_voltage",), volts=v, profile="space")
+
+
+def test_derating_profiles_ic_abs(tmp_path):
+    nl = _cap_nl(tmp_path, "", "")
+    nl.components["U9"] = {"ref": "U9", "value": "IC", "fields": {}}
+    nl.pins["U9"] = [pr.Pin("U9", "1", "VIN", "power_in", "+12V")]
+    specs = {"U9": {"mpn": "IC9", "pdf": {"file": "ic9.pdf"},
+                    "absolute_max": {"VIN": {"max": 14, "unit": "V", "page": 3}}}}
+    v = {"+12V": (12.0, "c")}           # 86 % of 14 V
+    com = cr.analyze(nl, ("pin_abs_max",), specs=specs, volts=v)["findings"]
+    assert com == []                    # commercial 90 %
+    mil = cr.analyze(nl, ("pin_abs_max",), specs=specs, volts=v, profile="military")
+    assert [f["rule"] for f in mil["findings"]] == ["CR-PIN-DERATE"]
+
+
+def _budget(tmp_path, specs=None, sleep_states=None):
+    from kicad_claude.adapters import part_ratings
+
+    nl = pr.parse_netlist(_netlist(tmp_path))
+    pt = pr.analyze(nl, vref={"U1": 0.8}, rail_voltages={"VIN": 12, "+3V3": 3.3})
+    return part_ratings.check(nl, pt, specs or {}, {"+3V3": 0.5}, sleep_states=sleep_states)
+
+
+def test_power_budget_two_regulator_chain(tmp_path):
+    b = _budget(tmp_path)["power_budget"]
+    u1_in = 4.8 * 0.5 / (0.85 * 12)
+    assert b["regulators"]["U2"]["iin"] == pytest.approx(0.5)            # linear
+    assert b["regulators"]["U1"]["iin"] == pytest.approx(u1_in, rel=1e-3)
+    assert b["input"]["VIN"] == pytest.approx(u1_in, rel=1e-3)
+    assert b["total_input_w"] == pytest.approx(12 * u1_in, rel=1e-3)
+    assert b["regulator_loss_w"] == pytest.approx(1.5 * 0.5 + 2.4 * 0.15 / 0.85, rel=1e-3)
+    rails = {r["rail"]: r for r in b["rails"]}
+    assert rails["+3V3"]["power_w"] == pytest.approx(1.65)
+
+
+def test_sleep_current_divider_and_ldo_iq(tmp_path):
+    specs = {"U2": {"mpn": "LDO1", "electrical": {"IQ": {"typ": 50e-6, "unit": "A", "page": 4}}}}
+    sc = _budget(tmp_path, specs)["sleep_current"]
+    items = {x["ref"]: x for x in sc["items"]}
+    assert items["R1"]["current_a"] == pytest.approx(4.8 / 120e3, rel=1e-3)   # FB divider
+    assert items["R3"]["current_a"] == pytest.approx(12 / 147e3, rel=1e-3)    # EN divider
+    assert items["U2"]["current_a"] == pytest.approx(50e-6)
+    assert "U1: no Iq extracted" in sc["nodata"]
+    vin = 12 / 147e3 + (4.8 / 120e3 + 50e-6) * 4.8 / (0.85 * 12)
+    assert sc["input"]["VIN"] == pytest.approx(vin, rel=1e-3)
+    # U1 off in sleep: its output rail and everything below is at 0 V
+    off = _budget(tmp_path, specs, {"U1": "off"})["sleep_current"]
+    assert "+5V" in off["rails_off"] and "R1" not in {x["ref"] for x in off["items"]}
+    assert "U1: no I_shdn extracted" in off["nodata"]

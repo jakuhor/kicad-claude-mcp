@@ -10,7 +10,7 @@ Detects, from KiCAD's own netlist (`power_review.parse_netlist`):
   - LC / ferrite / pi ladders: chains of series inductors between nodes
     that carry capacitors to ground (converter power-stage inductors are
     excluded), with R-C damping branches and bleeders, simulated with an
-    ngspice AC sweep driven from the ladder's source end: resonances,
+    SPICE AC sweep (ngspice or LTspice) from the ladder's source end: resonances,
     peaking, attenuation at the switching harmonics, optional Monte Carlo.
 
 Component values come from the netlist `Value` field; tolerances only from a
@@ -28,8 +28,6 @@ from __future__ import annotations
 import math
 import random
 import re
-import shutil
-import subprocess
 import tempfile
 from collections import defaultdict
 from pathlib import Path
@@ -341,34 +339,18 @@ def ladder_deck(nl: Netlist, lad: dict, f_lo: float, f_hi: float, scale: dict | 
 
 
 def find_ngspice() -> str | None:
-    return shutil.which("ngspice")
+    from kicad_claude.adapters import spice_backends
+    return spice_backends.find_ngspice()
 
 
-def run_ac(deck: str, nodes: list[str], ngspice: str, timeout: float = 60.0) -> dict:
-    """Run ngspice in batch mode; return {node: [(f, dB)]}."""
-    with tempfile.TemporaryDirectory() as d:
-        cir = Path(d) / "deck.cir"
-        data = Path(d) / "out.txt"
-        ctrl = (".control\nrun\nset wr_singlescale\nwrdata " + str(data).replace("\\", "/")
-                + " " + " ".join(f"vdb({n})" for n in nodes) + "\n.endc\n")
-        cir.write_text(deck.replace(".end\n", ctrl + ".end\n"), encoding="utf-8")
-        r = subprocess.run([ngspice, "-b", str(cir)], capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           timeout=timeout, check=False)
-        if not data.is_file():
-            raise RuntimeError(f"ngspice produced no data: {(r.stderr or r.stdout)[-400:]}")
-        out = {n: [] for n in nodes}
-        for line in data.read_text(encoding="utf-8", errors="replace").splitlines():
-            parts = line.split()
-            if len(parts) < 1 + len(nodes):
-                continue
-            try:
-                f = float(parts[0])
-                vals = [float(x) for x in parts[1:1 + len(nodes)]]
-            except ValueError:
-                continue
-            for n, v in zip(nodes, vals):
-                out[n].append((f, v))
-        return out
+NOSIM = "no SPICE simulator found (ngspice on PATH, or LTspice)"
+
+
+def run_ac(deck: str, nodes: list[str], sim, timeout: float = 60.0) -> dict:
+    """AC sweep of `deck` on `sim` (a spice_backends.Backend or an ngspice
+    path); returns {node: [(f, dB)]}."""
+    from kicad_claude.adapters import spice_backends
+    return spice_backends.as_backend(sim).run_ac(deck, nodes, timeout)
 
 
 def _interp(curve: list, f: float) -> float | None:
@@ -390,7 +372,7 @@ def summarize_curve(curve: list, freqs: list[float]) -> dict:
                    for f in freqs}}
 
 
-def analyze_ladder(nl: Netlist, lad: dict, freqs: list[float], ngspice: str | None,
+def analyze_ladder(nl: Netlist, lad: dict, freqs: list[float], sim,
                    mc: int, rng: random.Random, specs: dict, loads: dict | None = None,
                    source_ohm: dict | None = None, mount_l: dict | None = None,
                    bias: dict | None = None) -> dict:
@@ -442,10 +424,10 @@ def analyze_ladder(nl: Netlist, lad: dict, freqs: list[float], ngspice: str | No
                                "load: peaking is an upper bound, pass loads={net: ohm})")
                             + f", source {rs} ohm"]
     rec["deck"] = deck
-    if not ngspice:
-        rec["error"] = "ngspice not found on PATH"
+    if not sim:
+        rec["error"] = NOSIM
         return rec
-    curves = run_ac(deck, [node[out_net]], ngspice)
+    curves = run_ac(deck, [node[out_net]], sim)
     rec["response"] = summarize_curve(curves[node[out_net]], freqs)
     if mc:
         tol = {r: tolerance(nl.components[r]) or spec_tolerance(specs, r) for r in
@@ -459,7 +441,7 @@ def analyze_ladder(nl: Netlist, lad: dict, freqs: list[float], ngspice: str | No
                 scale.update({r: v for r, v in bias.items() if r not in scale})
                 deck_i, node_i, _ = ladder_deck(nl, lad, f_lo, f_hi, scale, specs, loads, rs,
                                                 mount_l)
-                s = summarize_curve(run_ac(deck_i, [node_i[out_net]], ngspice)[node_i[out_net]],
+                s = summarize_curve(run_ac(deck_i, [node_i[out_net]], sim)[node_i[out_net]],
                                     freqs)
                 if s["max_peaking_db"] is not None:
                     peaks.append(s["max_peaking_db"])
@@ -623,7 +605,7 @@ def model_from_fields(nl: Netlist, ref: str) -> dict | None:
     return rec
 
 
-def opamp_ac(nl: Netlist, stage: dict, model: dict, volts: dict, ngspice: str,
+def opamp_ac(nl: Netlist, stage: dict, model: dict, volts: dict, sim,
              supplies: dict | None = None) -> dict:
     """AC closed-loop response of one op-amp stage with a vendor subcircuit:
     1 V AC at the stage input, the stage's own Rf / Rg / Cf, DC supplies on
@@ -695,7 +677,7 @@ def opamp_ac(nl: Netlist, stage: dict, model: dict, volts: dict, ngspice: str,
         lines.append(f"RLK_{n} {n} 0 1e12")
     lines += [".ac dec 50 1 1e9", ".end"]
     deck = "\n".join(lines) + "\n"
-    curve = run_ac(deck, [nd(stage["out"])], ngspice)[nd(stage["out"])]
+    curve = run_ac(deck, [nd(stage["out"])], sim)[nd(stage["out"])]
     lf = curve[0][1]
     peak = max(v for _, v in curve)
     f3 = next((f for f, v in curve if v < lf - 3), None)
@@ -850,10 +832,18 @@ def strip_inductance_h(length_mm: float, width_mm: float, height_mm: float) -> f
 TYPES = ("divider", "rc", "lc", "opamp", "crystal")
 
 
+def _sim(sim):
+    """`sim` as given; None -> the first installed simulator; "" -> none."""
+    if sim is None:
+        from kicad_claude.adapters import spice_backends
+        return spice_backends.detect("auto")
+    return sim
+
+
 def analyze(nl: Netlist, types: tuple[str, ...] = TYPES, volts: dict | None = None,
             vref: dict | None = None, regulators: list | None = None, sources: dict | None = None,
             freqs: list[float] | None = None, mc: int = 0, seed: int = 1,
-            specs: dict | None = None, ngspice: str | None = None,
+            specs: dict | None = None, sim=None,
             peaking_warn_db: float = 6.0, loads: dict | None = None,
             source_ohm: dict | None = None, mount_l: dict | None = None,
             c_stray_pf: float | None = None, cl_tolerance: float = 0.1,
@@ -901,7 +891,7 @@ def analyze(nl: Netlist, types: tuple[str, ...] = TYPES, volts: dict | None = No
     if "rc" in types:
         result["rc_filters"] = find_rc(nl, ladder_nets | rails)
     if "lc" in types:
-        ng = ngspice if ngspice is not None else find_ngspice()
+        ng = _sim(sim)
         lads = []
         for lad in ladders:
             from kicad_claude.adapters.datasheet_specs import c_bias_ratio
@@ -947,22 +937,39 @@ def analyze(nl: Netlist, types: tuple[str, ...] = TYPES, volts: dict | None = No
     if "opamp" in types:
         stages = find_opamp_stages(nl, specs or {})
         result["opamp_stages"] = stages
-        ng = ngspice if ngspice is not None else find_ngspice()
+        ng = _sim(sim)
+        tmp = tempfile.TemporaryDirectory()
         for s in stages:
             model = (opamp_models or {}).get(s["ref"]) or model_from_fields(nl, s["ref"])
+            if not model and (specs or {}).get(s["ref"]) and not s.get(
+                    "topology", "").startswith("unrecognised"):
+                from kicad_claude.adapters import spice_models
+                gen = spice_models.opamp(specs[s["ref"]])
+                if gen.get("text"):
+                    lib = Path(tmp.name) / f"{gen['subckt']}.lib"
+                    lib.write_text(gen["text"], encoding="utf-8")
+                    model = {"lib": str(lib), "subckt": gen["subckt"], "pins": gen["pins"],
+                             "source": gen["source"]}
+                else:
+                    s["behavioural_missing"] = gen["missing"]
             if not model or s.get("topology", "").startswith("unrecognised"):
                 if not s.get("topology", "").startswith("unrecognised"):
-                    s["model"] = "ideal (no vendor model: pass opamp_models or set Sim.Library)"
+                    s["model"] = ("ideal (no vendor model: pass opamp_models or set Sim.Library"
+                                  + (f"; behavioural model needs {', '.join(s['behavioural_missing'])}"
+                                     if s.get("behavioural_missing") else "") + ")")
                 continue
             if not ng:
-                s["model"] = "vendor model given, ngspice not on PATH"
+                s["model"] = f"vendor model given, {NOSIM}"
                 continue
             try:
                 s["simulated"] = opamp_ac(nl, s, model, volts, ng, supplies)
                 s["simulated"].pop("deck", None)
-                s["model"] = f"vendor: {s['simulated']['model']}"
+                s["model"] = (f"{model['source']}: {s['simulated']['model']}"
+                              if str(model.get("source", "")).startswith("behavioural")
+                              else f"vendor: {s['simulated']['model']}")
             except (ValueError, OSError, RuntimeError) as e:
-                s["model"] = f"vendor model not usable: {e}"
+                s["model"] = f"model not usable: {e}"
+        tmp.cleanup()
         for s in stages:
             if s.get("topology", "").startswith("unrecognised"):
                 continue
@@ -995,6 +1002,9 @@ def analyze(nl: Netlist, types: tuple[str, ...] = TYPES, volts: dict | None = No
                                  + ("" if x["c_stray_pf"] is not None else
                                     " (no stray capacitance given: c_stray_pf)")
                                  + "; the crystal's CL is not in the spec cache."})
+    if {"lc", "opamp"} & set(types):
+        used = _sim(sim)
+        result["simulator"] = (getattr(used, "name", "ngspice") if used else None)
     result["findings"] = findings
     result["counts"] = {k: sum(1 for f in findings if f["severity"] == k)
                         for k in ("error", "warning", "info")}

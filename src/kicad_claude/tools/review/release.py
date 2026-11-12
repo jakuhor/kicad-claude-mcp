@@ -94,6 +94,56 @@ def _review(nl, rail_voltages: dict) -> dict:
     return {"power": power, "connectivity": conn, "subcircuits": sub}
 
 
+def find_alternatives(mpn: str, hits: dict, names: list[str], search, error_of,
+                      limit: int = 5) -> list[dict]:
+    """Replacement candidates for an end-of-life / NRND `mpn`: each source's
+    suggested replacement, then the family stem searched at `names` (same
+    manufacturer, same package token when the original's description names
+    one, active). Ported in behaviour from kicad-happy 3.0.1 (MIT, © 2025
+    Andrew Klofas): kicad/scripts/lifecycle_engine.py:find_alternatives."""
+    from kicad_claude.adapters import datasheet_index as dsi
+    from kicad_claude.adapters import thermal_pkg
+
+    seen, out = {mpn.upper()}, []
+    for name, h in hits.items():
+        r = (h.get("suggested_replacement") or "").strip()
+        if r and r.upper() not in seen:
+            seen.add(r.upper())
+            out.append({"mpn": r, "source": name, "why": "suggested replacement"})
+    mfr = next((h.get("manufacturer") for h in hits.values() if h.get("manufacturer")), "")
+    desc = " ".join(h.get("description") or "" for h in hits.values())
+    pkg = (thermal_pkg.classify(desc) or {}).get("package")
+    stem = dsi.stem(mpn)
+    if len(stem) < 4 or stem.upper() == mpn.upper():
+        stem = re.sub(r"[A-Z#\-/]{1,6}$", "", mpn, flags=re.I) or stem
+    for name in names:
+        if len(out) >= limit:
+            break
+        try:
+            cands = search(name, stem, limit=10)
+        except error_of(name):
+            continue
+        for c in cands:
+            m = (c.get("mpn") or "").strip()
+            text = f"{c.get('lifecycle') or ''}"
+            if (not m or m.upper() in seen or not m.upper().startswith(stem.upper())
+                    or EOL_RE.search(text) or NRND_RE.search(text)
+                    or c.get("discontinued") or c.get("end_of_life")):
+                continue
+            if mfr and c.get("manufacturer") and mfr.split()[0].lower() not in \
+                    c["manufacturer"].lower():
+                continue
+            if pkg and pkg.upper() not in (c.get("description") or "").upper():
+                continue
+            seen.add(m.upper())
+            out.append({"mpn": m, "source": name, "manufacturer": c.get("manufacturer", ""),
+                        "stock": c.get("stock"), "lifecycle": c.get("lifecycle", ""),
+                        "why": f"family {stem}" + (f", package {pkg}" if pkg else "")})
+            if len(out) >= limit:
+                break
+    return out
+
+
 def register(mcp) -> None:
     @mcp.tool()
     @on_board
@@ -258,8 +308,10 @@ def register(mcp) -> None:
                "dividers": div_changes, "rc_filters": rc_changes,
                "findings_new": fmt(fb - fa), "findings_gone": fmt(fa - fb)}
         if filters:
-            if not spice_auto.find_ngspice():
-                out["filters"] = "skipped: ngspice not on PATH"
+            from kicad_claude.adapters import spice_backends
+            sim = spice_backends.detect("auto")
+            if not sim:
+                out["filters"] = f"skipped: {spice_auto.NOSIM}"
             else:
                 freqs = sorted({k * f for f in (fsw or {}).values() for k in (1, 2, 3)})
 
@@ -269,7 +321,7 @@ def register(mcp) -> None:
                                             r["power"]["rail_voltages"].items()},
                         regulators=r["power"]["regulators"],
                         sources=connectivity_review.sourced_nets(nl), freqs=freqs,
-                        loads=loads or {})
+                        loads=loads or {}, sim=sim)
                     return {f"{x['input']} -> {x['output']}": x.get("response") or {}
                             for x in res.get("ladders", [])}
                 la, lb = ladders(base_nl, a), ladders(new_nl, b)
@@ -308,13 +360,30 @@ def register(mcp) -> None:
 
     @mcp.tool()
     def audit_lifecycle(sources: list[Source] | None = None, mpn_field: str = "MPN",
-                        max_parts: int = 200, netlist_path: str = "") -> dict:
+                        max_parts: int = 200, temp_range_c: list[float] | None = None,
+                        netlist_path: str = "") -> dict:
         """Lifecycle and stock of every MPN in the active schematic at each source
         in `sources` (exact MPN match, needs their API keys). Findings: LC-EOL
         (error), LC-NRND, LC-RESTRICTED, LC-STOCK (no stock anywhere),
-        LC-SINGLE, LC-DIST-DROP, LC-NOTFOUND.
+        LC-SINGLE, LC-DIST-DROP, LC-NOTFOUND; with `temp_range_c=[-40, 85]`
+        LC-TEMP (part range does not cover it) / LC-TEMP-NODATA.
 
         Details:
+
+        Temperature grade: each part's operating range from its extracted
+        datasheet (`recommended.T_A`, else `T_J`) or, failing that, the
+        distributor's operating-temperature field, classified commercial
+        (0..70) / industrial (-40..85) / extended (-40..105) / automotive
+        (-40..125) / military (-55..125) / non-standard. `temp_range_c`
+        given: LC-TEMP (warning) when a part's range does not cover it,
+        LC-TEMP-NODATA (info, one finding) for parts with no range.
+
+        Alternatives (LC-EOL / LC-NRND parts, `alternatives`): each source's
+        suggested replacement, then a search at the queried `sources` for the
+        MPN's family stem - same manufacturer, same package token in the
+        description when the original names one, not end of life / NRND -
+        with source, stock and lifecycle. Key electrical parameters are not
+        compared: check fit before replacing; nothing is replaced.
 
         Per MPN and source (exact MPN match only): lifecycle text (DigiKey
         `ProductStatus`, plus its Discontinued / EndOfLife flags; Mouser
@@ -331,14 +400,25 @@ def register(mcp) -> None:
         from kicad_claude.tools.common import project_netlist
         from kicad_claude.tools.sourcing.distributors import search_source, source_error
 
+        from kicad_claude.adapters import datasheet_index as dsi
+        from kicad_claude.adapters import datasheet_specs as dss
+        from kicad_claude.adapters import temp_grade
+
         names = clean(sources, ("digikey", "mouser", "farnell"))
+        if temp_range_c is not None and (len(temp_range_c) != 2
+                                         or temp_range_c[0] >= temp_range_c[1]):
+            raise ValueError("temp_range_c: [min C, max C], min < max")
+        try:
+            ds_dir = dsi.datasheets_dir(state.get_active().path)
+        except Exception:  # noqa: BLE001 - no active project: distributor data only
+            ds_dir = None
         nl = power_review.parse_netlist(project_netlist(netlist_path))
         mpns: dict[str, list[str]] = {}
         for ref, comp in nl.components.items():
             m = (comp["fields"].get(mpn_field) or "").strip()
             if m:
                 mpns.setdefault(m, []).append(ref)
-        findings, parts, errors = [], [], {}
+        findings, parts, errors, no_temp = [], [], {}, []
         for mpn in sorted(mpns)[:max_parts]:
             rec = {"mpn": mpn, "refs": sorted(mpns[mpn], key=design_diff._nat), "sources": {}}
             for name in names:
@@ -352,9 +432,24 @@ def register(mcp) -> None:
                     h = exact[0]
                     rec["sources"][name] = {k: h.get(k) for k in (
                         "lifecycle", "discontinued", "end_of_life", "suggested_replacement",
-                        "stock", "unit_price", "currency") if k in h}
+                        "stock", "unit_price", "currency", "operating_temp", "manufacturer",
+                        "description") if k in h}
             parts.append(rec)
             refs = ",".join(rec["refs"][:6])
+            spec = dss.load(ds_dir, mpn) if ds_dir else None
+            rng = temp_grade.from_specs(spec) or temp_grade.from_sources(rec["sources"])
+            if rng:
+                rec["temperature"] = {"min_c": rng[0], "max_c": rng[1], "source": rng[2],
+                                      "grade": temp_grade.classify(rng[0], rng[1])}
+            if temp_range_c is not None:
+                lo, hi = float(temp_range_c[0]), float(temp_range_c[1])
+                if not rng:
+                    no_temp.append((mpn, refs))
+                elif rng[0] > lo or rng[1] < hi:
+                    findings.append({"severity": "warning", "rule": "LC-TEMP", "ref": refs,
+                                     "message": f"{mpn}: rated {rng[0]:g}..{rng[1]:g} C "
+                                     f"({rec['temperature']['grade']}, {rng[2]}), does not "
+                                     f"cover the required {lo:g}..{hi:g} C."})
             texts = " | ".join(f"{s}: {v.get('lifecycle')}" for s, v in rec["sources"].items()
                                if v.get("lifecycle"))
             flags = any(v.get("discontinued") or v.get("end_of_life") for v in rec["sources"].values())
@@ -362,12 +457,18 @@ def register(mcp) -> None:
                 findings.append({"severity": "info", "rule": "LC-NOTFOUND", "ref": refs,
                                  "message": f"{mpn}: no exact match at {', '.join(names)}."})
                 continue
+            if flags or EOL_RE.search(texts) or NRND_RE.search(texts):
+                rec["alternatives"] = find_alternatives(mpn, rec["sources"], names,
+                                                        search_source, source_error)
+                alt = (f" Alternatives: {', '.join(a['mpn'] for a in rec['alternatives'])}"
+                       " (check fit before replacing)." if rec["alternatives"] else "")
             if flags or EOL_RE.search(texts):
                 findings.append({"severity": "error", "rule": "LC-EOL", "ref": refs,
-                                 "message": f"{mpn}: {texts or 'discontinued / end of life'}."})
+                                 "message": f"{mpn}: {texts or 'discontinued / end of life'}."
+                                 + alt})
             elif NRND_RE.search(texts):
                 findings.append({"severity": "warning", "rule": "LC-NRND", "ref": refs,
-                                 "message": f"{mpn}: {texts}."})
+                                 "message": f"{mpn}: {texts}." + alt})
             elif RESTRICT_RE.search(texts):
                 repl = [v.get("suggested_replacement") for v in rec["sources"].values()
                         if v.get("suggested_replacement")]
@@ -385,6 +486,13 @@ def register(mcp) -> None:
             elif len(stocked) == 1 and len(names) > 1:
                 findings.append({"severity": "info", "rule": "LC-SINGLE", "ref": refs,
                                  "message": f"{mpn}: in stock only at {stocked[0]}."})
+        if no_temp:
+            findings.append({"severity": "info", "rule": "LC-TEMP-NODATA",
+                             "ref": ",".join(r for _, r in no_temp[:8]),
+                             "message": f"No operating-temperature range for {len(no_temp)} "
+                             f"MPN(s): {', '.join(m for m, _ in no_temp[:8])}"
+                             f"{' ...' if len(no_temp) > 8 else ''} - extract "
+                             "recommended.T_A from their datasheets."})
         order = {"error": 0, "warning": 1, "info": 2}
         findings.sort(key=lambda f: (order[f["severity"]], f["rule"], f["ref"]))
         return {"parts": parts, "findings": findings, "lookup_errors": errors,
@@ -400,15 +508,37 @@ def register(mcp) -> None:
                         max_height_top_mm: float | None = None,
                         max_height_bottom_mm: float | None = None,
                         heights: bool = True,
-                        cross_verify: bool = True, netlist_path: str = "") -> dict:
+                        cross_verify: bool = True, dfm_preset: str = "",
+                        netlist_path: str = "") -> dict:
         """Assembly review of the active board plus schematic <-> PCB
         cross-verify: courtyard overlap, spacing and edge distance
         (`min_spacing_mm`, `edge_clearance_mm`), missing courtyards, SMD on an
         unpopulated side (`assembly_sides`), THT, fiducials, polarity and pin-1
         marks; `heights` from 3D models (`tall_mm`, `max_height_*_mm`); netlist
-        vs board. Rule IDs AS-*, XV-*. DNP parts skipped.
+        vs board. `dfm_preset` (a `list_fab_presets` name): DFM against
+        that fab + `dfm_score`. Rule IDs AS-*, XV-*, DFM-*. DNP skipped.
 
         Details:
+
+        DFM (`dfm_preset`): DRC checks the project's own rules; this checks
+        the copper against what the preset's fab can build. DFM-TRACK
+        (track < min_track_width), DFM-SPACING (two nets' tracks / pads /
+        vias on one layer < min_clearance), DFM-DRILL (via < min_via_drill,
+        plated hole < min_through_hole_diameter), DFM-VIA (< min_via_diameter),
+        DFM-RING (via ring < (min_via_diameter - min_via_drill) / 2), DFM-EDGE
+        (copper < min_copper_edge_clearance from Edge.Cuts) - errors;
+        DFM-VIA-IN-PAD (via in an SMD pad that is not an exposed pad),
+        DFM-SILK (silkscreen over a pad), DFM-MASK (mask web between a
+        footprint's pads below the preset's min_solder_mask_bridge or the
+        board's solder_mask_min_width; else listed in `not_checked`) -
+        warnings. `dfm_score` = 100 - 10 per error - 3 per warning (at most
+        30 / 15 per rule), with the deductions. Zones are left to DRC.
+
+        `complexity` (always): placements, unique parts, sides, THT,
+        fine-pitch (< 0.5 mm from the footprint name) and BGA / exposed-pad
+        parts, smallest passive, DNP count, and a 0-100 score with its
+        factors (package mix hard 80 / medium 40 / easy 10 per placement,
+        unique parts > 15, both sides, THT with SMD, fine pitch / BGA).
 
         Assembly: real courtyard outlines (non-convex ones too) that overlap
         (AS-CRTYD-OVERLAP; touching is fine) or sit closer than
@@ -441,6 +571,17 @@ def register(mcp) -> None:
                                              edge_clearance_mm, fiducials_min, tall_mm,
                                              tall_edge_mm, max_height_top_mm,
                                              max_height_bottom_mm, heights)
+        out["complexity"] = assembly_review.complexity(tree)
+        if dfm_preset:
+            from kicad_claude.adapters import dfm
+
+            res = dfm.analyze(tree, dfm_preset, _preset_rules(dfm_preset))
+            out["dfm"] = {k: v for k, v in res.items() if k != "findings"}
+            out["findings"] = out["findings"] + res["findings"]
+            order = {"error": 0, "warning": 1, "info": 2}
+            out["findings"].sort(key=lambda f: (order[f["severity"]], f["rule"], f["ref"]))
+            out["counts"] = {k: sum(1 for x in out["findings"] if x["severity"] == k)
+                             for k in order}
         if cross_verify:
             from kicad_claude.tools.common import project_netlist
             nl = power_review.parse_netlist(project_netlist(netlist_path))
@@ -453,12 +594,14 @@ def register(mcp) -> None:
     def fab_release_gate(preset: str = "", fab_dir: str = "",
                          rail_voltages: dict[str, float] | None = None,
                          require_mpn: bool = False, check_lifecycle: bool = False,
-                         assembly_sides: Literal["top", "bottom", "both"] = "top", netlist_path: str = "") -> dict:
+                         assembly_sides: Literal["top", "bottom", "both"] = "top",
+                         loads: dict[str, float] | None = None,
+                         netlist_path: str = "") -> dict:
         """One release verdict for the active project, FAB-READY or NOT FAB-READY,
         with blockers and warnings. Gates: ERC, DRC (no refill), power-tree and
-        connectivity errors, Gerber folder vs `preset`, BOM MPN coverage
-        (`require_mpn`), assembly review + cross-verify, optional lifecycle
-        audit. Warnings never block. Read-only.
+        connectivity errors, Gerber folder and DFM vs `preset`, BOM MPN
+        coverage (`require_mpn`), assembly + cross-verify, board thermal (with
+        `loads`), optional lifecycle audit. Warnings never block. Read-only.
 
         Details:
 
@@ -470,8 +613,11 @@ def register(mcp) -> None:
         `require_mpn`; test points, holes and DNP parts are exempt);
         `review_assembly` + cross-verify (their errors block: SMD on an
         unpopulated side, symbol pins without pads, parts missing from the
-        board); optionally `audit_lifecycle` (LC-EOL blocks). Warnings never
-        block.
+        board); with `preset` the DFM check of `review_assembly(dfm_preset=)`
+        (DFM-* errors block, `dfm_score` reported); with `loads` the board
+        thermal review of `analyze_board_thermal` (TH-TJ errors block - a Tj
+        above Tj max on a datasheet Rθ); optionally `audit_lifecycle` (LC-EOL
+        blocks). Warnings never block.
         Read-only.
         """
         from kicad_claude.tools.common import project_netlist
@@ -526,6 +672,30 @@ def register(mcp) -> None:
                 blockers.append(line)
             elif f["severity"] == "warning":
                 warnings.append(line)
+
+        def gate(name, res, keep=()):
+            gates[name] = {**res["counts"], **{k: res[k] for k in keep}}
+            for f in res["findings"]:
+                line = f"{f['rule']} {f['ref']}: {f['message'][:140]}"
+                if f["severity"] == "error":
+                    blockers.append(line)
+                elif f["severity"] == "warning":
+                    warnings.append(line)
+
+        if preset:
+            from kicad_claude.adapters import dfm
+
+            res = dfm.analyze(tree, preset, _preset_rules(preset))
+            gate("dfm", res, ("dfm_score", "not_checked"))
+        if loads:
+            from kicad_claude.adapters import board_thermal, part_ratings
+            from kicad_claude.tools.common import specs_by_ref
+
+            specs = specs_by_ref(nl)
+            ratings = part_ratings.check(nl, rev["power"], specs, loads)
+            gate("thermal", board_thermal.analyze(tree, nl, specs, ratings,
+                                                  ratings["assumptions"]["ambient_c"],
+                                                  ratings["assumptions"]["tj_margin_c"]))
 
         folder = _fab_dir(fab_dir)
         if folder.is_dir():

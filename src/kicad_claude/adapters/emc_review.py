@@ -773,6 +773,8 @@ def check_switching(b: Board, findings: list, regulators: list[dict], nl,
                                  "margin_db": round(lim[0] - dbuv, 1)}
                 rec["radiation_estimate"] = {"standard": standard, "load_current_a": i_load,
                                              "load_source": i_src, "worst": worst}
+                rec["envelope"] = {"fsw_hz": f, "duty": duty, "rise_time_s": rise_time_s,
+                                   "load_current_a": i_load, "loop_area_mm2": loop["area_mm2"]}
                 if worst:
                     findings.append(_f(
                         "warning" if worst["margin_db"] < 6 else "info", "EM-SW-RAD",
@@ -1400,6 +1402,105 @@ def test_plan(result: dict, standard: str) -> dict:
 GROUPS = ("ground", "switching", "decoupling", "io", "thermal")
 
 
+# ---- harmonic-limit screen ------------------------------------------------------ #
+
+HARMONIC_UNITS = ("dBuV/m", "dBuA")
+MAX_HARMONICS = 5000
+
+
+def validate_limit_profile(profile: dict) -> dict:
+    """A caller's limit profile: {"name", "unit": "dBuV/m" (radiated, with
+    "distance_m") | "dBuA" (harmonic current at the switch), "bands": [{"name",
+    "f_start_hz", "f_stop_hz", "limit_db", "limit_stop_db" (optional: the
+    limit slopes linearly in log f from start to stop)}]}. Raises ValueError
+    naming the first problem. No limit tables are shipped.
+    Ported in behaviour from kicad-happy 3.0.1 (MIT, © 2025 Andrew Klofas):
+    emc/scripts/analyze_harmonic_limits.py:validate_limit_profile."""
+    if not isinstance(profile, dict):
+        raise ValueError("harmonic_limits: an object {name, unit, bands, distance_m}")
+    name = profile.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("harmonic_limits.name: required (where the limits come from)")
+    unit = profile.get("unit")
+    if unit not in HARMONIC_UNITS:
+        raise ValueError(f"harmonic_limits.unit: {unit!r} not in {list(HARMONIC_UNITS)}")
+    dist = profile.get("distance_m")
+    if unit == "dBuV/m" and (isinstance(dist, bool) or not isinstance(dist, (int, float))
+                             or dist <= 0):
+        raise ValueError("harmonic_limits.distance_m: required for dBuV/m, > 0")
+    bands = profile.get("bands")
+    if not isinstance(bands, list) or not bands:
+        raise ValueError("harmonic_limits.bands: a non-empty list")
+    out = []
+    for i, b in enumerate(bands):
+        where = f"harmonic_limits.bands[{i}]"
+        if not isinstance(b, dict):
+            raise ValueError(f"{where}: an object")
+        try:
+            lo, hi, lim = float(b["f_start_hz"]), float(b["f_stop_hz"]), float(b["limit_db"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(f"{where}: f_start_hz, f_stop_hz and limit_db numbers ({e})") from e
+        if not 0 < lo < hi:
+            raise ValueError(f"{where}: 0 < f_start_hz < f_stop_hz")
+        stop = b.get("limit_stop_db")
+        if stop is not None and (isinstance(stop, bool) or not isinstance(stop, (int, float))):
+            raise ValueError(f"{where}.limit_stop_db: a number")
+        out.append({"name": str(b.get("name") or f"band {i + 1}"), "f_start_hz": lo,
+                    "f_stop_hz": hi, "limit_db": lim,
+                    "limit_stop_db": float(stop) if stop is not None else lim})
+    return {"name": name, "unit": unit, "distance_m": dist, "bands": out}
+
+
+def _limit_at(band: dict, f: float) -> float:
+    lo, hi = band["f_start_hz"], band["f_stop_hz"]
+    t = math.log(f / lo) / math.log(hi / lo)
+    return band["limit_db"] + (band["limit_stop_db"] - band["limit_db"]) * min(1.0, max(0.0, t))
+
+
+def screen_harmonics(switching: list[dict], profile: dict, findings: list) -> dict:
+    """Each switcher's trapezoid harmonic envelope (the one the radiation
+    estimate uses) against the caller's profile: worst margin per band.
+    dBuV/m: Ott's differential-mode E at the profile distance; dBuA: the
+    harmonic current amplitude. A screen, not a measurement."""
+    prof = validate_limit_profile(profile)
+    out = {}
+    for rec in switching or []:
+        env = rec.get("envelope")
+        if not env:
+            continue
+        f, rows = env["fsw_hz"], []
+        for band in prof["bands"]:
+            n0 = max(1, math.ceil(band["f_start_hz"] / f))
+            n1 = min(int(band["f_stop_hz"] // f), n0 + MAX_HARMONICS)
+            worst = None
+            for n in range(n0, n1 + 1):
+                fn = n * f
+                i_n = trapezoid_harmonic(n, env["load_current_a"], env["duty"],
+                                         env["rise_time_s"], f)
+                if prof["unit"] == "dBuA":
+                    level = 20 * math.log10(i_n * 1e6) if i_n > 0 else -999.0
+                else:
+                    e = K_DM_GROUND * fn ** 2 * env["loop_area_mm2"] * 1e-6 * i_n / prof["distance_m"]
+                    level = 20 * math.log10(e * 1e6) if e > 0 else -999.0
+                lim = _limit_at(band, fn)
+                if worst is None or lim - level < worst["margin_db"]:
+                    worst = {"band": band["name"], "harmonic": n, "f_hz": round(fn),
+                             "level": round(level, 1), "limit": round(lim, 1),
+                             "margin_db": round(lim - level, 1)}
+            rows.append(worst or {"band": band["name"], "margin_db": None,
+                                  "note": "no harmonic in the band"})
+            if worst and worst["margin_db"] < 0:
+                findings.append(_f("warning", "EM-HARM-LIMIT",
+                                   f"{rec['regulator']}: harmonic {worst['harmonic']} at "
+                                   f"{worst['f_hz'] / 1e6:.3g} MHz = {worst['level']} "
+                                   f"{prof['unit']} over {prof['name']} {band['name']} "
+                                   f"({worst['limit']}): {worst['margin_db']} dB. Screening "
+                                   "estimate only.", regulator=rec["regulator"]))
+        out[rec["regulator"]] = rows
+    return {"profile": prof["name"], "unit": prof["unit"], "distance_m": prof["distance_m"],
+            "screening_only": True, "regulators": out}
+
+
 def analyze(tree: list, groups: tuple[str, ...] = GROUPS, f_max_hz: float = 200e6,
             stitch_spacing_mm: float | None = None, resolution_mm: float = 0.5,
             power: dict | None = None, nl=None, specs: dict | None = None,
@@ -1407,11 +1508,14 @@ def analyze(tree: list, groups: tuple[str, ...] = GROUPS, f_max_hz: float = 200e
             standard: str = "fcc-class-b", rise_time_s: float = 10e-9,
             decap_max_mm: float = 3.0, cap_via_max_mm: float = 1.5, pdn: dict | None = None,
             edge_keepout_mm: float = 1.0, esd_max_mm: float = 10.0,
-            diff_skew_ps: float = 25.0, plan: bool = True) -> dict:
+            diff_skew_ps: float = 25.0, plan: bool = True,
+            harmonic_limits: dict | None = None) -> dict:
     """`power`: an `analyze_power_tree` result and `nl` its Netlist (needed by
     the switching and decoupling groups); `specs`: {ref: spec record}."""
     if standard not in LIMITS:
         raise ValueError(f"standard must be one of {sorted(LIMITS)}")
+    if harmonic_limits is not None:
+        validate_limit_profile(harmonic_limits)          # fail before the slow part
     b = load_board(tree, resolution_mm)
     findings: list[dict] = []
     result: dict = {"resolution_mm": resolution_mm, "board_area_mm2":
@@ -1432,6 +1536,9 @@ def analyze(tree: list, groups: tuple[str, ...] = GROUPS, f_max_hz: float = 200e
             result["switching"] = check_switching(b, findings, power["regulators"], nl, volts,
                                                   fsw or {}, iout or {}, specs or {}, standard,
                                                   rise_time_s)
+            if harmonic_limits is not None:
+                result["harmonic_screen"] = screen_harmonics(result["switching"],
+                                                             harmonic_limits, findings)
     if "decoupling" in groups:
         volts = {k: v["volts"] for k, v in (power or {}).get("rail_voltages", {}).items()}
         if nl is None:
