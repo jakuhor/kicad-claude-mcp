@@ -41,7 +41,7 @@ from kicad_claude.adapters import pcb_editor
 from kicad_claude.adapters.board_thermal import exposed_pads
 from kicad_claude.adapters.pcb_geometry import board_outline_loops
 from kicad_claude.adapters.pcb_netlist import _footprint_rotation, pad_to_board_xy
-from kicad_claude.adapters.sch_io import find_child, find_children, is_call, property_name_index
+from kicad_claude.adapters.sch_io import find_child, find_children, is_call
 
 ERROR_POINTS, WARNING_POINTS = 10, 3
 ERROR_CAP, WARNING_CAP = 30, 15
@@ -95,11 +95,7 @@ def board_items(tree: list) -> dict:
                              "layers": [str(x) for x in (lays[1:] if lays else ["F.Cu", "B.Cu"])],
                              "net": pcb_editor.net_of(n, tree) or ""})
         elif is_call(n, "footprint"):
-            ref = ""
-            for prop in find_children(n, "property"):
-                i = property_name_index(prop)
-                if len(prop) > i + 1 and str(prop[i]) == "Reference":
-                    ref = str(prop[i + 1])
+            ref = pcb_editor.get_footprint_reference(n) or ""
             fx, fy, fa = _footprint_rotation(n)
             fpads = []
             for pad in find_children(n, "pad"):

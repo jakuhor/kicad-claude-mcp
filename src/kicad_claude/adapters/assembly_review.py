@@ -75,6 +75,11 @@ def footprints(tree: list) -> list[dict]:
         attr = find_child(fp, "attr")
         attrs = {str(a) for a in (attr or [])[1:]}
         props = {str(p[1]): str(p[2]) for p in find_children(fp, "property") if len(p) >= 3}
+        if "Value" not in props:                   # a footprint text instead of a property
+            from kicad_claude.adapters.pcb_editor import get_fp_text
+            v = get_fp_text(fp, "value")
+            if v is not None:
+                props["Value"] = v
         crt, silk, segs, silk_pts = [], 0, [], []
         for g in fp[1:]:
             if not isinstance(g, list) or not g or str(g[0]) not in (

@@ -134,14 +134,7 @@ def list_pads(tree: list) -> list[dict]:
     for fp in tree[1:]:
         if not is_call(fp, "footprint"):
             continue
-        ref = None
-        for prop in find_children(fp, "property"):
-            from kicad_claude.adapters.sch_io import property_name_index
-
-            i = property_name_index(prop)
-            if len(prop) > i + 1 and prop[i] == "Reference":
-                ref = str(prop[i + 1])
-                break
+        ref = pcb_editor.get_footprint_reference(fp)
         fx, fy, fa = _footprint_rotation(fp)
         fp_layer_node = find_child(fp, "layer")
         fp_layer = fp_layer_node[1] if fp_layer_node and len(fp_layer_node) > 1 else "F.Cu"

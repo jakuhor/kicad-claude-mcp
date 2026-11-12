@@ -841,9 +841,12 @@ def mounting_inductance(tree: list, caps: list[str]) -> dict[str, dict]:
         # dielectrics[j] sits between layers[j] and layers[j + 1]
         h, found = 0.0, None
         down = k < len(b.layers) - 1
+
+        def diel(i):            # a board with no stackup has no dielectrics: no estimate
+            return b.dielectrics[i] if 0 <= i < len(b.dielectrics) else {}
         j = k
         while 0 <= (j + 1 if down else j - 1) < len(b.layers):
-            d = b.dielectrics[j] if down else b.dielectrics[j - 1]
+            d = diel(j) if down else diel(j - 1)
             j = j + 1 if down else j - 1
             h += d.get("thickness_mm") or 0.0
             if roles.get(b.layers[j]) == "ground_plane":
@@ -855,8 +858,8 @@ def mounting_inductance(tree: list, caps: list[str]) -> dict[str, dict]:
         # pad -> via: a ground track that starts at the pad and ends at the
         # via (single segment), else the pour, modelled as a strip of the
         # pad's width over the plane below the cap's layer
-        h_strip = b.dielectrics[k]["thickness_mm"] if down and b.dielectrics[k].get("thickness_mm") \
-            else (b.dielectrics[k - 1].get("thickness_mm") if k else None) or h
+        h_strip = diel(k)["thickness_mm"] if down and diel(k).get("thickness_mm") \
+            else (diel(k - 1).get("thickness_mm") if k else None) or h
         track = None
         for t in tracks_by_layer.get(layer, []):
             ends = (t["start"], t["end"])

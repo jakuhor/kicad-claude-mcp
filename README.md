@@ -6,7 +6,7 @@
 > review against the parts' datasheets, sourcing, manufacturing outputs,
 > signal-integrity calculations, RF design, and more.
 
-**143 MCP tools in 11 on-demand sets · 913 tests (844 fast, 63 acceptance, 6 network) · headless from idea to gerbers**
+**143 MCP tools in 11 on-demand sets · 915 tests (846 fast, 63 acceptance, 6 network) · headless from idea to gerbers**
 
 The server edits `.kicad_sch` / `.kicad_pcb` / `.kicad_pro` files directly, in
 KiCAD 10's own formatting — one added wire is a ten-line git diff, not a
@@ -347,6 +347,7 @@ Runs on the board's real filled copper: every zone's filled polygons are rasteri
 | `EM-GND-ISLAND` | warning | Ground copper island with no via or pad |
 | `EM-GND-DOMAINS` | info | Ground nets and the parts joining them |
 | `EM-SPLIT-CROSS` | warning | Signal crosses a change of reference-plane net, no bridging cap within 5 mm |
+| `EM-REF-GAP` | warning / info | Signal track with no copper on its reference layer under it (nearest adjacent poured layer; both neighbours within 2× dielectric). One per net with ≥ 1 mm of gap, whole board; antipads at vias / through-hole pads skipped; warning for clock / high-speed nets or a stretch ≥ 5 mm |
 | `EM-VIA-STITCH` | warning / info | Signal or supply via whose layer change moves the return current to another plane (each layer's reference: the nearest adjacent pour at the via; both neighbours only when their dielectrics are within 2×, as in a stripline). Same plane net: no via of that net reaching both plane layers within 2× the first dielectric, at least 1 mm. Different plane nets (GND / +5V, GND / GND_USB): no capacitor between them within 5 mm. One per net; warning for clock / high-speed signals, info otherwise |
 | `EM-STITCH` | warning | < 90 % of the overlapping ground area within λ/40 of a ground via |
 | `EM-EDGE-GND` | warning / info | Ground copper covers < 70 % / < 90 % of the board edge |
@@ -514,7 +515,7 @@ kicad-claude-mcp/
 │   ├── indexer/                       # KiCAD library indexing (~10 MB cache)
 │   ├── templates/                     # blank project / sheet / PCB
 │   └── utils/                         # logging, geometry (mm, grid snap), paths
-├── tests/                             # 844 fast + 63 acceptance + 6 network tests
+├── tests/                             # 846 fast + 63 acceptance + 6 network tests
 └── docs/open_points.md                # the open-items queue
 ```
 
@@ -539,7 +540,7 @@ Open work and new field reports live in [`docs/open_points.md`](./docs/open_poin
 
 ```bash
 uv run mcp dev server.py                          # MCP Inspector (browser UI)
-uv run pytest -m "not slow and not network" -q    # 844 fast tests, ~1 min
+uv run pytest -m "not slow and not network" -q    # 846 fast tests, ~1 min
 uv run pytest -m "slow" -q                        # 63 acceptance tests via kicad-cli (~8 min)
 uv run pytest -m "network" -q                     # 6 live distributor tests
 ```

@@ -249,7 +249,11 @@ def register(mcp) -> None:
             layer (EM-STACK-REF), floating ground islands (EM-GND-ISLAND),
             ground nets and the parts joining them (EM-GND-DOMAINS), signals
             crossing a change of reference-plane net without a bridging cap
-            (EM-SPLIT-CROSS), signal and supply vias whose layer change moves
+            (EM-SPLIT-CROSS), signal tracks with no copper on their reference
+            layer under them - nearest adjacent poured layer, both within 2x
+            dielectric; via / through-hole antipads skipped (EM-REF-GAP, one
+            per net >= 1 mm; warning for clock / high-speed or a 5 mm
+            stretch; `reference_gaps`), signal and supply vias whose layer change moves
             the return current to another plane (each layer's nearest adjacent
             pour; both only within 2x dielectric): same plane net needs a via
             of that net reaching both planes within 2x the first dielectric,

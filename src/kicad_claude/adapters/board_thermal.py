@@ -39,7 +39,7 @@ from kicad_claude.adapters import datasheet_specs as dss
 from kicad_claude.adapters import derating as drt
 from kicad_claude.adapters import pcb_editor, thermal_pkg
 from kicad_claude.adapters.pcb_netlist import _footprint_rotation, pad_to_board_xy
-from kicad_claude.adapters.sch_io import find_child, find_children, is_call, property_name_index
+from kicad_claude.adapters.sch_io import find_child, find_children, is_call
 
 CORRECTION = {"good": 0.50, "adequate": 0.65, "insufficient": 0.80, "none": 1.0}
 VIA_POWER_W = 0.5         # TH-VIAS only for parts above this dissipation
@@ -53,11 +53,7 @@ def _f(sev: str, rule: str, ref: str, msg: str, **kw) -> dict:
 
 
 def _ref(fp: list) -> str:
-    for prop in find_children(fp, "property"):
-        i = property_name_index(prop)
-        if len(prop) > i + 1 and str(prop[i]) == "Reference":
-            return str(prop[i + 1])
-    return ""
+    return pcb_editor.get_footprint_reference(fp) or ""
 
 
 def footprints(tree: list) -> dict[str, dict]:

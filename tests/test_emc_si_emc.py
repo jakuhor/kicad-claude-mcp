@@ -295,6 +295,24 @@ def test_via_stitch_supply_nets_and_plane_nets():
     assert "EM-VIA-STITCH" not in by_rule(r)
 
 
+def test_reference_gap():
+    # OP-19 / kicad-happy GP-001: In1 GND with a 4 mm slot at x 18..22
+    plane = (zone("GND", "In1.Cu", 0, 0, 18, 20), zone("GND", "In1.Cu", 22, 0, 40, 20))
+    r = er.analyze(board(*plane, seg(5, 10, 35, 10, "SIG"), seg(5, 5, 35, 5, "SCLK"),
+                         seg(5, 15, 15, 15, "OK")), ("ground",), plan=False)
+    gaps = {g["net"]: g for g in r["ground"]["reference_gaps"]}
+    assert set(gaps) == {"SIG", "SCLK"}                      # OK never leaves the plane
+    assert gaps["SIG"]["gap_mm"] == pytest.approx(4, abs=0.6) and gaps["SIG"]["reference"] == "In1.Cu"
+    sev = {f["net"]: f["severity"] for f in by_rule(r)["EM-REF-GAP"]}
+    assert sev == {"SCLK": "warning", "SIG": "info"}           # clock, or a gap >= 5 mm
+    # a 6 mm slot is a warning on any signal; a via's antipad is not a gap
+    wide = (zone("GND", "In1.Cu", 0, 0, 17, 20), zone("GND", "In1.Cu", 23, 0, 40, 20))
+    f = by_rule(er.analyze(board(*wide, seg(5, 10, 35, 10, "SIG")), ("ground",), plan=False))
+    assert f["EM-REF-GAP"][0]["severity"] == "warning"
+    tree = board(zone("GND", "In1.Cu", 0, 0, 40, 20), seg(5, 10, 20, 10, "SIG"), via(20, 10, "SIG"))
+    assert er.analyze(tree, ("ground",), plan=False)["ground"]["reference_gaps"] == []
+
+
 def test_fsw_from_rt_strap():
     hint = {"typ": 1.8e6, "conditions": "RT = 46.4k"}
     nl = _nl([("U2", "5", "RT", "passive", "RTN"), ("R28", "1", "", "passive", "RTN"),
@@ -472,3 +490,16 @@ def test_thermal_group():
     f = by_rule(r)
     assert "read the MPN's DC-bias curve" in f["EM-TH-BIAS"][0]["message"]
     assert [x["ref"] for x in f["EM-TH-FERRITE"]] == ["FB1"]
+
+
+def test_decoupling_on_a_board_without_stackup(tmp_path):
+    # a board saved without (stackup): the mounting-inductance estimate is skipped, not a crash
+    p = tmp_path / "n.kicad_pcb"
+    p.write_text(f'(kicad_pcb (version 20260206) {LAYERS} '
+                 '(gr_rect (start 0 0) (end 40 20) (layer "Edge.Cuts")) '
+                 + zone("GND", "In1.Cu", 0, 0, 40, 20) + " "
+                 + fp("C1", 11, 11, [("1", 0, 0, "+3V3"), ("2", 1, 0, "GND")], "100n") + " "
+                 + via(12.2, 11, "GND") + ")", encoding="utf-8")
+    r = er.analyze(sch_io.parse_file(p), ("decoupling",), plan=False)
+    bank = r["decoupling"]["banks"]["+3V3"]
+    assert "mounting inductance (0/1)" in bank["z_profile_basis"]

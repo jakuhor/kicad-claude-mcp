@@ -144,7 +144,7 @@ def register(mcp) -> None:
         `ground_nets`: net lists (defaults: non-power nets / ground-named
         nets); `adjacent_only` (default) checks only neighbouring layers;
         `end_clearance_mm` ignores via ends; `max_segments_to_check` caps the
-        work.
+        work. For the whole board, per net, use analyze_emc (EM-REF-GAP).
 
         Details:
 

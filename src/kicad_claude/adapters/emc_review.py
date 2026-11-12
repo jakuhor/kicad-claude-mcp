@@ -228,7 +228,8 @@ def _footprints(tree: list) -> list[dict]:
             if len(p) >= 3:
                 props[str(p[1])] = str(p[2])
         out.append({"ref": pcb_editor.get_footprint_reference(fp) or "?",
-                    "value": props.get("Value", ""), "lib": lib, "fields": props,
+                    "value": props.get("Value") or pcb_editor.get_fp_text(fp, "value") or "",
+                    "lib": lib, "fields": props,
                     "x": float(at[1]) if at else 0.0, "y": float(at[2]) if at else 0.0,
                     "side": str(layer[1]) if layer else "F.Cu",
                     "dnp": find_child(fp, "dnp") is not None
@@ -384,6 +385,21 @@ def check_ground_stackup(b: Board, findings: list, f_max_hz: float,
                            + ". Check the join is the intended single point and that no "
                            "signal crosses the boundary (EM-SPLIT-CROSS).", ground_nets=gnets))
 
+    # signal tracks over a gap in their reference plane
+    gaps = _ref_gaps(b)
+    for g in gaps[:30]:
+        sev = "warning" if _fast(g["net"]) or g["longest_gap_mm"] >= REF_GAP_WARN_MM else "info"
+        findings.append(_f(sev, "EM-REF-GAP",
+                           f"Net {g['net']}: {g['gap_mm']} of {g['length_mm']} mm of track "
+                           f"({100 - g['coverage_pct']:.0f} %) runs with no copper on its reference "
+                           f"layer {g['reference']}; longest stretch {g['longest_gap_mm']} mm from "
+                           f"({g['at'][0]}, {g['at'][1]}). The return current detours around "
+                           "the gap: fill it or reroute.", net=g["net"],
+                           gap_mm=g["gap_mm"], coverage_pct=g["coverage_pct"]))
+    if len(gaps) > 30:
+        findings.append(_f("info", "EM-REF-GAP", f"{len(gaps) - 30} more nets run over reference "
+                           "gaps (see `ground.reference_gaps`)."))
+
     # signal crossing a change of reference-plane net
     crossings = _split_crossings(b, roles)
     for c in crossings:
@@ -448,7 +464,8 @@ def check_ground_stackup(b: Board, findings: list, f_max_hz: float,
 
     return {"layers": roles, "planes": planes, "dielectrics": b.dielectrics,
             "ground_nets": gnets, "ground_joins": joins, "islands": islands,
-            "split_crossings": crossings, "via_transitions": trans, "stitching": stitch,
+            "split_crossings": crossings, "reference_gaps": gaps, "via_transitions": trans,
+            "stitching": stitch,
             "edge": edge,
             "connectors": conn}
 
@@ -501,6 +518,83 @@ def _split_crossings(b: Board, roles: list[dict]) -> list[dict]:
                                     "from": prev[0], "to": net, "at": [round(x, 2), round(y, 2)]})
                 prev = (net, x, y)
     return out
+
+
+REF_GAP_MIN_MM = 1.0        # EM-REF-GAP: less than this per net is ignored
+REF_GAP_WARN_MM = 5.0       # ... a gap this long is a warning on any signal
+
+
+def _track_refs(b: Board) -> dict[str, list[str]]:
+    """Per copper layer, the layers its tracks return on: the nearest
+    adjacent layer that carries a pour anywhere; both neighbours only when
+    their dielectrics are within 2x (a stripline), and when a thickness is
+    unknown."""
+    poured = {ly for ly, nets in b.fill.items() if nets}
+    out = {}
+    for k, ly in enumerate(b.layers):
+        cand = []
+        for n in (k - 1, k + 1):
+            if 0 <= n < len(b.layers) and b.layers[n] in poured:
+                d = b.dielectrics[min(k, n)] if min(k, n) < len(b.dielectrics) else {}
+                cand.append((b.layers[n], d.get("thickness_mm")))
+        th = [t for _, t in cand if t]
+        if len(th) == len(cand) and th:
+            cand = [c for c in cand if c[1] <= 2 * min(th)]
+        out[ly] = [c[0] for c in cand]
+    return out
+
+
+def _ref_gaps(b: Board) -> list[dict]:
+    """Signal track length with no copper under it on its reference layer(s),
+    per net, sampled at the grid resolution. Points within 0.6 mm of a via or
+    through-hole pad are skipped: a plane's antipad there is not a gap."""
+    refs = _track_refs(b)
+    holes = [v["point"] for v in b.vias] + [p["point"] for p in b.pads if len(p["layers"]) > 1]
+    cell = 2.0
+    bucket = defaultdict(list)
+    for x, y in holes:
+        bucket[(int(x // cell), int(y // cell))].append((x, y))
+
+    def near_hole(x, y):
+        bx, by = int(x // cell), int(y // cell)
+        return any(math.dist((x, y), h) <= 0.6 for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                   for h in bucket.get((bx + dx, by + dy), []))
+    per = defaultdict(lambda: {"length_mm": 0.0, "gap_mm": 0.0, "worst": None, "layers": set()})
+    step = b.grid.res
+    for t in b.tracks:
+        net, rl = t["net_name"], refs.get(t["layer"]) or []
+        if not is_signal_net(net) or not rl:
+            continue
+        (xa, ya), (xb, yb) = t["start"], t["end"]
+        length = math.dist(t["start"], t["end"])
+        n = max(1, int(length / step))
+        rec = per[net]
+        rec["length_mm"] += length
+        run, run_at = 0.0, None
+        for k in range(n):
+            f = (k + 0.5) / n
+            x, y = xa + (xb - xa) * f, ya + (yb - ya) * f
+            if near_hole(x, y):
+                continue
+            if not any(b.net_at(r, x, y) for r in rl):
+                rec["gap_mm"] += length / n
+                rec["layers"].add(t["layer"])
+                run += length / n
+                run_at = run_at or (round(x, 2), round(y, 2))
+            else:
+                run, run_at = 0.0, None
+            if run and (rec["worst"] is None or run > rec["worst"][0]):
+                rec["worst"] = (round(run, 2), run_at, "/".join(rl))
+    out = []
+    for net, r in per.items():
+        if r["gap_mm"] < REF_GAP_MIN_MM:
+            continue
+        out.append({"net": net, "length_mm": round(r["length_mm"], 1),
+                    "gap_mm": round(r["gap_mm"], 1),
+                    "coverage_pct": round(100 * (1 - r["gap_mm"] / r["length_mm"]), 1),
+                    "longest_gap_mm": r["worst"][0], "at": list(r["worst"][1]),
+                    "reference": r["worst"][2], "layers": sorted(r["layers"])})
+    return sorted(out, key=lambda g: -g["gap_mm"])
 
 
 def _plane_net_near(b: Board, layer: str, pt: tuple, r0: float) -> str | None:
