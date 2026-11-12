@@ -373,16 +373,51 @@ def solve(nl: Netlist, known: dict, specs: dict | None = None,
     zs = zeners(nl, specs)
     clamps_def = [{"kind": "pin", **pm} for pm in pms if "clamp" in pm] + \
                  [{"kind": "zener", **z} for z in zs]
-    # A node carrying a supply pin or a connector pin is held by a source the
-    # model does not know (a USB-PD contract behind a load switch, a bench
-    # input). Tied to ground only through dividers and pin currents, it would
-    # solve to a few mV and fail every VIN / EN check, so such a group stays
-    # unsolved unless it also reaches a known non-ground node.
+    # Nets the resistor network cannot determine:
+    # - source-like: held by a source of unknown value (a power_out pin, a
+    #   regulator input, a connector that brings in a supply). No resistor
+    #   network sets their voltage, so a group holding one is never solved;
+    #   an EN divider from such a rail with its tap pulled to +3V3 would
+    #   otherwise put the rail at a made-up mid voltage.
+    # - load-like: a supply pin or connector pin that only consumes (AVDD fed
+    #   through a filter resistor). Solved when the group reaches a known
+    #   non-ground node; tied to ground only, it would solve to a few mV.
     gnd_g = uf.find(gnd)
-    supply_like = {uf.find(p.net) for ps in nl.pins.values() for p in ps
-                   if not is_ground(p.net) and not is_unconnected(p.net)
-                   and (p.type.split("+")[0] in ("power_in", "power_out")
-                        or kind(p.ref) in ("J", "P", "CN"))}
+    from kicad_claude.adapters.power_review import detect_regulators
+    reg_in = {(r["ref"], p.number) for r in detect_regulators(nl)
+              for p in r["roles"].get("vin", [])}
+    feeds_ic = {p.net for ps in nl.pins.values() for p in ps
+                if p.type.split("+")[0] == "power_in" and kind(p.ref) in ("U", "IC")}
+    source_like, supply_like, reg_vin, reg_fed = set(), set(), set(), set()
+    for ps in nl.pins.values():
+        for p in ps:
+            if is_ground(p.net) or is_unconnected(p.net):
+                continue
+            t = p.type.split("+")[0]
+            conn = kind(p.ref) in ("J", "P", "CN")
+            if t == "power_out" or (conn and p.net in feeds_ic):
+                source_like.add(uf.find(p.net))
+            elif (p.ref, p.number) in reg_in:
+                reg_vin.add(uf.find(p.net))
+            elif t == "power_in" or conn:
+                supply_like.add(uf.find(p.net))
+    # a regulator input draws mA: only a series resistor of <= 100 ohm from a
+    # known rail can be its supply path (an LDO behind an RC filter); fed by
+    # nothing else it is held by a source outside the model
+    known_live = {uf.find(n) for n in known if not is_ground(n)} | {
+        g for g in val if g != gnd_g}
+    for ref, c in nl.components.items():
+        if kind(ref) != "R" or not _fitted(nl, ref):
+            continue
+        ps = nl.pins.get(ref, [])
+        v = parse_value(c.get("value", ""))
+        if len(ps) == 2 and v is not None and v <= 100:
+            a, b = uf.find(ps[0].net), uf.find(ps[1].net)
+            for x, y in ((a, b), (b, a)):
+                if x in reg_vin and y in known_live:
+                    reg_fed.add(x)
+    source_like |= reg_vin - reg_fed
+    supply_like |= reg_vin & reg_fed
 
     def run():
         fixed: dict[str, tuple[float, str]] = {}
@@ -419,7 +454,8 @@ def solve(nl: Netlist, known: dict, specs: dict | None = None,
                     elif y not in seen:
                         seen.add(y)
                         stack.append(y)
-            if touches and (live or not any(m in supply_like for m in members)):
+            if touches and not any(m in source_like for m in members) and (
+                    live or not any(m in supply_like for m in members)):
                 for m in members:
                     comp[m] = True
         idx = {g: i for i, g in enumerate(sorted(comp))}

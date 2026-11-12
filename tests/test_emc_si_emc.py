@@ -270,7 +270,8 @@ def test_via_layer_change_stitching():
     r = er.analyze(board(zone("GND", "In1.Cu", 0, 0, 40, 20), zone("GND", "B.Cu", 0, 0, 40, 20),
                          *sig2), ("ground",), plan=False)
     st = by_rule(r)["EM-VIA-STITCH"]
-    assert len(st) == 1 and "B.Cu / In1.Cu" in st[0]["message"]
+    assert len(st) == 1 and "In1.Cu / B.Cu" in st[0]["message"]
+    assert "2.4 mm" in st[0]["message"]           # 2x the In1-B spacing (1.0 + 0.2 mm)
 
 
 def test_via_stitch_supply_nets_and_plane_nets():
@@ -283,7 +284,7 @@ def test_via_stitch_supply_nets_and_plane_nets():
     # GND above, +5V below: no via can join them, a cap between the nets can
     gp = (zone("GND", "In1.Cu", 0, 0, 40, 20), zone("+5V", "In2.Cu", 0, 0, 40, 20))
     st = by_rule(er.analyze(board(*gp, *sig("SCLK")), ("ground",), plan=False))["EM-VIA-STITCH"]
-    assert "stitching capacitor" in st[0]["message"]
+    assert "add a capacitor between the two plane nets" in st[0]["message"]
     cap = fp("C1", 22, 10, [("1", 0, 0, "+5V"), ("2", 1, 0, "GND")], "100n")
     r = er.analyze(board(*gp, *sig("SCLK"), cap), ("ground",), plan=False)
     assert "EM-VIA-STITCH" not in by_rule(r)
@@ -302,15 +303,74 @@ def test_reference_gap():
                          seg(5, 15, 15, 15, "OK")), ("ground",), plan=False)
     gaps = {g["net"]: g for g in r["ground"]["reference_gaps"]}
     assert set(gaps) == {"SIG", "SCLK"}                      # OK never leaves the plane
-    assert gaps["SIG"]["gap_mm"] == pytest.approx(4, abs=0.6) and gaps["SIG"]["reference"] == "In1.Cu"
+    assert gaps["SIG"]["longest_gap_mm"] == pytest.approx(4, abs=0.6)
+    assert gaps["SIG"]["layer"] == "F.Cu" and gaps["SIG"]["reference_mm"] == 0.2
     sev = {f["net"]: f["severity"] for f in by_rule(r)["EM-REF-GAP"]}
-    assert sev == {"SCLK": "warning", "SIG": "info"}           # clock, or a gap >= 5 mm
-    # a 6 mm slot is a warning on any signal; a via's antipad is not a gap
+    assert sev == {"SCLK": "warning", "SIG": "info"}           # clock, or a stretch >= 5 mm
+    # a 6 mm slot is a warning on any signal 0.2 mm above its plane;
+    # a via's antipad is not a gap
     wide = (zone("GND", "In1.Cu", 0, 0, 17, 20), zone("GND", "In1.Cu", 23, 0, 40, 20))
     f = by_rule(er.analyze(board(*wide, seg(5, 10, 35, 10, "SIG")), ("ground",), plan=False))
     assert f["EM-REF-GAP"][0]["severity"] == "warning"
     tree = board(zone("GND", "In1.Cu", 0, 0, 40, 20), seg(5, 10, 20, 10, "SIG"), via(20, 10, "SIG"))
     assert er.analyze(tree, ("ground",), plan=False)["ground"]["reference_gaps"] == []
+
+
+def test_reference_gap_physics():
+    # OP-20 #5-12
+    slot = (zone("GND", "In1.Cu", 0, 0, 18, 20), zone("GND", "In1.Cu", 22, 0, 40, 20))
+
+    def gaps(*items):
+        r = er.analyze(board(*items), ("ground",), plan=False)
+        return {g["net"]: g for g in r["ground"]["reference_gaps"]}, by_rule(r)
+    # the 4 mm gap measured whole although the track is cut into 1 mm segments
+    pieces = [seg(x, 10, x + 1, 10, "SIG") for x in range(5, 35)]
+    g, _ = gaps(*slot, *pieces)
+    assert g["SIG"]["longest_gap_mm"] == pytest.approx(4, abs=0.6)
+    # a signal-net pour under the slot is no reference; a GND pour there is
+    g, _ = gaps(*slot, zone("SIG2", "In1.Cu", 18, 0, 22, 20), seg(5, 10, 35, 10, "SIG"))
+    assert "SIG" in g
+    g, _ = gaps(*slot, zone("GND", "In1.Cu", 18, 0, 22, 20), seg(5, 10, 35, 10, "SIG"))
+    assert "SIG" not in g
+    # In2.Cu track: B.Cu GND under the In1 slot is a local reference
+    g, _ = gaps(*slot, zone("GND", "B.Cu", 0, 0, 40, 20), seg(5, 10, 35, 10, "SIG", layer="In2.Cu"))
+    assert "SIG" not in g
+    # a supply trace over the gap is listed as info
+    g, f = gaps(*slot, seg(5, 10, 35, 10, "+3V3"))
+    assert g["+3V3"]["kind"] == "supply" and f["EM-REF-GAP"][0]["severity"] == "info"
+    # four 0.5 mm nicks add up to 2 mm but no stretch reaches the 1 mm floor
+    nicks = [zone("GND", "In1.Cu", x, 0, x + 4.5, 20) for x in (0, 5, 10, 15, 20)]
+    g, _ = gaps(*nicks, seg(2, 10, 24, 10, "SIG"))
+    assert "SIG" not in g
+
+
+def test_via_stitch_fanout_tht_own_net_and_split():
+    # OP-20 #15-18
+    g = (zone("GND", "In1.Cu", 0, 0, 40, 20), zone("GND", "In2.Cu", 0, 0, 40, 20))
+    # via in an SMD pad on F.Cu, track only on B.Cu: still a layer change
+    pad = fp("C1", 20, 10, [("1", 0, 0, "SIG"), ("2", 1, 0, "GND")], "100n")
+    r = er.analyze(board(*g, pad, seg(20, 10, 35, 10, "SIG", layer="B.Cu"), via(20, 10, "SIG")),
+                   ("ground",), plan=False)
+    assert [t["layers"] for t in r["ground"]["via_transitions"]] == [["F.Cu", "B.Cu"]]
+    # a through-hole connector pin: top in, bottom out
+    tht = ('(footprint "Conn:Pin" (layer "F.Cu") (at 20 10) (property "Reference" "J1") '
+           '(pad "1" thru_hole circle (at 0 0) (size 1.7 1.7) (drill 1.0) (layers "*.Cu") '
+           '(net "SIG")))')
+    r = er.analyze(board(*g, tht, seg(5, 10, 20, 10, "SIG"), seg(20, 10, 35, 10, "SIG",
+                                                                 layer="B.Cu")),
+                   ("ground",), plan=False)
+    assert [t["via"] for t in r["ground"]["via_transitions"]] == ["J1.1"]
+    # a +5V via landing in a +5V pour on In1: its own plane is no reference for it
+    own = (zone("+5V", "In1.Cu", 0, 0, 40, 20), zone("GND", "In2.Cu", 0, 0, 40, 20))
+    r = er.analyze(board(*own, seg(5, 10, 20, 10, "+5V"), seg(20, 10, 35, 10, "+5V", layer="B.Cu"),
+                         via(20, 10, "+5V")), ("ground",), plan=False)
+    assert all("+5V" not in t["reference_nets"] for t in r["ground"]["via_transitions"])
+    # GND above, GND_ISO below: a split, not a capacitor to add
+    iso = (zone("GND", "In1.Cu", 0, 0, 40, 20), zone("GND_ISO", "In2.Cu", 0, 0, 40, 20))
+    r = er.analyze(board(*iso, seg(5, 10, 20, 10, "SIG"), seg(20, 10, 35, 10, "SIG", layer="B.Cu"),
+                         via(20, 10, "SIG")), ("ground",), plan=False)
+    m = by_rule(r)["EM-VIA-STITCH"][0]["message"]
+    assert "two ground nets" in m and "non-safety" in m
 
 
 def test_fsw_from_rt_strap():
@@ -333,6 +393,15 @@ def test_fsw_from_rt_strap():
     nl2.components = {}
     assert er.fsw_from_strap(nl2, "U1", floating)[0] == 5e5
     assert er.fsw_from_strap(nl, "U2", floating) is None    # a resistor is fitted
+    # OP-20 #43-44: "SYNC floating, RT = 46.4k" asks for the resistor, not a floating RT;
+    # a SYNCOUT pin and an EN/SYNC tied to a rail drive no clock in
+    assert er.fsw_from_strap(nl2, "U1", {"typ": 5e5, "conditions": "SYNC floating, RT = 46.4k"})         is None
+    nl_o = _nl([("U2", "5", "RT", "passive", "RTN"), ("R28", "1", "", "passive", "RTN"),
+                ("R28", "2", "", "passive", "GND"), ("U2", "6", "SYNCOUT", "output", "CLKO"),
+                ("U9", "3", "IN", "input", "CLKO"), ("U2", "7", "EN/SYNC", "input", "+5V"),
+                ("U8", "2", "VOUT", "power_out", "+5V")])
+    nl_o.components = {"R28": {"value": "46.4k"}}
+    assert er.fsw_from_strap(nl_o, "U2", hint)[0] == 1.8e6
 
 
 def test_decoupling_group():
@@ -362,7 +431,8 @@ def test_decoupling_group():
     # OP-18: impedance profile with no target; 100 kHz is the capacitive asymptote
     assert set(bank["z_profile_ohm"]) == {"100000", "1e+06", "1e+07", "1e+08"}
     assert bank["z_profile_ohm"]["100000"] == pytest.approx(1 / (2 * math.pi * 1e5 * 1e-7), rel=0.01)
-    assert "mounting inductance" in bank["z_profile_basis"]
+    assert "ESR missing" in bank["z_profile_basis"]          # no datasheet ESR here
+    assert bank["z_profile_ohm"]["1e+08"] is None               # above 0.3x resonance: unknown
     assert "z_profile_ohm" in d["banks"]["VIO"]                  # no pdn target for VIO
     assert bank["z_target_ohm"] == pytest.approx(3.3 * 0.03 / 0.1)
     assert bank["meets_target_above_hz"] == round(1 / (2 * math.pi * 1e-7 * bank["z_target_ohm"]))
@@ -502,4 +572,69 @@ def test_decoupling_on_a_board_without_stackup(tmp_path):
                  + via(12.2, 11, "GND") + ")", encoding="utf-8")
     r = er.analyze(sch_io.parse_file(p), ("decoupling",), plan=False)
     bank = r["decoupling"]["banks"]["+3V3"]
-    assert "mounting inductance (0/1)" in bank["z_profile_basis"]
+    assert "L missing" in bank["z_profile_basis"]
+    assert set(bank["z_profile_ohm"].values()) == {None} and bank["z_capacitive_ohm"]["100000"]
+
+
+def test_net_classes_by_token():
+    # OP-20 #22: active-low names are no diff pairs, USB CC no data line,
+    # a rail name with a control token is a signal (kicad-happy KH-518)
+    nets = frozenset({"/LVDS_P", "/LVDS_N"})
+    fast = {n: er.is_fast_net(n, nets) for n in (
+        "RESET_N", "/CS_N", "/USB_CC_2", "NEWS", "/PROG_SWCLK", "/USB_D-", "/LVDS_P", "METHOD")}
+    assert fast == {"RESET_N": False, "/CS_N": False, "/USB_CC_2": False, "NEWS": False,
+                    "/PROG_SWCLK": True, "/USB_D-": True, "/LVDS_P": True, "METHOD": False}
+    power = {n: er.is_power_net(n) for n in ("VBUS_FET_EN", "VIN_SENSE", "/PG_20V", "VBUS_MAX",
+                                             "+3V3", "/VBUS_+20V", "VCC_3V3_PERIPH")}
+    assert power == {"VBUS_FET_EN": False, "VIN_SENSE": False, "/PG_20V": False,
+                     "VBUS_MAX": False, "+3V3": True, "/VBUS_+20V": True,
+                     "VCC_3V3_PERIPH": True}
+
+
+def test_z_profile_levels():
+    # OP-20 #23-24: full sum only with ESR and L for every cap
+    full = er._z_profile([("C1", 1e-7, 0.01, 5e-10)], {"C1": 5e-10})
+    f_res = 1 / (2 * math.pi * math.sqrt(1e-9 * 1e-7))
+    assert full["z_profile_ohm"]["1e+08"] is not None and "full" in full["z_profile_basis"]
+    # at resonance only the ESR is left
+    at = er._z_profile([("C1", 1e-7, 0.01, 1e-9)], {})
+    assert at["lowest_resonance_hz"] == round(f_res)
+    no_esr = er._z_profile([("C1", 1e-7, None, 1e-9)], {})
+    assert no_esr["z_profile_ohm"]["100000"] == no_esr["z_capacitive_ohm"]["100000"]
+    assert no_esr["z_profile_ohm"]["1e+07"] is None            # 10 MHz > 0.3 x 15.9 MHz
+
+
+def test_mounting_inductance_counts_the_supply_side():
+    # OP-20 #25: cap with a GND via and a +3V3 via into a +3V3 plane on In2
+    from kicad_claude.adapters import spice_auto
+    tree = board(zone("GND", "In1.Cu", 0, 0, 40, 20), zone("+3V3", "In2.Cu", 0, 0, 40, 20),
+                 fp("C1", 10, 10, [("1", 0, 0, "+3V3"), ("2", 1, 0, "GND")], "100n"),
+                 via(11.6, 10, "GND"), via(9.4, 10, "+3V3"))
+    m = spice_auto.mounting_inductance(tree, ["C1"])["C1"]
+    assert m["supply_side"]["plane"] == "In2.Cu" and not m["sides_missing"]
+    assert m["l_h"] == pytest.approx(m["ground_side"]["l_h"] + m["supply_side"]["l_h"])
+    tree = board(zone("GND", "In1.Cu", 0, 0, 40, 20),
+                 fp("C1", 10, 10, [("1", 0, 0, "+3V3"), ("2", 1, 0, "GND")], "100n"),
+                 via(11.6, 10, "GND"))
+    m = spice_auto.mounting_inductance(tree, ["C1"])["C1"]
+    assert m["supply_side"] is None and "supply (+3V3)" in m["sides_missing"][0]
+
+
+def test_fsw_range_from_the_datasheet():
+    # OP-20 #45: the strap uses the typical frequency and carries the min / max
+    tree = board(zone("GND", "In1.Cu", 0, 0, 40, 20),
+                 fp("U2", 10, 10, [("1", 0, 0, "VIN"), ("2", 0, 1, "SW"), ("5", 0, 2, "RTN")], "BUCK"),
+                 fp("R28", 14, 12, [("1", 0, 0, "RTN"), ("2", 1, 0, "GND")], "46.4k"))
+    nl = _nl([("U2", "1", "VIN", "power_in", "VIN"), ("U2", "2", "SW", "output", "SW"),
+              ("U2", "5", "RT", "passive", "RTN"), ("R28", "1", "", "passive", "RTN"),
+              ("R28", "2", "", "passive", "GND")])
+    nl.components = {"U2": {"value": "BUCK"}, "R28": {"value": "46.4k"}}
+    power = {"regulators": [{"topology": "switching", "name": "U2", "ref": "U2", "value": "BUCK",
+                             "channel": None,
+                             "input_net": "VIN", "output_net": "OUT", "switch_net": "SW",
+                             "inductor": None}], "rail_voltages": {}}
+    specs = {"U2": {"mpn": "M", "regulator": {"fsw": {"typ": 1.8e6, "min": 1.6e6, "max": 2.0e6,
+                                                      "conditions": "RT = 46.4k", "page": 3}}}}
+    r = er.analyze(tree, ("switching",), power=power, nl=nl, specs=specs, plan=False)
+    sw = r["switching"][0]
+    assert sw["fsw_range_hz"] == [1.6e6, 2.0e6] and "R28 46.4k" in sw["fsw_source"]

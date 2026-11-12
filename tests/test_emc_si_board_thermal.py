@@ -11,12 +11,16 @@ from kicad_claude.adapters import board_thermal as bt
 from kicad_claude.adapters import sch_io
 
 
-def _qfn(x, y, n_vias, drill=0.3):
+EP_GND = '(pad "17" smd rect (at 0 0) (size 1.7 1.7) (layers "F.Cu") (net "GND"))'
+
+
+def _qfn(x, y, n_vias, drill=0.3, ep=EP_GND, fp_extra=""):
+    """A QFN-16 U1 with `n_vias` board vias under its exposed pad; `ep` is
+    the exposed-pad text, `fp_extra` more pads inside the footprint."""
     sig = " ".join(f'(pad "{i}" smd rect (at {-1.5 + 0.5 * (i % 4)} {-1.5 if i < 8 else 1.5}) '
                    f'(size 0.25 0.8) (layers "F.Cu") (net "S{i}"))' for i in range(16))
-    ep = '(pad "17" smd rect (at 0 0) (size 1.7 1.7) (layers "F.Cu") (net "GND"))'
     fp = (f'(footprint "Package_DFN_QFN:QFN-16-1EP_3x3mm_P0.5mm_EP1.7x1.7mm" (layer "F.Cu") '
-          f'(at {x} {y}) (property "Reference" "U1") {sig} {ep})')
+          f'(at {x} {y}) (property "Reference" "U1") {sig} {ep} {fp_extra})')
     grid = [(x + dx, y + dy) for dx in (-0.6, 0, 0.6) for dy in (-0.6, 0, 0.6)][:n_vias]
     vs = " ".join(f'(via (at {vx} {vy}) (size 0.6) (drill {drill}) (layers "F.Cu" "B.Cu") '
                   f'(net "GND"))' for vx, vy in grid)
@@ -29,9 +33,9 @@ def _cap(ref, x, y, lib="Capacitor_SMD:C_0603_1608Metric"):
             f'(pad "2" smd rect (at 0.8 0) (size 0.8 0.9) (layers "F.Cu") (net "GND")))')
 
 
-def _board(tmp_path, n_vias, extra=""):
+def _board(tmp_path, n_vias, extra="", **qfn):
     text = ('(kicad_pcb (version 20260206) (layers (0 "F.Cu" signal) (2 "B.Cu" signal)) '
-            + _qfn(20, 20, n_vias) + " " + extra + ")")
+            + _qfn(20, 20, n_vias, **qfn) + " " + extra + ")")
     p = tmp_path / "t.kicad_pcb"
     p.write_text(text, encoding="utf-8")
     return sch_io.parse_file(p)
@@ -126,11 +130,8 @@ def test_thermal_via_footprint_counts_its_own_holes(tmp_path):
     holes = " ".join(f'(pad "17" thru_hole circle (at {dx} {dy}) (size 0.5 0.5) (drill 0.3) '
                      f'(layers "*.Cu") (net "GND"))'
                      for dx in (-0.6, 0, 0.6) for dy in (-0.6, 0, 0.6))
-    _board(tmp_path, 0)                                   # writes t.kicad_pcb
-    p = tmp_path / "t.kicad_pcb"
-    p.write_text(p.read_text(encoding="utf-8").replace(
-        '(net "GND"))', '(net "GND")) ' + holes, 1), encoding="utf-8")
-    row = _run(sch_io.parse_file(p))["parts"][0]
+    tree = _board(tmp_path, 0, fp_extra=holes)
+    row = _run(tree)["parts"][0]
     assert row["exposed_pads"][0]["vias"] == 9 and row["exposed_pads"][0]["adequacy"] == "good"
 
 
@@ -148,13 +149,38 @@ def test_low_power_exposed_pad_vias_are_info(tmp_path):
 
 def test_split_exposed_pad_is_one_row(tmp_path):
     # two copper pads with the EP number (firbox U2 pad 29): one row, areas added
-    _board(tmp_path, 9)
-    p = tmp_path / "t.kicad_pcb"
-    p.write_text(p.read_text(encoding="utf-8").replace(
-        '(pad "17" smd rect (at 0 0) (size 1.7 1.7) (layers "F.Cu") (net "GND"))',
-        '(pad "17" smd rect (at 0 -0.45) (size 1.7 0.85) (layers "F.Cu") (net "GND")) '
-        '(pad "17" smd rect (at 0 0.45) (size 1.7 0.85) (layers "F.Cu") (net "GND"))'),
-        encoding="utf-8")
-    ep = [e for e in _run(sch_io.parse_file(p))["parts"][0]["exposed_pads"] if e["pad"] == "17"]
+    split = ('(pad "17" smd rect (at 0 -0.45) (size 1.7 0.85) (layers "F.Cu") (net "GND")) '
+             '(pad "17" smd rect (at 0 0.45) (size 1.7 0.85) (layers "F.Cu") (net "GND"))')
+    tree = _board(tmp_path, 9, ep=split)
+    ep = [e for e in _run(tree)["parts"][0]["exposed_pads"] if e["pad"] == "17"]
     assert len(ep) == 1 and ep[0]["area_mm2"] == pytest.approx(2.89, abs=0.02)
     assert ep[0]["vias"] == 9                  # union of both halves, none twice
+
+
+def test_far_side_copy_of_the_exposed_pad_adds_no_area(tmp_path):
+    # OP-20 #2 (firbox U2): the EP also drawn on B.Cu is the far end of the vias
+    far = '(pad "17" smd rect (at 0 0) (size 1.7 1.7) (layers "B.Cu") (net "GND"))'
+    tree = _board(tmp_path, 9, fp_extra=far)
+    ep = [e for e in _run(tree)["parts"][0]["exposed_pads"] if e["pad"] == "17"]
+    assert ep[0]["area_mm2"] == pytest.approx(2.89) and ep[0]["adequacy"] == "good"
+
+
+def test_thermal_via_info_needs_a_thermal_pad_and_hot_caps_use_board_temperature(tmp_path):
+    # OP-20 #28: an EP on a switch node gets no via-field advice
+    tree = _board(tmp_path, 0, ep=EP_GND.replace('"GND"', '"SW"'))
+    r = bt.analyze(tree, _nl(), {}, {"dissipation": []}, 25.0, 25.0)
+    assert r["low_power_vias"] == []
+    # OP-20 #29: electrolytic near a 50 K junction rise, no psi_jb: info only;
+    # with psi_jb = 30 C/W the board under the part is 20 K up: warning
+    caps = [("C3", "100u", "electrolytic")]
+    extra = _cap("C3", 20, 25, "Capacitor_SMD:CP_Elec_6.3x5.8")
+    r = _run(_board(tmp_path, 0, extra), nl=_nl(caps))
+    assert [f["severity"] for f in r["findings"] if f["rule"] == "TH-ELCO-HOT"] == ["info"]
+    psi = {"U1": {"mpn": "B", "thermal": {"psi_jb": {"typ": 30, "unit": "C/W", "page": 4}}}}
+    r = _run(_board(tmp_path, 0, extra), psi, _nl(caps))
+    elco = [f for f in r["findings"] if f["rule"] == "TH-ELCO-HOT"]
+    assert elco[0]["severity"] == "warning" and "up to 20 K" in elco[0]["message"]
+    # OP-20 #30: the public pad_vias result serialises
+    import json
+    json.dumps(bt.pad_vias({"number": "1", "net": "GND", "x": 0, "y": 0, "w": 1, "h": 1,
+                            "angle": 0}, [{"x": 0, "y": 0, "drill": 0.3, "net": "GND"}]))

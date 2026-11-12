@@ -138,24 +138,35 @@ def parse_netlist(path: Path) -> Netlist:
     return nl
 
 
-_SUPPLY_NAME = re.compile(r"^(A|D|P|IO)?V(CC|DD|IN|BAT|IO|S\+|\+)\w*$|^(A|D|P)?(GND|VSS|VEE)\w*$",
-                          re.I)
+# Supply pin names. VIN alone (or VIN_<word>) is a supply; VIN1, VINP, VINN,
+# VIN+ are a converter's / amplifier's signal inputs and are left alone.
+SUPPLY_PIN_RE = re.compile(
+    r"^(A|D|P|IO|PV|AV|DV)?V(CC|DD)\w*$"
+    r"|^(A|D|P|PV)?VIN(_(?![NPM]$)\w+)?$"
+    r"|^V(BAT|IO|PP|M|S)(\d*|_\w+)?$|^VS?\+$", re.I)
+# not VEE (an op-amp's V- may sit on GND) and not VBUS (a USB bridge's VBUS
+# pin is a sense input, wired to a detect or EN net)
+GROUND_PIN_NAME_RE = re.compile(r"^(A|D|P|S|E)?GND\w*$|^(A|D)?VSS\w*$", re.I)
 
 
 def _infer_untyped_supply_pins(nl: Netlist) -> None:
     """A vendor symbol (SnapEDA, Ultra Librarian) often types every pin
     passive, so no supply check would see its VCC. For an IC whose pins are
-    all passive, pins named like a supply or ground become power_in; the
-    component records `pin_types: "inferred"`. Typed symbols are untouched."""
+    all passive and that has both a supply-named and a ground-named pin,
+    those pins become power_in; the component records
+    `pin_types: "inferred"`. Typed symbols are untouched."""
     for ref, pins in nl.pins.items():
         if not re.match(r"(U|IC)\d", ref) or not pins:
             continue
         if any(p.type not in ("passive", "") for p in pins):
             continue
-        hit = [p for p in pins if _SUPPLY_NAME.match(p.name or "")]
-        for p in hit:
+        sup = [p for p in pins if SUPPLY_PIN_RE.match(p.name or "")]
+        gnd = [p for p in pins if GROUND_PIN_NAME_RE.match(p.name or "")]
+        if not sup or not gnd:
+            continue
+        for p in sup + gnd:
             p.type = "power_in"
-        if hit and ref in nl.components:
+        if ref in nl.components:
             nl.components[ref]["pin_types"] = "inferred"
 
 

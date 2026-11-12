@@ -33,6 +33,7 @@ from collections import defaultdict
 
 from kicad_claude.adapters import power_review
 from kicad_claude.adapters.power_review import (
+    SUPPLY_PIN_RE,
     Netlist,
     Pin,
     detect_regulators,
@@ -47,7 +48,6 @@ PASSIVE_KINDS = {"R", "C", "L", "FB", "FL", "D", "TP", "J", "P", "CN", "SW",
 DRIVER_TYPES = {"output", "power_out", "bidirectional", "tri_state"}
 LINK_KINDS = {"L", "FB", "FL", "R", "D"}
 GND_PIN_RE = re.compile(r"^(A|D|P|S|E)?GND\d*$|^EP$|^EPAD$|^PAD$|^THERMAL", re.I)
-SUPPLY_PIN_RE = re.compile(r"^(A|D|P|IO)?V(CC|DD|IN|BAT|IO|S\+|\+)\w*$", re.I)
 ADDR_PIN_RE = re.compile(r"^(A\d|ADDR\d*|ADD\d|AD\d|SA\d|ADR\d*|ADDR/\w+)$", re.I)
 _I2C_SPLIT = re.compile(r"[_/\s.-]")
 

@@ -207,6 +207,36 @@ class TestUnknownSupplies:
         assert volts["EN"][0] == pytest.approx(20 * 100 / 1530 + 1e-6 * 1430e3 * 100 / 1530,
                                                rel=1e-6)
 
+    def test_unknown_rail_with_divider_tap_pulled_to_a_known_rail(self, tmp_path):
+        # OP-20 #1: EN tap also pulled to +3V3 (a PG pull-up for sequencing):
+        # the unknown VIN must not be solved to a mid voltage through R1 / R3
+        comps = [_comp("U1", "TPS62933"), _comp("R1", "1430k"), _comp("R2", "100k"),
+                 _comp("R3", "100k"), _comp("L1", "10u"), _comp("C1", "10u")]
+        nets = [_net(1, "VIN", ("U1", "1", "VIN", "power_in"), ("R1", "1", "", "passive")),
+                _net(2, "EN", ("U1", "2", "EN", "input"), ("R1", "2", "", "passive"),
+                     ("R2", "1", "", "passive"), ("R3", "1", "", "passive")),
+                _net(3, "+3V3", ("R3", "2", "", "passive")),
+                _net(4, "SW", ("U1", "3", "SW", "output"), ("L1", "1", "", "passive")),
+                _net(5, "OUT", ("L1", "2", "", "passive"), ("C1", "1", "", "passive")),
+                _net(6, "GND", ("U1", "9", "GND", "power_in"), ("R2", "2", "", "passive"),
+                     ("C1", "2", "", "passive"))]
+        nl = _nl(tmp_path, comps, nets)
+        assert any(r["ref"] == "U1" for r in pr.detect_regulators(nl))
+        volts = dc_model.solve(nl, {"+3V3": (3.3, "c")}, {})["volts"]
+        assert "VIN" not in volts and "EN" not in volts
+
+    def test_ldo_behind_a_filter_resistor_is_solved(self, tmp_path):
+        # a regulator input fed from a known rail through <= 100 ohm keeps its voltage
+        comps = [_comp("U1", "LDO"), _comp("R1", "10"), _comp("R2", "100k")]
+        nets = [_net(1, "+5V", ("R1", "1", "", "passive")),
+                _net(2, "VIN", ("R1", "2", "", "passive"), ("U1", "1", "VIN", "power_in"),
+                     ("R2", "1", "", "passive")),
+                _net(3, "VOUT", ("U1", "5", "VOUT", "power_out")),
+                _net(4, "GND", ("U1", "2", "GND", "power_in"), ("R2", "2", "", "passive"))]
+        nl = _nl(tmp_path, comps, nets)
+        volts = dc_model.solve(nl, {"+5V": (5.0, "c")}, {})["volts"]
+        assert volts["VIN"][0] == pytest.approx(5 * 100e3 / 100010, rel=1e-6)
+
     def test_led_string_stops_at_unknown_rail(self, tmp_path):
         nl = self._board(tmp_path)
         specs = {"D3": {"mpn": "L", "category": "led",
@@ -233,3 +263,46 @@ def test_all_passive_vendor_symbol_gets_supply_pins(tmp_path):
     assert types[("IC5", "VCC")] == types[("IC5", "VSS")] == "power_in"
     assert types[("IC5", "C")] == "passive" and nl.components["IC5"]["pin_types"] == "inferred"
     assert types[("U2", "VCC")] == "passive"          # a typed symbol is left alone
+
+
+def test_inference_leaves_converter_inputs_alone(tmp_path):
+    # OP-20 #4: an all-passive ADC: VINP / VINN are signal inputs, only VDD / GND are supplies;
+    # a part with no ground-named pin is not touched at all
+    comps = [_comp("U3", "ADC"), _comp("U4", "SENSOR")]
+    nets = [_net(1, "AIN_P", ("U3", "1", "VINP", "passive")),
+            _net(2, "AIN_N", ("U3", "2", "VINN", "passive")),
+            _net(3, "+3V3", ("U3", "3", "VDD", "passive"), ("U4", "1", "VCC", "passive")),
+            _net(4, "GND", ("U3", "4", "GND", "passive")),
+            _net(5, "OUT", ("U4", "2", "OUT", "passive")),
+            _net(6, "VB_DET", ("U3", "5", "VBUS", "passive"))]
+    nl = _nl(tmp_path, comps, nets)
+    types = {(p.ref, p.name): p.type for ps in nl.pins.values() for p in ps}
+    assert types[("U3", "VDD")] == types[("U3", "GND")] == "power_in"
+    assert types[("U3", "VBUS")] == "passive"                 # a sense pin on USB bridges
+    assert types[("U3", "VINP")] == types[("U3", "VINN")] == "passive"
+    assert types[("U4", "VCC")] == "passive" and "pin_types" not in nl.components["U4"]
+
+
+def test_led_walk_stops_at_a_branch_and_names_a_loop(tmp_path):
+    # OP-20 #46: the node above the LED also feeds R2 to another net: a branch
+    comps = [_comp("D1", "RED", lib="Device:LED"), _comp("R1", "1k"), _comp("R2", "1k"),
+             _comp("R3", "10k")]
+    nets = [_net(1, "+5V", ("R1", "1", "", "passive")),
+            _net(2, "A", ("R1", "2", "", "passive"), ("R2", "1", "", "passive"),
+                 ("R3", "1", "", "passive")),
+            _net(3, "B", ("R3", "2", "", "passive"), ("D1", "2", "A", "passive")),
+            _net(4, "X", ("R2", "2", "", "passive")),
+            _net(5, "GND", ("D1", "1", "K", "passive"))]
+    specs = {"D1": {"mpn": "L", "category": "led",
+                    "electrical": {"VF": {"typ": 1.9, "unit": "V", "page": 1}}}}
+    f: list = []
+    rows = part_ratings.check_leds(_nl(tmp_path, comps, nets), specs, {"+5V": 5.0}, f,
+                                   lambda *a: None)
+    assert "branch" in rows[0]["status"] and not f
+    # OP-20 #47: both ends on one net
+    comps = [_comp("D1", "RED", lib="Device:LED"), _comp("R1", "1k")]
+    nets = [_net(1, "GND", ("R1", "1", "", "passive"), ("D1", "1", "K", "passive")),
+            _net(2, "A", ("R1", "2", "", "passive"), ("D1", "2", "A", "passive"))]
+    rows = part_ratings.check_leds(_nl(tmp_path, comps, nets, name="l.net"), specs, {"GND": 0.0},
+                                   f, lambda *a: None)
+    assert rows[0]["status"] == "string returns to GND: no supply across it"

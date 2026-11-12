@@ -55,6 +55,12 @@ def _fab_dir(fab_dir: str) -> Path:
     return proj.path / "fab" / "gerbers"
 
 
+def _dru_text(board) -> str | None:
+    """The board's custom DRC rules (`<board>.kicad_dru`), if any."""
+    p = Path(board).with_suffix(".kicad_dru")
+    return p.read_text(encoding="utf-8") if p.is_file() else None
+
+
 def _preset_rules(preset: str) -> dict | None:
     if not preset:
         return None
@@ -302,6 +308,10 @@ def register(mcp) -> None:
         cb = {x["node"]: x["fc_hz"] for x in b["subcircuits"].get("rc_filters", [])}
         rc_changes = [{"node": n, "fc_hz": [ca.get(n), cb.get(n)]}
                       for n in sorted(set(ca) | set(cb)) if ca.get(n) != cb.get(n)]
+        ha = {x["node"]: x["fc_hz"] for x in a["subcircuits"].get("rc_highpass", [])}
+        hb = {x["node"]: x["fc_hz"] for x in b["subcircuits"].get("rc_highpass", [])}
+        rc_changes += [{"node": n, "kind": "high-pass", "fc_hz": [ha.get(n), hb.get(n)]}
+                       for n in sorted(set(ha) | set(hb)) if ha.get(n) != hb.get(n)]
         fa, fb = fkeys(a), fkeys(b)
         fmt = lambda s: [{"rule": r, "ref": ref, "message": m} for r, ref, m in sorted(s)]  # noqa: E731
         out = {"applied": applied, "regulators": reg_changes, "rails": rail_changes,
@@ -550,10 +560,11 @@ def register(mcp) -> None:
         info when SMD parts sit on both), through-hole parts (AS-THT), fiducials per populated
         side (AS-FIDUCIAL), test-point coverage and supply rails without a
         test point (AS-TESTPOINT, info; `testpoints`), 0201 / 0402 passives
-        with one pad joined solid to a pour (or on a via in pad into a
-        plane) and the other on a track
-        (AS-TOMBSTONE, warning; thermal reliefs are not reported), two-pad
-        passives off the side's majority angle (AS-ORIENT, info, at >= 10 %),
+        with one pad joined solid to a pour (or on a via in pad landing in
+        its net's pour) and the other on a track (AS-TOMBSTONE, warning) or
+        a relief (info), or track widths > 3x apart (info); reliefs on both
+        pads are not reported; a .kicad_dru zone_connection rule is stated;
+        per-side passive orientation as data (`orientation`),
         polarized parts with no silkscreen of their own
         (AS-SILK-POLARITY) or no mark nearer pad 1 than the other pads
         (AS-PIN1-MARK: pin-1 dot, cathode bar, chamfer). DNP parts are skipped.
@@ -573,11 +584,12 @@ def register(mcp) -> None:
         """
         if assembly_sides not in ("auto", "top", "bottom", "both"):
             raise ValueError("assembly_sides must be auto, top, bottom or both")
-        tree = sch_io.parse_file(state.get_active_board_path())
+        board = state.get_active_board_path()
+        tree = sch_io.parse_file(board)
         out = assembly_review.check_assembly(tree, assembly_sides, min_spacing_mm,
                                              edge_clearance_mm, fiducials_min, tall_mm,
                                              tall_edge_mm, max_height_top_mm,
-                                             max_height_bottom_mm, heights)
+                                             max_height_bottom_mm, heights, _dru_text(board))
         out["complexity"] = assembly_review.complexity(tree)
         if dfm_preset:
             from kicad_claude.adapters import dfm
@@ -668,8 +680,16 @@ def register(mcp) -> None:
             (blockers if require_mpn else warnings).append(
                 f"BOM: {len(no_mpn)} fitted part(s) without MPN: {', '.join(no_mpn[:20])}")
 
-        tree = sch_io.parse_file(state.get_active_board_path())
-        asm = assembly_review.check_assembly(tree, assembly_sides)
+        board = state.get_active_board_path()
+        tree = sch_io.parse_file(board)
+        asm = assembly_review.check_assembly(tree, assembly_sides, dru_text=_dru_text(board))
+        if assembly_sides == "auto":
+            # the gate cannot know the assembler: a second SMD side must be confirmed
+            both = [f for f in asm["findings"] if f["rule"] == "AS-SIDE"]
+            if both:
+                warnings.append(f"AS-SIDE: {both[0]['message'][:140]} Confirm the assembler "
+                                "populates both sides (assembly_sides=\"both\"), else they "
+                                "are blockers.")
         xv = assembly_review.cross_verify(tree, nl)
         gates["assembly"] = asm["counts"]
         gates["cross_verify"] = xv["counts"]

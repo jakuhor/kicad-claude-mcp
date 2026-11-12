@@ -39,11 +39,13 @@ from kicad_claude.adapters import datasheet_specs as dss
 from kicad_claude.adapters import derating as drt
 from kicad_claude.adapters import pcb_editor, thermal_pkg
 from kicad_claude.adapters.pcb_netlist import _footprint_rotation, pad_to_board_xy
+from kicad_claude.adapters.pcb_geometry import is_ground_net
 from kicad_claude.adapters.sch_io import find_child, find_children, is_call
 
 CORRECTION = {"good": 0.50, "adequate": 0.65, "insufficient": 0.80, "none": 1.0}
 VIA_POWER_W = 0.5         # TH-VIAS only for parts above this dissipation
 HOT_RISE_K = 20.0         # TH-MLCC-HOT / TH-ELCO-HOT source threshold
+LOW_POWER_PAD_MM2 = 2.0   # TH-VIAS info: smaller pads are no thermal pads
 HOT_DIST_MM = 10.0
 _CLASS2 = ("X5R", "X7R", "X6S", "X7S", "X8R", "Y5V", "Z5U")
 
@@ -105,9 +107,14 @@ def vias(tree: list) -> list[dict]:
 
 def exposed_pads(fp: dict) -> list[dict]:
     """Thermal / exposed pads: SMD copper pads numbered EP / 0 / "", or at
-    least 3x the median area of the footprint's other SMD pads."""
+    least 3x the median area of the footprint's other SMD pads. Only pads on
+    the footprint's own copper side: a same-number pad on the far side
+    (`_ThermalVias` footprints) is the far end of the via field, not more
+    pad area."""
+    side = fp.get("layer")
     smd = [p for p in fp["pads"] if p["type"] == "smd" and p["w"] * p["h"] > 0
-           and any(x.endswith(".Cu") for x in p["layers"])]
+           and any(x.endswith(".Cu") for x in p["layers"])
+           and (side is None or side in p["layers"])]
     if len(smd) < 3:
         return []
     out = []
@@ -125,6 +132,13 @@ def _recommended(area: float) -> tuple[int, int]:
 
 
 def pad_vias(pad: dict, all_vias: list[dict]) -> dict:
+    """Public form of `_pad_vias` (no internal via ids)."""
+    out = _pad_vias(pad, all_vias)
+    out.pop("_via_ids", None)
+    return out
+
+
+def _pad_vias(pad: dict, all_vias: list[dict]) -> dict:
     """Vias inside 1.5x the pad's (rotated) box on its net: count, drill-
     weighted count Σ(d / 0.3 mm)², and adequacy against the recommended
     count for the pad area (< 10 mm²: 5 / 9, < 25 mm²: 9 / 16, else 0.5 /
@@ -207,7 +221,7 @@ def analyze(tree: list, nl, specs: dict, ratings: dict, ambient_c: float,
         # a "_ThermalVias" footprint carries its vias as plated holes of its own
         own = [{"x": p["x"], "y": p["y"], "drill": p["drill"] or 0.3, "net": p["net"]}
                for p in fp["pads"] if p["type"] == "thru_hole" and p.get("drill")]
-        ep = sorted(_merge_split_pads([pad_vias(p, all_vias + own) for p in eps]),
+        ep = sorted(_merge_split_pads([_pad_vias(p, all_vias + own) for p in eps]),
                     key=lambda e: -e["area_mm2"])
         adequacy = ep[0]["adequacy"] if ep else None      # the main (largest) pad
         if rth:
@@ -227,6 +241,11 @@ def analyze(tree: list, nl, specs: dict, ratings: dict, ambient_c: float,
                        tj_c=round(ambient_c + rise, 1))
         if tjm:
             row["tj_max"] = tjm[0]
+        # the board under the part: Tj - psi_jb * P (psi_jb, else Rth_jb)
+        psi = dss.rated(rec, "thermal", "psi_jb", "rth_jb", prefer="typ")
+        if row.get("rise_k") is not None and psi:
+            row["board_rise_k"] = round(max(0.0, row["rise_k"] - p_w * psi[0]), 2)
+            row["board_rise_source"] = f"Tj - psi_jb x P ({rec.get('mpn')} p.{psi[1]})"
         parts.append(row)
         assumed = src == thermal_pkg.ASSUMED
         if rth_v is not None and tjm and ref[:1] != "R":
@@ -253,6 +272,7 @@ def analyze(tree: list, nl, specs: dict, ratings: dict, ambient_c: float,
                                "recommended."))
     # exposed pads of parts below VIA_POWER_W (or with no load given): the
     # via count still sets how the part sheds heat once it does dissipate
+    from kicad_claude.adapters.emc_review import is_power_net
     seen = {r["ref"] for r in parts if r["p_w"] > VIA_POWER_W}
     low_vias = []
     for ref, fp in sorted(fps.items()):
@@ -261,8 +281,12 @@ def analyze(tree: list, nl, specs: dict, ratings: dict, ambient_c: float,
             continue
         own = [{"x": p["x"], "y": p["y"], "drill": p["drill"] or 0.3, "net": p["net"]}
                for p in fp["pads"] if p["type"] == "thru_hole" and p.get("drill")]
-        ep = sorted(_merge_split_pads([pad_vias(p, all_vias + own) for p in exposed_pads(fp)]),
+        ep = sorted(_merge_split_pads([_pad_vias(p, all_vias + own) for p in exposed_pads(fp)]),
                     key=lambda e: -e["area_mm2"])
+        # a thermal pad: >= 2 mm2 on ground or a supply; a tab on a
+        # switching node must not get a via field (it radiates)
+        ep = [e for e in ep if e["area_mm2"] >= LOW_POWER_PAD_MM2 and e["net"]
+              and (is_ground_net(e["net"]) or is_power_net(e["net"]))]
         if ep and ep[0]["adequacy"] in ("none", "insufficient"):
             e = ep[0]
             low_vias.append({"ref": ref, **e})
@@ -272,7 +296,7 @@ def analyze(tree: list, nl, specs: dict, ratings: dict, ambient_c: float,
                                f"{e['recommended_min']} (ideally {e['recommended']}) recommended "
                                f"(info: dissipation below {VIA_POWER_W:g} W or not known)."))
     # B4: hot-spot proximity
-    hot = [r for r in parts if (r.get("rise_k") or 0) >= HOT_RISE_K]
+    hot = [r for r in parts if (r.get("board_rise_k", r.get("rise_k")) or 0) >= HOT_RISE_K]
     near = []
     for ref, fp in fps.items():
         if not ref.startswith("C") or (nl.components.get(ref) or {}).get("dnp"):
@@ -284,22 +308,27 @@ def analyze(tree: list, nl, specs: dict, ratings: dict, ambient_c: float,
             dist = math.hypot(fp["x"] - h["x_mm"], fp["y"] - h["y_mm"])
             if dist > HOT_DIST_MM:
                 continue
+            board = h.get("board_rise_k")
             near.append({"cap": ref, "kind": k, "source": h["ref"], "distance_mm": round(dist, 2),
-                         "source_rise_k": h["rise_k"]})
-            if k == "mlcc":
-                # info: a switcher's own input / output caps belong this close
-                findings.append(_f("info", "TH-MLCC-HOT", ref,
-                                   f"Class-II MLCC {ref} {dist:.1f} mm from {h['ref']} (junction "
-                                   f"rise {h['rise_k']:.0f} K; the board at the cap runs cooler, "
-                                   "falling with distance): X5R / X7R capacitance drifts with "
-                                   "temperature - check the derated value (C0G / NP0 where "
-                                   "it is critical)."))
+                         "source_rise_k": h["rise_k"], "board_rise_k": board})
+            # the cap sees the board, no hotter than under the part: an upper bound
+            if board is not None:
+                basis = (f"board under {h['ref']} up to {board:.0f} K above ambient "
+                         f"({h['board_rise_source']}); the cap runs cooler with distance")
             else:
-                findings.append(_f("warning", "TH-ELCO-HOT", ref,
-                                   f"Electrolytic {ref} {dist:.1f} mm from {h['ref']} (junction "
-                                   f"rise {h['rise_k']:.0f} K; the board at the cap runs cooler): "
-                                   "its life halves per 10 K - move it away or derate its "
-                                   "lifetime at the measured board temperature."))
+                basis = (f"{h['ref']} junction rise {h['rise_k']:.0f} K is the only bound: "
+                         "the board runs cooler, and without psi_jb in the spec cache it is "
+                         "not estimated")
+            if k == "mlcc":
+                findings.append(_f("info", "TH-MLCC-HOT", ref,
+                                   f"Class-II MLCC {ref} {dist:.1f} mm from {h['ref']} ({basis}): "
+                                   "X5R / X7R capacitance drifts with temperature - check the "
+                                   "derated value (C0G / NP0 where it is critical)."))
+            else:
+                findings.append(_f("warning" if board is not None else "info", "TH-ELCO-HOT",
+                                   ref, f"Electrolytic {ref} {dist:.1f} mm from {h['ref']} "
+                                   f"({basis}): its life halves per 10 K - check its rated "
+                                   "lifetime at that temperature or move it away."))
             break
     for ref, why in sorted(nodata.items()):
         findings.append(_f("info", "TH-NODATA", ref, f"{why}: extract its datasheet "

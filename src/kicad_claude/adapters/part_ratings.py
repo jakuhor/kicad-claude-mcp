@@ -1109,6 +1109,12 @@ def check_leds(nl: Netlist, specs: dict, volts: dict, findings: list, therm) -> 
                 if any(p.type.split("+")[0] in ("power_in", "power_out")
                        or kind(p.ref) in ("J", "P", "CN") for p in nl.nets.get(net, [])):
                     return None
+                # a string node joins two series parts; a third current path
+                # (R, D, Q, IC) is a branch the walk cannot choose
+                carriers = {p.ref for p in nl.nets.get(net, []) if not nl.components.get(
+                    p.ref, {}).get("dnp") and kind(p.ref) in ("R", "D", "Q", "U", "IC")}
+                if len(carriers) > 2:
+                    return None
                 nxt = None
                 for p in nl.nets.get(net, []):
                     if p.ref in seen or p.ref in chain:
@@ -1149,8 +1155,12 @@ def check_leds(nl: Netlist, specs: dict, volts: dict, findings: list, therm) -> 
         row = {"ref": ref, "chain": chain, "series_r": r_total or None, "ccr": ccr,
                "switch_assumed_on": switch}
         out.append(row)
-        if top is None or bot is None or top == bot:
-            row["status"] = "string does not end on nets of known voltage (GPIO-driven?)"
+        if top is not None and top == bot:
+            row["status"] = f"string returns to {top}: no supply across it"
+            continue
+        if top is None or bot is None:
+            row["status"] = ("string does not end on nets of known voltage (GPIO-driven, a "
+                             "branch, or an unknown rail)")
             continue
         vs = _net_v(top, volts) - _net_v(bot, volts)
         row.update(top=top, bottom=bot, volts=round(vs, 3))

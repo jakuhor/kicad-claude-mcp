@@ -71,7 +71,7 @@ a current focus — do not extend them unless asked.
 - Escape every control character on write (backslash, `"`, `\n`, `\r`, `\t`).
   `sexpdata` decodes escapes on read, so a naive dump corrupts the file.
 - Preserve existing UUIDs. Generate a new UUID only for a new item.
-- Keep the format versions KiCad 10.0.6 writes: `.kicad_sch` `20260306`,
+- Keep the format versions KiCad 10.0.8 writes (unchanged since 10.0.6): `.kicad_sch` `20260306`,
   `.kicad_pcb` `20260206`, `.kicad_mod` `20260206`, `.kicad_sym` `20251024`,
   `.kicad_pro` `meta.version` 3. Read them back from the tool, not from
   `source_repo/kicad` (that checkout is master and runs ahead — board
@@ -96,7 +96,7 @@ Add a test to the matching `tests/test_<set>_*.py` for every new or fixed
 tool.
 
 ## KiCad
-- **KiCad 10.0.6** at `C:\Program Files\KiCad\10.0` — the version to use.
+- **KiCad 10.0.8** at `C:\Program Files\KiCad\10.0` — the version to use.
 - `kicad-cli` at `C:\Program Files\KiCad\10.0\bin\kicad-cli.exe`.
 
 ## Docs

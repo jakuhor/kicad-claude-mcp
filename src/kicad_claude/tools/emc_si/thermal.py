@@ -187,7 +187,7 @@ def register(mcp) -> None:
         `review_part_ratings` model (same `loads` etc.), Rθ_JA from the
         datasheet or the package-typical estimate corrected by the thermal
         vias under the exposed pad. TH-TJ, TH-VIAS, TH-MLCC-HOT /
-        TH-ELCO-HOT (caps within 10 mm of a part rising >= 20 K), TH-NODATA.
+        TH-ELCO-HOT (caps within 10 mm of a hot part), TH-NODATA.
 
         Details:
 
@@ -204,11 +204,17 @@ def register(mcp) -> None:
         TH-TJ: above Tj max (error; warning when Rθ is the estimate), within
         `tj_margin_c` (default from `derating_profile`: 25 / 25 / 30 / 40 C)
         - warning. TH-VIAS: a part above 0.5 W whose exposed pad has fewer
-        vias than the minimum (info for any other fitted U / IC / Q,
-        `low_power_vias`); split exposed pads count as one; exposed-pad vias include the footprint's own
-        plated holes on the pad net (`_ThermalVias` footprints). TH-MLCC-HOT
-        (info): class-II MLCC (not C0G / NP0) within 10 mm of a part whose
-        rise P x Rθ_eff is >= 20 K; TH-ELCO-HOT (warning): electrolytic there. TH-NODATA: a part above 50 mW with
+        vias than the minimum; info for any other fitted U / IC / Q whose
+        exposed pad (>= 2 mm², on ground or a supply - not a switch-node
+        tab) has too few (`low_power_vias`). An exposed pad drawn as several
+        pads on the footprint's side counts once (its far-side copy is the
+        end of the via field); vias include the footprint's own plated holes
+        on the pad net (`_ThermalVias` footprints). Hot caps within 10 mm of
+        a part whose board under it is >= 20 K up: board rise = junction
+        rise - psi_jb x P when the spec cache has thermal.psi_jb (or rth_jb),
+        an upper bound for the cap; TH-MLCC-HOT (info, class-II MLCC),
+        TH-ELCO-HOT (warning on that estimate; info with only the junction
+        rise as a bound). TH-NODATA: a part above 50 mW with
         no Rθ (unknown package) or Tj max. Resistors get a rise (table Rθ by
         size) for the hot-spot check, no Tj. Copper pours and inner planes
         are not modelled beyond the via count. First-pass estimate.

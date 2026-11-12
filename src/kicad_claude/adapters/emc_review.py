@@ -38,9 +38,17 @@ PLANE_FRACTION = 0.5          # fill share that makes a layer without signals a 
 PLANE_FRACTION_ROUTED = 0.8   # ... and a layer that also carries signal tracks
 POUR_FRACTION = 0.2           # fill share reported as a pour on a signal layer
 POWER_NET_RE = re.compile(r"^([+-]\d|\+?V(CC|DD|BUS|IN|BAT|DC)(\b|_)|.*\d+V\d*(_\w+)?$)", re.I)
-CLOCK_RE = re.compile(r"(CLK|SCK|SCLK|MCLK|BCLK|LRCK|LRCLK|WS|XTAL|OSC|XIN|XOUT)", re.I)
-HIGH_SPEED_RE = re.compile(r"(USB|D[+-]$|DP$|DM$|_P$|_N$|HDMI|LVDS|ETH|RGMII|RMII|MDI|"
-                           r"SDIO|QSPI|SPDIF|AES|I2S|TDM|SAI)", re.I)
+# Net-name classes work on tokens (split at anything but letters / digits),
+# so NEWS is no clock and METHOD no Ethernet.
+CLOCK_TOKEN = re.compile(r"^(\w*CLK\w*|SCK\d*|SCLK\d*|MCLK|BCLK|LRCK|LRCLK|WS|XTAL\w*|OSC\w*"
+                         r"|XIN|XOUT)$", re.I)
+FAST_TOKEN = re.compile(r"^(HDMI\w*|LVDS\w*|RGMII\w*|RMII\w*|MDI\w*|ETH\w*|SDIO\w*|QSPI\w*"
+                        r"|SPDIF\w*|I2S\w*|TDM\w*|SAI\d*|PCIE\w*|SATA\w*|MIPI\w*|DDR\w*)$", re.I)
+USB_DATA_RE = re.compile(r"(^|[^A-Z0-9])(D[+-]|DP|DM|DN|D_?P|D_?N)\d?$", re.I)
+# a rail name with one of these tokens is a control signal (VCC_EN, PG_20V,
+# VBUS_MAX), not a rail (kicad-happy KH-518)
+CONTROL_TOKEN = re.compile(r"^(EN|ENA|PG|PGOOD|POK|SENSE|SNS|FB|MON|DET|FAULT|FLT|ILIM|OK|ON|OFF"
+                           r"|CTRL|CTL|ADC|MAX|MIN|SEL|IRQ|INT|ALERT|SDA|SCL)$", re.I)
 CONNECTOR_PREFIXES = ("J", "P", "CN", "X", "USB")
 
 
@@ -48,8 +56,44 @@ def leaf(net: str) -> str:
     return (net or "").rsplit("/", 1)[-1]
 
 
+def _tokens(net: str) -> list[str]:
+    return [t for t in re.split(r"[^A-Za-z0-9]+", leaf(net)) if t]
+
+
 def is_power_net(net: str) -> bool:
-    return bool(net) and bool(POWER_NET_RE.search(leaf(net))) and not is_ground_net(net)
+    if not net or is_ground_net(net) or not POWER_NET_RE.search(leaf(net)):
+        return False
+    return not any(CONTROL_TOKEN.match(t) for t in _tokens(net))
+
+
+def is_clock_net(net: str) -> bool:
+    return any(CLOCK_TOKEN.match(t) for t in _tokens(net))
+
+
+def _partner(net: str) -> str | None:
+    """The other half of a differential name: USB_P <-> USB_N, D+ <-> D-."""
+    swap = {"P": "N", "N": "P", "p": "n", "n": "p", "+": "-", "-": "+"}
+    if len(net) > 1 and net[-1] in swap and (net[-1] in "+-" or net[-2] == "_"):
+        return net[:-1] + swap[net[-1]]
+    return None
+
+
+def is_fast_net(net: str, nets: set | frozenset = frozenset()) -> bool:
+    """Clock, a named high-speed interface, USB data (not CC / VBUS / ID), or
+    one half of a differential pair whose partner is on the board (`nets`)."""
+    if not net or is_ground_net(net):
+        return False
+    if is_clock_net(net):
+        return True
+    toks, lf = _tokens(net), leaf(net)
+    if any(FAST_TOKEN.match(t) for t in toks):
+        return True
+    if any(t.upper().startswith("USB") for t in toks) and USB_DATA_RE.search(lf):
+        return True
+    if re.search(r"(^|[^A-Z0-9])D[+-]$", lf, re.I):
+        return True
+    p = _partner(net)
+    return bool(p and p in nets)
 
 
 def is_signal_net(net: str) -> bool:
@@ -386,16 +430,27 @@ def check_ground_stackup(b: Board, findings: list, f_max_hz: float,
                            "signal crosses the boundary (EM-SPLIT-CROSS).", ground_nets=gnets))
 
     # signal tracks over a gap in their reference plane
+    names = _net_names(b)
     gaps = _ref_gaps(b)
-    for g in gaps[:30]:
-        sev = "warning" if _fast(g["net"]) or g["longest_gap_mm"] >= REF_GAP_WARN_MM else "info"
-        findings.append(_f(sev, "EM-REF-GAP",
-                           f"Net {g['net']}: {g['gap_mm']} of {g['length_mm']} mm of track "
-                           f"({100 - g['coverage_pct']:.0f} %) runs with no copper on its reference "
-                           f"layer {g['reference']}; longest stretch {g['longest_gap_mm']} mm from "
-                           f"({g['at'][0]}, {g['at'][1]}). The return current detours around "
-                           "the gap: fill it or reroute.", net=g["net"],
-                           gap_mm=g["gap_mm"], coverage_pct=g["coverage_pct"]))
+
+    def _gap_sev(g):
+        if g["kind"] == "supply":
+            return "info"
+        if is_fast_net(g["net"], names):
+            return "warning"
+        # a slow line far above its plane is weakly coupled to it anyway
+        close = g["reference_mm"] is None or g["reference_mm"] <= REF_GAP_NEAR_MM
+        return "warning" if close and g["longest_gap_mm"] >= REF_GAP_WARN_MM else "info"
+    ranked = sorted(gaps, key=lambda g: (_gap_sev(g) != "warning", -g["longest_gap_mm"]))
+    for g in ranked[:30]:
+        findings.append(_f(_gap_sev(g), "EM-REF-GAP",
+                           f"{g['kind'].capitalize()} net {g['net']}: {g['gap_mm']} of "
+                           f"{g['length_mm']} mm of track ({100 - g['coverage_pct']:.0f} %) has no "
+                           f"ground or supply copper on an adjacent layer; longest stretch "
+                           f"{g['longest_gap_mm']} mm on {g['layer']} near ({g['at'][0]}, "
+                           f"{g['at'][1]}). The return current detours around the gap: fill it "
+                           "or reroute.", net=g["net"], gap_mm=g["gap_mm"],
+                           coverage_pct=g["coverage_pct"]))
     if len(gaps) > 30:
         findings.append(_f("info", "EM-REF-GAP", f"{len(gaps) - 30} more nets run over reference "
                            "gaps (see `ground.reference_gaps`)."))
@@ -417,24 +472,35 @@ def check_ground_stackup(b: Board, findings: list, f_max_hz: float,
             bad[t["net"]].append(t)
 
     def _sev(net, ts):
-        return "warning" if ts[0]["kind"] == "signal" and _fast(net) else "info"
+        return "warning" if ts[0]["kind"] == "signal" and is_fast_net(net, names) else "info"
     order = sorted(bad.items(), key=lambda kv: (_sev(*kv) != "warning", kv[0]))
     for net, ts in order[:20]:
         n_all = sum(1 for t in trans if t["net"] == net)
         t0 = ts[0]
-        what = (f"no {t0['stitch_net']} via reaching both planes within {t0['radius_mm']:g} mm"
-                if t0["stitch"] == "via" else
-                f"the planes are different nets ({' / '.join(t0['reference_nets'])}), so the "
-                f"return crosses through a capacitor between them - none within "
-                f"{t0['radius_mm']:g} mm")
-        fix = (f"add a {t0['stitch_net']} via next to the {t0['kind']} via" if t0["stitch"] == "via"
-               else "add a stitching capacitor between the two plane nets next to the via")
+        if t0["stitch"] == "via":
+            what = (f"no {t0['stitch_net']} via reaching both planes within "
+                    f"{t0['radius_mm']:g} mm")
+            fix = f"add a {t0['stitch_net']} via next to it"
+        elif t0["stitch"] == "capacitor":
+            what = (f"the planes are different nets ({' / '.join(t0['reference_nets'])}): the "
+                    f"return crosses through a capacitor between them, none within "
+                    f"{t0['radius_mm']:g} mm")
+            fix = "add a capacitor between the two plane nets next to it"
+        else:
+            what = (f"the planes are two ground nets ({' / '.join(t0['reference_nets'])}), a "
+                    "split or an isolation barrier")
+            fix = ("keep the signal on one side's reference; a capacitor across only for a "
+                   "functional, non-safety split (a rated Y capacitor across isolation)")
+        share = t0.get("nearer_plane_share")
         findings.append(_f(_sev(net, ts), "EM-VIA-STITCH",
                            f"{t0['kind'].capitalize()} net {net}: {len(ts)} of {n_all} layer "
                            f"change(s) move the return current between "
                            f"{' / '.join(t0['reference_planes'])}; {what} (first at "
-                           f"({t0['at'][0]}, {t0['at'][1]}), nearest {t0['nearest_mm']} mm): "
-                           f"{fix}.", net=net, count=len(ts)))
+                           f"{t0['via']} ({t0['at'][0]}, {t0['at'][1]})"
+                           + (f", nearest {t0['nearest_mm']} mm" if t0["nearest_mm"] else "")
+                           + (f"; nearer plane carries ~{max(share.values()):.0%} of the return"
+                              if share else "")
+                           + f"): {fix}.", net=net, count=len(ts)))
     if len(bad) > 20:
         findings.append(_f("info", "EM-VIA-STITCH", f"{len(bad) - 20} more nets have unstitched "
                            "layer changes (see `ground.via_transitions`)."))
@@ -470,8 +536,8 @@ def check_ground_stackup(b: Board, findings: list, f_max_hz: float,
             "connectors": conn}
 
 
-def _fast(net: str) -> bool:
-    return bool(CLOCK_RE.search(leaf(net)) or HIGH_SPEED_RE.search(leaf(net)))
+def _net_names(b: "Board") -> frozenset:
+    return frozenset({t["net_name"] for t in b.tracks} | {p["net_name"] for p in b.pads})
 
 
 def _ref_layers(b: Board, roles: list[dict], layer: str) -> list[str]:
@@ -521,113 +587,185 @@ def _split_crossings(b: Board, roles: list[dict]) -> list[dict]:
 
 
 REF_GAP_MIN_MM = 1.0        # EM-REF-GAP: less than this per net is ignored
-REF_GAP_WARN_MM = 5.0       # ... a gap this long is a warning on any signal
+REF_GAP_WARN_MM = 5.0       # ... a stretch this long is a warning on a signal
+REF_GAP_NEAR_MM = 0.5       # ... when its plane is this close (else info)
 
 
-def _track_refs(b: Board) -> dict[str, list[str]]:
-    """Per copper layer, the layers its tracks return on: the nearest
-    adjacent layer that carries a pour anywhere; both neighbours only when
-    their dielectrics are within 2x (a stripline), and when a thickness is
-    unknown."""
-    poured = {ly for ly, nets in b.fill.items() if nets}
-    out = {}
-    for k, ly in enumerate(b.layers):
-        cand = []
-        for n in (k - 1, k + 1):
-            if 0 <= n < len(b.layers) and b.layers[n] in poured:
-                d = b.dielectrics[min(k, n)] if min(k, n) < len(b.dielectrics) else {}
-                cand.append((b.layers[n], d.get("thickness_mm")))
-        th = [t for _, t in cand if t]
-        if len(th) == len(cand) and th:
-            cand = [c for c in cand if c[1] <= 2 * min(th)]
-        out[ly] = [c[0] for c in cand]
-    return out
+def _zone_clearance(tree: list) -> float:
+    """The largest zone clearance on the board (a plane's antipad grows by it)."""
+    best = 0.0
+    for z in find_children(tree, "zone"):
+        cp = find_child(z, "connect_pads")
+        cl = find_child(cp, "clearance") if cp else None
+        if cl and len(cl) > 1:
+            best = max(best, float(cl[1]))
+    return best or 0.3
+
+
+def _is_reference_net(net: str, own: str) -> bool:
+    """Copper that can carry a return current: ground, or a supply plane (an
+    AC reference through its decoupling) - not a signal pour, not the track's
+    own net."""
+    return bool(net) and net != own and (is_ground_net(net) or is_power_net(net))
 
 
 def _ref_gaps(b: Board) -> list[dict]:
-    """Signal track length with no copper under it on its reference layer(s),
-    per net, sampled at the grid resolution. Points within 0.6 mm of a via or
-    through-hole pad are skipped: a plane's antipad there is not a gap."""
-    refs = _track_refs(b)
-    holes = [v["point"] for v in b.vias] + [p["point"] for p in b.pads if len(p["layers"]) > 1]
-    cell = 2.0
+    """Track length with no reference copper under it, per net. A sample is
+    covered when an adjacent copper layer has ground or supply copper there
+    (the local reference, whatever the layer's role); a gap stretch is a
+    connected run of uncovered samples of one net, across segments, so a gap
+    under a curved trace is measured whole. Samples near a via or
+    through-hole pad are skipped within its radius + the zone clearance + one
+    raster cell: the plane's antipad there is not a gap. Arcs are sampled
+    along their chord."""
+    clear = _zone_clearance(b.tree) + b.grid.res
+    holes = [(v["point"], v.get("radius_mm", 0.3)) for v in b.vias]
+    holes += [(p["point"], p.get("radius_mm") or 0.5) for p in b.pads if len(p["layers"]) > 1]
+    cell = 3.0
     bucket = defaultdict(list)
-    for x, y in holes:
-        bucket[(int(x // cell), int(y // cell))].append((x, y))
+    for pt, r in holes:
+        bucket[(int(pt[0] // cell), int(pt[1] // cell))].append((pt, r))
 
     def near_hole(x, y):
         bx, by = int(x // cell), int(y // cell)
-        return any(math.dist((x, y), h) <= 0.6 for dx in (-1, 0, 1) for dy in (-1, 0, 1)
-                   for h in bucket.get((bx + dx, by + dy), []))
-    per = defaultdict(lambda: {"length_mm": 0.0, "gap_mm": 0.0, "worst": None, "layers": set()})
+        return any(math.dist((x, y), pt) <= r + clear for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                   for pt, r in bucket.get((bx + dx, by + dy), []))
+
+    def covered(layer_k, x, y, own):
+        c = b.grid.cell(x, y)
+        if not c:
+            return True
+        i = c[1] * b.grid.nx + c[0]
+        for n in (layer_k - 1, layer_k + 1):
+            if 0 <= n < len(b.layers):
+                for net, m in b.fill.get(b.layers[n], {}).items():
+                    if m[i] and _is_reference_net(net, own):
+                        return True
+        return False
+
+    poured = {ly for ly, nets in b.fill.items() if nets}
+    h_near = {}
+    for k, ly in enumerate(b.layers):
+        hs = [b.dielectrics[min(k, n)].get("thickness_mm") for n in (k - 1, k + 1)
+              if 0 <= n < len(b.layers) and b.layers[n] in poured and min(k, n) < len(b.dielectrics)]
+        hs = [h for h in hs if h]
+        h_near[ly] = min(hs) if hs else None
     step = b.grid.res
+    per = defaultdict(lambda: {"length_mm": 0.0, "gaps": [], "layers": set()})
     for t in b.tracks:
-        net, rl = t["net_name"], refs.get(t["layer"]) or []
-        if not is_signal_net(net) or not rl:
+        net = t["net_name"]
+        if not net or is_ground_net(net) or leaf(net).startswith("unconnected-") \
+                or t["layer"] not in b.layers:
             continue
+        k = b.layers.index(t["layer"])
+        if not any(b.layers[n] in poured for n in (k - 1, k + 1) if 0 <= n < len(b.layers)):
+            continue                            # no plane next to it at all: EM-STACK-REF
         (xa, ya), (xb, yb) = t["start"], t["end"]
         length = math.dist(t["start"], t["end"])
         n = max(1, int(length / step))
         rec = per[net]
         rec["length_mm"] += length
-        run, run_at = 0.0, None
-        for k in range(n):
-            f = (k + 0.5) / n
+        for j in range(n):
+            f = (j + 0.5) / n
             x, y = xa + (xb - xa) * f, ya + (yb - ya) * f
-            if near_hole(x, y):
+            if near_hole(x, y) or covered(k, x, y, net):
                 continue
-            if not any(b.net_at(r, x, y) for r in rl):
-                rec["gap_mm"] += length / n
-                rec["layers"].add(t["layer"])
-                run += length / n
-                run_at = run_at or (round(x, 2), round(y, 2))
-            else:
-                run, run_at = 0.0, None
-            if run and (rec["worst"] is None or run > rec["worst"][0]):
-                rec["worst"] = (round(run, 2), run_at, "/".join(rl))
+            rec["gaps"].append((x, y, length / n, t["layer"]))
+            rec["layers"].add(t["layer"])
     out = []
     for net, r in per.items():
-        if r["gap_mm"] < REF_GAP_MIN_MM:
+        if not r["gaps"]:
             continue
-        out.append({"net": net, "length_mm": round(r["length_mm"], 1),
-                    "gap_mm": round(r["gap_mm"], 1),
-                    "coverage_pct": round(100 * (1 - r["gap_mm"] / r["length_mm"]), 1),
-                    "longest_gap_mm": r["worst"][0], "at": list(r["worst"][1]),
-                    "reference": r["worst"][2], "layers": sorted(r["layers"])})
-    return sorted(out, key=lambda g: -g["gap_mm"])
+        # connected runs of gap samples (within 1.5 steps), across segments
+        pts, seen, runs = r["gaps"], set(), []
+        grid = defaultdict(list)
+        for i, (x, y, _, _) in enumerate(pts):
+            grid[(int(x // (2 * step)), int(y // (2 * step)))].append(i)
+        for i in range(len(pts)):
+            if i in seen:
+                continue
+            stack, members = [i], []
+            seen.add(i)
+            while stack:
+                u = stack.pop()
+                members.append(u)
+                x, y = pts[u][0], pts[u][1]
+                gx, gy = int(x // (2 * step)), int(y // (2 * step))
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        for v in grid.get((gx + dx, gy + dy), []):
+                            if v not in seen and math.dist((x, y), pts[v][:2]) <= 1.5 * step:
+                                seen.add(v)
+                                stack.append(v)
+            runs.append(members)
+        stretches = sorted(((sum(pts[m][2] for m in run), run) for run in runs),
+                           key=lambda x: -x[0])
+        longest, run = stretches[0]
+        if longest < REF_GAP_MIN_MM:
+            continue                            # the floor is per stretch, not per net
+        at = min((pts[m] for m in run), key=lambda q: (q[0], q[1]))
+        total = sum(p[2] for p in pts)
+        lay = pts[run[0]][3]
+        out.append({"net": net, "kind": "signal" if is_signal_net(net) else "supply",
+                    "length_mm": round(r["length_mm"], 1), "gap_mm": round(total, 1),
+                    "coverage_pct": round(100 * (1 - total / r["length_mm"]), 1),
+                    "longest_gap_mm": round(longest, 2), "at": [round(at[0], 2), round(at[1], 2)],
+                    "layer": lay, "reference_mm": h_near.get(lay),
+                    "stretches_over_floor": sum(1 for s_, _ in stretches if s_ >= REF_GAP_MIN_MM),
+                    "layers": sorted(r["layers"])})
+    return sorted(out, key=lambda g: -g["longest_gap_mm"])
 
 
-def _plane_net_near(b: Board, layer: str, pt: tuple, r0: float) -> str | None:
+def _plane_net_near(b: Board, layer: str, pt: tuple, r0: float,
+                    own: str | None = None) -> str | None:
     """The plane net around a via: the fill has an antipad at the via
-    itself, so sample rings outside it (to 2 mm) and take the majority."""
+    itself, so sample rings outside it (to 2 mm) and take the majority.
+    The via's own net (a supply via landing in its own plane) is not a
+    reference for its own return."""
     seen = defaultdict(int)
+    c0 = b.grid.cell(*pt)
     for k in range(1, 5):
         rad = r0 + 0.4 * k
         for a in range(8):
-            n = b.net_at(layer, pt[0] + rad * math.cos(a * math.pi / 4),
-                         pt[1] + rad * math.sin(a * math.pi / 4))
-            if n:
-                seen[n] += 1
+            c = b.grid.cell(pt[0] + rad * math.cos(a * math.pi / 4),
+                            pt[1] + rad * math.sin(a * math.pi / 4))
+            if not c or c0 is None:
+                continue
+            i = c[1] * b.grid.nx + c[0]
+            for n, m in b.fill.get(layer, {}).items():
+                if m[i] and n != own:
+                    seen[n] += 1
         if seen:
             return max(seen, key=seen.get)
     return None
 
 
+def _between_mm(b: Board, la: str, lb: str) -> float | None:
+    """Dielectric thickness between two copper layers (None if unknown)."""
+    i, j = sorted((b.layers.index(la), b.layers.index(lb)))
+    th = [b.dielectrics[k].get("thickness_mm") for k in range(i, j) if k < len(b.dielectrics)]
+    return sum(th) if th and all(th) else None
+
+
 def _via_transitions(b: Board, roles: list[dict]) -> list[dict]:
-    """Signal and supply vias whose tracks leave on layers with different
-    reference planes: the return current (for a supply, its AC part) must
-    move between those planes at the via. Each layer's reference is the
-    nearest adjacent pour at the via - both neighbours only when their
-    dielectrics are within 2x (a stripline); a 2-layer board with pours on
-    both sides counts.
-    - Same plane net on both layers: a via (or through-hole pad) of that net
-      spanning both plane layers within 2x the first dielectric, at least
-      1 mm (kicad-happy RP-001), gives the return its short way.
-    - Different plane nets (GND / +5V, GND / GND_USB): no via can join them;
-      the return crosses through a capacitor between the two nets, so one
-      within 5 mm (as EM-SPLIT-CROSS) is the stitch."""
-    h = next((d["thickness_mm"] for d in b.dielectrics if d.get("thickness_mm")), 0.2)
-    radius, cap_radius = max(2 * h, 1.0), 5.0
+    """Signal and supply layer changes - vias and through-hole pins - whose
+    tracks leave on layers with different reference planes: the return
+    current (for a supply, its AC part) must move between those planes there.
+    The layers joined are the tracks ending on the hole plus an SMD pad of
+    the same net sitting on it (via-in-pad fan-out). Each layer's reference
+    is the nearest adjacent pour at the spot, not of the hole's own net; both
+    neighbours when their dielectrics are within 2x (a stripline). The
+    nearer plane's share of the return, h_far / (h_near + h_far), is given
+    when the farther neighbour also has copper.
+    - Same plane net on both sides: a via (or through-hole pad) of that net
+      spanning both plane layers within 2x the spacing of those two planes,
+      at least 1 mm, gives the return its short way.
+    - A ground plane and a supply plane: the return crosses through a
+      capacitor between the two nets; one within 5 mm is the stitch.
+    - Two different ground nets: a split or an isolation barrier - the signal
+      should not change reference there (a capacitor only for a functional,
+      non-safety split)."""
+    cap_radius = 5.0
     joins = [(v["point"], v["net_name"], set(v["layers"])) for v in b.vias]
     joins += [(p["point"], p["net_name"], set(p["layers"])) for p in b.pads
               if len(p["layers"]) > 1]
@@ -641,57 +779,70 @@ def _via_transitions(b: Board, roles: list[dict]) -> list[dict]:
     for t in b.tracks:
         for pt in (t["start"], t["end"]):
             ends[t["net_name"]].append((pt, t["layer"]))
+    smd = defaultdict(list)                    # net -> [(point, radius, layer)]
+    for p in b.pads:
+        if len(p["layers"]) == 1:
+            smd[p["net_name"]].append((p["point"], p.get("radius_mm") or 0.3, p["layers"][0]))
+    holes = [(v["point"], v["net_name"], v["layers"], v.get("radius_mm", 0.3), "via")
+             for v in b.vias]
+    holes += [(p["point"], p["net_name"], p["layers"], p.get("radius_mm") or 0.5,
+               f"{p['ref']}.{p['pad']}") for p in b.pads if len(p["layers"]) > 1]
     out = []
-    for v in b.vias:
-        net = v["net_name"]
+    for pt, net, span, rad, what in holes:
         if not net or is_ground_net(net) or leaf(net).startswith("unconnected-"):
             continue                            # a ground via is itself a stitch
-        r = v.get("radius_mm", 0.3) + 0.05
-        used = sorted({ly for pt, ly in ends.get(net, []) if math.dist(pt, v["point"]) <= r
-                       and ly in v["layers"]})
+        r = rad + 0.05
+        used = {ly for q, ly in ends.get(net, []) if math.dist(q, pt) <= r and ly in span}
+        used |= {ly for q, pr, ly in smd.get(net, []) if math.dist(q, pt) <= pr and ly in span}
+        used = sorted(used, key=b.layers.index)
         if len(used) < 2:
             continue
-        refs = {}
+        refs, shares = {}, {}
         for ly in used:
-            k = b.layers.index(ly)              # the adjacent pour at this spot, any role
+            k = b.layers.index(ly)
             cand = []
             for n in (k - 1, k + 1):
                 if 0 <= n < len(b.layers):
                     d = b.dielectrics[min(k, n)] if min(k, n) < len(b.dielectrics) else {}
-                    cand.append((b.layers[n], _plane_net_near(b, b.layers[n], v["point"], r),
+                    cand.append((b.layers[n], _plane_net_near(b, b.layers[n], pt, r, net),
                                  d.get("thickness_mm")))
             cand = [c for c in cand if c[1]]
-            # the return current crowds into the nearest plane: a neighbour
-            # more than 2x farther is not the reference (In2 under a 1 mm core
-            # with B.Cu 0.2 mm away refers to B.Cu); unknown thickness keeps both
             th = [t for _, _, t in cand if t]
-            if len(th) == len(cand) and th:
-                cand = [c for c in cand if c[2] <= 2 * min(th)]
+            if len(cand) == 2 and len(th) == 2:
+                near, far = sorted(th)
+                shares[ly] = round(far / (near + far), 2)
+                if far > 2 * near:              # the return crowds into the nearer plane
+                    cand = [c for c in cand if c[2] == near][:1]
             refs[ly] = [(rl, n) for rl, n, _ in cand]
-        if any(not refs[ly] for ly in used) or any(
-                {rl for rl, _ in refs[a]} & {rl for rl, _ in refs[b_]}
-                for a in used for b_ in used if a < b_):
-            continue                            # same plane on both sides, or none
-        planes = sorted({rl for ly in used for rl, _ in refs[ly]})
+        if any(not refs[ly] for ly in used):
+            continue
+        layer_sets = [{rl for rl, _ in refs[ly]} for ly in used]
+        if all(a_ & b_ for i, a_ in enumerate(layer_sets) for b_ in layer_sets[i + 1:]):
+            continue                            # every pair shares a plane: the return stays
+        planes = sorted({rl for ly in used for rl, _ in refs[ly]}, key=b.layers.index)
         nets = sorted({n for ly in used for _, n in refs[ly]})
         sides = [{n for _, n in refs[ly]} for ly in used]
         common = set.intersection(*sides)
-        rec = {"net": net, "kind": "signal" if is_signal_net(net) else "supply",
-               "at": [round(v["point"][0], 2), round(v["point"][1], 2)], "layers": used,
-               "reference_planes": planes, "reference_nets": nets}
+        rec = {"net": net, "kind": "signal" if is_signal_net(net) else "supply", "via": what,
+               "at": [round(pt[0], 2), round(pt[1], 2)], "layers": used,
+               "reference_planes": planes, "reference_nets": nets,
+               "nearer_plane_share": shares or None}
         if common:
-            # a via of the plane net that reaches every reference layer
             need = {rl for ly in used for rl, n in refs[ly] if n in common}
-            d = min((math.dist(v["point"], pt) for pt, n, lys in joins
-                     if n in common and need <= lys), default=math.inf)
+            h = _between_mm(b, planes[0], planes[-1]) if len(planes) > 1 else None
+            radius = max(2 * (h or 0.2), 1.0)
+            d = min((math.dist(pt, q) for q, n, lys in joins
+                     if n in common and need <= lys and q != pt), default=math.inf)
             rec.update(stitch="via", stitch_net=sorted(common)[0], radius_mm=round(radius, 2),
                        nearest_mm=None if d == math.inf else round(d, 2), stitched=d <= radius)
         else:
-            pairs = {frozenset((x, y)) for x in sides[0] for y in sides[1] if x != y}
-            d = min((math.dist(v["point"], pt) for pt, ns in caps if ns in pairs),
-                    default=math.inf)
-            rec.update(stitch="capacitor", radius_mm=cap_radius,
-                       nearest_mm=None if d == math.inf else round(d, 2), stitched=d <= cap_radius)
+            pairs = {frozenset((x, y)) for i, a_ in enumerate(sides) for b_ in sides[i + 1:]
+                     for x in a_ for y in b_ if x != y}
+            grounds_only = all(is_ground_net(n) for n in nets)
+            d = min((math.dist(pt, q) for q, ns in caps if ns in pairs), default=math.inf)
+            rec.update(stitch="split" if grounds_only else "capacitor", radius_mm=cap_radius,
+                       nearest_mm=None if d == math.inf else round(d, 2),
+                       stitched=(not grounds_only) and d <= cap_radius)
         out.append(rec)
     return out
 
@@ -905,7 +1056,15 @@ def _input_loop(b: Board, ref: str, vin_net: str, pads_by_ref: dict) -> dict | N
 
 
 _RT_PIN = re.compile(r"^(RT|RT/SYNC|RT/CLK|FSW|FREQ|ROSC)$", re.I)
-_SYNC_PIN = re.compile(r"SYNC|CLKIN|EXTCLK|^CLK$", re.I)
+_SYNC_TOKENS = {"SYNC", "SYNCIN", "CLKIN", "EXTCLK", "CLK", "FSYNC"}
+_RT_FLOAT = re.compile(r"\bR_?T\w*(/\w+)?(\s*pin)?\s*(is\s*|=\s*|left\s*)?(float\w*|open|unconnected|NC)\b"
+                       r"|\b(float\w*|open)\s+R_?T\b", re.I)
+
+
+def _is_sync_pin(name: str) -> bool:
+    """SYNC / CLKIN-type input by token (EN/SYNC counts; SYNCOUT does not)."""
+    toks = {t.upper() for t in re.split(r"[^A-Za-z0-9]+", name or "") if t}
+    return bool(toks & _SYNC_TOKENS) and "OUT" not in toks
 
 
 def fsw_from_strap(nl, ref: str, hint: dict | None) -> tuple[float, str] | None:
@@ -923,10 +1082,10 @@ def fsw_from_strap(nl, ref: str, hint: dict | None) -> tuple[float, str] | None:
     # a clock on SYNC overrides RT: the strap holds only with SYNC idle
     # (grounded, open, or reached only by test points and resistors to ground)
     for sp in nl.pins.get(ref, []):
-        if sp is pin or not _SYNC_PIN.search((sp.name or "").strip()):
+        if sp is pin or not _is_sync_pin(sp.name):
             continue
-        if is_ground_net(sp.net) or is_unconnected(sp.net):
-            continue
+        if is_ground_net(sp.net) or is_unconnected(sp.net) or is_power_net(sp.net):
+            continue                           # tied low / open / to a rail: no clock
         for q in nl.nets.get(sp.net, []):
             if q.ref == ref or kind(q.ref) == "TP" or nl.components.get(q.ref, {}).get("dnp"):
                 continue
@@ -934,7 +1093,7 @@ def fsw_from_strap(nl, ref: str, hint: dict | None) -> tuple[float, str] | None:
             if not (kind(q.ref) == "R" and far and is_ground_net(far[0])):
                 return None
     others = [q for q in nl.nets.get(pin.net, []) if q.ref != ref]
-    if re.search(r"\b(float|floating|open|unconnected|NC)\b", cond, re.I):
+    if _RT_FLOAT.search(cond):                 # the float keyword must name RT itself
         if is_unconnected(pin.net) or not others:
             return hz, f"RT pin {pin.name} floating, as the datasheet condition '{cond}'"
         return None
@@ -996,6 +1155,11 @@ def check_switching(b: Board, findings: list, regulators: list[dict], nl,
         if strap:
             f = strap[0]
             rec["fsw_source"] = f"datasheet {(specs.get(ref) or {}).get('mpn')}: {strap[1]}"
+            if hint.get("min") and hint.get("max"):
+                # harmonics move with the oscillator tolerance
+                rec["fsw_range_hz"] = [float(hint["min"]), float(hint["max"])]
+                rec["fsw_source"] += (f"; typical used, datasheet range "
+                                      f"{float(hint['min']) / 1e6:g}..{float(hint['max']) / 1e6:g} MHz")
         elif f:
             rec["fsw_source"] = "caller"
         if not f:
@@ -1095,6 +1259,50 @@ def check_switching(b: Board, findings: list, regulators: list[dict], nl,
 # ---- group: decoupling & PDN ---------------------------------------------------- #
 
 PDN_FREQS = (1e5, 1e6, 1e7, 1e8)          # rail impedance profile (Hz)
+
+
+def _z_profile(branches: list, mount: dict) -> dict:
+    """Rail impedance at PDN_FREQS from each cap as a series C-ESR-L branch
+    (L = datasheet ESL + layout mounting inductance), reported only where
+    the data supports it:
+    - every cap with ESR and L: the full parallel sum;
+    - L for every cap but an ESR missing: the damping near resonance is
+      unknown, so only frequencies below 0.3x the lowest series resonance
+      are given (there the capacitive term dominates);
+    - an L missing: the resonance is unknown, so no value is given.
+    `z_capacitive_ohm` (1 / 2 pi f C_total, the asymptote below resonance)
+    is always given beside it.
+    Plane capacitance, spreading inductance and caps behind a ferrite or
+    0 ohm link (another net) are not included."""
+    c_tot = sum(c for _, c, _, _ in branches)
+    ls = [(esl or 0.0) + mount.get(cr, 0.0) for cr, _, _, esl in branches]
+    l_known = all(lh > 0 for lh in ls)
+    esr_known = all(esr is not None for _, _, esr, _ in branches)
+    f_res = min((1 / (2 * math.pi * math.sqrt(lh * c)) for lh, (_, c, _, _) in zip(ls, branches)
+                 if lh > 0), default=None) if l_known else None
+    prof, cap = {}, {}
+    for f in PDN_FREQS:
+        w = 2 * math.pi * f
+        cap[f"{f:g}"] = float(f"{1 / (w * c_tot):.3g}")
+        if l_known and esr_known:
+            y = sum(1 / complex(esr, w * lh - 1 / (w * c))
+                    for (_, c, esr, _), lh in zip(branches, ls))
+            prof[f"{f:g}"] = float(f"{abs(1 / y):.3g}") if y else None
+        elif f_res and f < 0.3 * f_res:
+            prof[f"{f:g}"] = cap[f"{f:g}"]
+        else:
+            prof[f"{f:g}"] = None
+    n = len(branches)
+    basis = (f"{n} caps; ESR from {sum(1 for b_ in branches if b_[2] is not None)}/{n} datasheets, "
+             f"L (datasheet ESL + layout mounting) for {sum(1 for lh in ls if lh > 0)}/{n}; "
+             + ("full C-ESR-L sum" if l_known and esr_known else
+                f"ESR missing: values only below 0.3x the lowest resonance "
+                f"({f_res / 1e6:.3g} MHz)" if l_known else
+                "L missing: resonance unknown, only the capacitive asymptote")
+             + ". Not included: plane capacitance (dominant near 100 MHz), spreading "
+             "inductance, caps behind a ferrite or 0 ohm link (another net).")
+    return {"z_profile_ohm": prof, "z_capacitive_ohm": cap, "z_profile_basis": basis,
+            "lowest_resonance_hz": round(f_res) if f_res else None}
 
 
 def _two_pin_parts(b: Board) -> dict[str, list[dict]]:
@@ -1219,34 +1427,16 @@ def check_decoupling(b: Board, findings: list, nl, rail_volts: dict, specs: dict
         bank.setdefault("_branches", []).append((cr, c_eff, esr, esl))
     # rail impedance for every bank, target or not: each cap a series C-ESR-L
     # branch, L = datasheet ESL + the layout's mounting inductance (nothing assumed)
-    mount = {}
+    mount, mount_rec = {}, {}
     if banks:
-        try:
-            from kicad_claude.adapters import spice_auto
-            mount = {c: v["l_h"] for c, v in spice_auto.mounting_inductance(
-                b.tree, sorted({c for bk in banks.values() for c in bk["caps"]})).items()
-                if v.get("l_h")}
-        except (ValueError, KeyError):
-            mount = {}
+        from kicad_claude.adapters import spice_auto
+        mount_rec = spice_auto.mounting_inductance(
+            b.tree, sorted({c for bk in banks.values() for c in bk["caps"]}), board=b)
+        mount = {c: v["l_h"] for c, v in mount_rec.items() if v.get("l_h")}
     for rail, bank in banks.items():
         br = bank.pop("_branches", [])
         if br and all(c for _, c, _, _ in br):
-            prof = {}
-            for f in PDN_FREQS:
-                w = 2 * math.pi * f
-                y = 0j
-                for cr, c, esr, esl in br:
-                    lh = (esl or 0.0) + mount.get(cr, 0.0)
-                    y += 1 / complex(esr or 0.0, w * lh - 1 / (w * c))
-                prof[f"{f:g}"] = float(f"{abs(1 / y):.3g}") if y else None
-            bank["z_profile_ohm"] = prof
-            bank["z_profile_basis"] = (
-                f"C{' (DC-bias derated)' if bank.get('dc_bias_derated') else ''}; ESR from "
-                f"{bank['esr_known']}/{bank['count']} datasheets (else 0); L = datasheet ESL "
-                f"({bank['esl_known']}/{bank['count']}) + layout mounting inductance "
-                f"({sum(1 for cr, *_ in br if cr in mount)}/{bank['count']}). Not included: "
-                "plane capacitance (it dominates near 100 MHz) and spreading inductance; an "
-                "unknown ESR (0) makes resonance dips too deep and anti-resonance peaks too high")
+            bank.update(_z_profile(br, mount))
         inv = bank.pop("_inv_esl")
         bank["c_total_f"] = float(f"{bank['c_total_f']:.4g}")
         if inv and bank["esl_known"] == bank["count"]:
@@ -1402,7 +1592,7 @@ def check_io_signals(b: Board, findings: list, specs: dict, edge_keepout_mm: flo
             if _edge_distance(b, x, y) < edge_keepout_mm:
                 near_edge[t["net_name"]] += math.dist(t["start"], t["end"]) / n
     for net, length in sorted(near_edge.items()):
-        hs = bool(CLOCK_RE.search(leaf(net)) or HIGH_SPEED_RE.search(leaf(net)))
+        hs = is_fast_net(net, _net_names(b))
         findings.append(_f("warning" if hs else "info", "EM-EDGE-TRACE",
                            f"{net}: {length:.1f} mm of track within {edge_keepout_mm} mm of the "
                            "board edge (fringing field, no plane beyond the edge).", net=net))
@@ -1413,7 +1603,7 @@ def check_io_signals(b: Board, findings: list, specs: dict, edge_keepout_mm: flo
     clocks = defaultdict(lambda: {"length_mm": 0.0, "outer_mm": 0.0, "min_connector_mm": math.inf})
     outer = {b.layers[0], b.layers[-1]} if b.layers else set()
     for t in b.tracks:
-        if not CLOCK_RE.search(leaf(t["net_name"])):
+        if not is_clock_net(t["net_name"]):
             continue
         c = clocks[t["net_name"]]
         length = math.dist(t["start"], t["end"])
@@ -1486,8 +1676,8 @@ def check_io_signals(b: Board, findings: list, specs: dict, edge_keepout_mm: flo
             h_ref[a] = min(h_ref.get(a, 9e9), d["thickness_mm"])
             h_ref[c] = min(h_ref.get(c, 9e9), d["thickness_mm"])
     xt = []
-    hot = [t for t in b.tracks if CLOCK_RE.search(leaf(t["net_name"]))
-           or HIGH_SPEED_RE.search(leaf(t["net_name"]))]
+    names = _net_names(b)
+    hot = [t for t in b.tracks if is_fast_net(t["net_name"], names)]
     for t in hot:
         h = h_ref.get(t["layer"])
         if not h:

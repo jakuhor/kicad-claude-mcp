@@ -449,3 +449,53 @@ def test_rc_highpass_dc_block():
     add("R49", "1", "", "passive", "+20V", "0R")      # a fitted DC path: no longer a high-pass
     add("R49", "2", "", "passive", "SMA", "0R")
     assert sa.find_rc_highpass(nl, {"+20V", "-18V", "SMA"}) == []
+
+
+def test_rc_highpass_roles_drivers_and_source_r(tmp_path):
+    # OP-20 #38-40
+    from kicad_claude.adapters.power_review import Netlist, Pin
+
+    def mk(rows, values):
+        nl = Netlist()
+        for ref, num, name, typ, net in rows:
+            p = Pin(ref, num, name, typ, net)
+            nl.pins[ref].append(p)
+            nl.nets.setdefault(net, []).append(p)
+        nl.components = {r: {"value": v} for r, v in values.items()}
+        return nl
+    # power-on reset: +3V3 -> C -> RST node with R to GND, into an IC input
+    por = mk([("C1", "1", "", "passive", "+3V3"), ("C1", "2", "", "passive", "RST"),
+              ("R1", "1", "", "passive", "RST"), ("R1", "2", "", "passive", "GND"),
+              ("U1", "4", "RST", "input", "RST")], {"C1": "100n", "R1": "100k"})
+    assert sa.find_rc_highpass(por, {"+3V3"})[0]["role"] == "timing"
+    # the same node also driven by an IC output: not a high-pass
+    drv = mk([("C1", "1", "", "passive", "+3V3"), ("C1", "2", "", "passive", "N"),
+              ("R1", "1", "", "passive", "N"), ("R1", "2", "", "passive", "GND"),
+              ("U2", "7", "OUT", "output", "N")], {"C1": "100n", "R1": "100k"})
+    assert sa.find_rc_highpass(drv, {"+3V3"}) == []
+    # MCU pin -> 1k -> 100n -> node with 10k to GND into an amplifier: R = 1k + 10k
+    ch = mk([("U1", "3", "PA1", "output", "DRV"), ("R2", "1", "", "passive", "DRV"),
+             ("R2", "2", "", "passive", "A"), ("C2", "1", "", "passive", "A"),
+             ("C2", "2", "", "passive", "B"), ("R3", "1", "", "passive", "B"),
+             ("R3", "2", "", "passive", "GND"), ("U5", "3", "+", "input", "B")],
+            {"R2": "1k", "C2": "100n", "R3": "10k"})
+    hp = sa.find_rc_highpass(ch, set())
+    assert hp[0]["role"] == "ac_coupling" and hp[0]["source_r"] == "R2"
+    assert hp[0]["fc_hz"] == pytest.approx(1 / (2 * math.pi * 11e3 * 1e-7), rel=1e-4)
+
+
+def test_opamp_open_collector_unnamed_output(tmp_path):
+    # OP-20 #42: an LMV331-style comparator with an unnamed open-collector output
+    comps = [_comp("U2", "LMV331")]
+    nets = [_net(1, "IN", ("U2", "1", "+", "input")), _net(2, "REF", ("U2", "3", "-", "input")),
+            _net(3, "OUT", ("U2", "4", "", "open_collector"))]
+    assert sa.opamp_pins(_nl(tmp_path, comps, nets), "U2") == {"": {"+": "IN", "-": "REF",
+                                                                       "out": "OUT"}}
+
+
+def test_bare_sign_pins_need_an_amplifier_part(tmp_path):
+    # OP-20 #50: a DC/DC module drawn as U with "+" / "-" pins is no op-amp
+    comps = [_comp("U7", "R-78E5.0", lib="Converter_DCDC:RECOM_R-78E")]
+    nets = [_net(1, "VIN", ("U7", "1", "+", "input")), _net(2, "GND", ("U7", "2", "-", "input")),
+            _net(3, "OUT", ("U7", "3", "", "output"))]
+    assert sa.opamp_pins(_nl(tmp_path, comps, nets), "U7") == {}

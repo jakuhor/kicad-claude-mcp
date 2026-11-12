@@ -180,8 +180,9 @@ def register(mcp) -> None:
           with the Thevenin resistance of every resistor on the node; and
           first-order high-pass nodes (a series cap into resistance to ground
           or a rail, no other DC path; feedback nodes skipped) in
-          `rc_highpass`, with `loads` on the node in the corner (else
-          "open").
+          `rc_highpass` (`role` dc_block / timing / ac_coupling; a series
+          source R adds to R; `loads` on the node in parallel, else
+          "open"; nodes held by an IC output or a transistor skipped).
         - `lc` — LC / ferrite / pi ladders (series L between nodes with
           capacitors to ground; switch nodes of converters excluded), with
           R-C damping branches, run as an ngspice AC sweep from the ladder's
@@ -211,10 +212,12 @@ def register(mcp) -> None:
           `CL` from the spec cache (SP-XTAL-CL; warning beyond ±10 %).
 
         `pcb_parasitics=True` adds each ladder capacitor's mounting
-        inductance in series with it: ground-via barrel from the cap's layer
-        to the first ground plane (L = 0.2 h (ln(4h/d) + 1) nH) plus the
-        pad-to-via strip over the plane (track width, or the pad width for
-        a pour; Hammerstad microstrip inductance).
+        inductance in series with it, both pads: each pad's nearest via of
+        its net, the barrel from the cap's layer to the first plane of that
+        net (L = 0.2 h (ln(4h/d) + 1) nH) plus the pad-to-via strip over the
+        plane (track width, or the pad width for a pour; Hammerstad
+        microstrip inductance); a supply pad with no via within 3 mm is left
+        out and named.
 
         Parts are ideal unless the datasheet spec cache gives ESR / ESL / DCR;
         ferrite beads without an inductance value are a short (noted). Open

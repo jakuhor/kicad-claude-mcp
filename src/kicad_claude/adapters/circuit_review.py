@@ -715,10 +715,10 @@ def opamp_channels(nl: Netlist, specs: dict) -> dict[str, dict[str, dict[str, st
     """{ref: {channel: {"+": net, "-": net, "out": net}}} for parts with
     op-amp pin names (or category opamp)."""
     # one pin matcher with the SPICE stages (bare "+" / "-", unnamed output)
-    from kicad_claude.adapters.spice_auto import _opamp_pins
+    from kicad_claude.adapters.spice_auto import opamp_pins
     out = {}
     for ref in ics(nl):
-        full = _opamp_pins(nl, ref)
+        full = opamp_pins(nl, ref)
         if full and ((specs.get(ref) or {}).get("category") in ("opamp", None, "")
                      and not any(btype(p) == "power_out" for p in nl.pins.get(ref, []))):
             out[ref] = full

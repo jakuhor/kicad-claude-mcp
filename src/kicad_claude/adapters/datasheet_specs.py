@@ -33,7 +33,7 @@ Spec record (schema version 1):
                         rail),
                       "channels": {"1": {"vref": SV}, "2": {...}}},
      "i2c":          {"addresses": ["0x48"], "address_rule": "...", "page": 12},
-     "thermal":      {"rth_ja": SV, "tj_max": SV},
+     "thermal":      {"rth_ja": SV, "tj_max": SV, "psi_jb": SV},
      "curves":       {"C_bias": CURVE, ...},
      "pin_models":   {"OV/UV": {"clamp": SV, "i_trip": SV, "i_bias": SV,
                                 "r_in": SV}, "EN_OUT": {"i_sink": SV,
@@ -77,7 +77,8 @@ Conventional keys the analyzers read (use these names):
   - fuse / PTC: electrical.I_hold (PTC: largest current that never
     trips), I_trip (PTC: smallest current that always trips), I_rated
     (fuse); absolute_max.V;
-  - every part with a die: thermal.rth_ja, thermal.tj_max;
+  - every part with a die: thermal.rth_ja, thermal.tj_max; psi_jb (or
+    rth_jb) when the thermal table gives it (board temperature next to it);
   - opamp: electrical.GBW, SR, Aol (dB or V/V; with GBW it gives the
     behavioural model when there is no vendor model), Vos, R_in;
   - LDO / reference behavioural model: regulator.vref, dropout,

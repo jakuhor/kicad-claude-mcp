@@ -182,6 +182,12 @@ def find_rc(nl: Netlist, ladder_nets: set) -> list[dict]:
 _FB_PIN = re.compile(r"^(FB|ADJ|VFB|NFB|FB\d|SET)$", re.I)
 
 
+def is_power_like(net: str) -> bool:
+    """A rail by name (+3V3, VCC, 12V), not a control signal."""
+    from kicad_claude.adapters.emc_review import is_power_net
+    return is_power_net(net)
+
+
 def find_rc_highpass(nl: Netlist, rails: set, skip: set = frozenset(),
                      loads: dict | None = None) -> list[dict]:
     """First-order high-pass: a series capacitor into a node whose only DC
@@ -189,7 +195,12 @@ def find_rc_highpass(nl: Netlist, rails: set, skip: set = frozenset(),
     bleed resistor, an SMA DC block). fc = 1 / (2 pi R C), R the shunt
     resistors in parallel with the caller's load on the node (`loads`, ohm:
     a 50 ohm instrument on an SMA sets the corner, not the 10k bleed);
-    without one the corner is the open-load value and says so."""
+    without one the corner is the open-load value and says so. A single
+    series resistor feeding the capacitor (an R-C chain from a driver) adds
+    to R. A node also held by an IC output or a transistor is no high-pass.
+    `role`: dc_block (into a connector), timing (a rail into an IC input:
+    power-on reset, soft-start - a differentiator, not a signal filter) or
+    ac_coupling. First-order formula, not a simulation."""
     out = []
     for node, pins in nl.nets.items():
         # a rail carried only through a DNP link is still a candidate: the DC
@@ -204,6 +215,11 @@ def find_rc_highpass(nl: Netlist, rails: set, skip: set = frozenset(),
         series, shunt, other = [], [], False
         for p in pins:
             if not _fitted(nl, p.ref):
+                continue
+            if kind(p.ref) not in PASSIVE and (
+                    kind(p.ref) == "Q" or p.type.split("+")[0] in (
+                        "output", "power_out", "bidirectional", "tri_state", "open_collector")):
+                other = True                   # a driver or a junction holds the node
                 continue
             ends = _two(nl, p.ref)
             k = kind(p.ref)
@@ -229,9 +245,23 @@ def find_rc_highpass(nl: Netlist, rails: set, skip: set = frozenset(),
         load = (loads or {}).get(node)
         r_th = 1 / (g + (1 / load if load else 0.0))
         conn = sorted({p.ref for p in pins if kind(p.ref) in ("J", "P", "CN")})
+        # a single series resistor driving the cap (input net = R + C only)
+        src_net = series[0][1]
+        on_src = [q for q in nl.nets.get(src_net, []) if _fitted(nl, q.ref)
+                  and q.ref != series[0][0]]
+        r_src = None
+        if src_net not in rails and len(on_src) == 1 and kind(on_src[0].ref) == "R":
+            r_src = parse_value(nl.components[on_src[0].ref]["value"])
+        r_tot = r_th + (r_src or 0.0)
+        ics_in = [p for p in pins if kind(p.ref) not in PASSIVE]
+        role = ("dc_block" if conn else
+                "timing" if (src_net in rails or is_power_like(src_net)) and ics_in else
+                "ac_coupling")
         out.append({"node": node, "input": series[0][1], "series_cap": series[0][0],
-                    "shunt_r": shunt, "r_ohm": round(r_th, 3), "c_f": float(f"{c:.4g}"),
-                    "fc_hz": round(1 / (2 * math.pi * r_th * c), 3),
+                    "shunt_r": shunt, "source_r": on_src[0].ref if r_src else None,
+                    "r_ohm": round(r_tot, 3), "c_f": float(f"{c:.4g}"),
+                    "fc_hz": round(1 / (2 * math.pi * r_tot * c), 3), "role": role,
+                    "method": "first-order formula",
                     "load": f"{load:g} ohm (caller)" if load else
                     "open" + (f" - {', '.join(conn)} goes off-board: pass loads={{net: ohm}} "
                               "for what is plugged in" if conn else ""),
@@ -522,14 +552,25 @@ _OPA_PIN = re.compile(r"^(?:(?P<pre>\d?)(?P<s1>[+-])?IN(?P<s2>[+-])?(?P<ch>[A-D\
                       r"(?P<pre2>\d?)OUT(?P<ch2>[A-D\d]?)|(?P<s3>[+-])(?P<ch3>[A-D]?))$", re.I)
 
 
-def _opamp_pins(nl: Netlist, ref: str) -> dict[str, dict]:
+_AMP_PART = re.compile(r"op.?amp|amplifier|comparator|\bOPA\d|\bAD8\d|\bLMV?\d|\bTL0\d|"
+                       r"\bMCP6\d|\bTS\d|\bTLV\d|\bNE5\d|\bLT1\d|\bLTC6\d|\bADA4", re.I)
+
+
+def opamp_pins(nl: Netlist, ref: str) -> dict[str, dict]:
     """channel -> {"+": net, "-": net, "out": net} from pin names
-    (+IN / IN+ / IN1+ / 1IN- / -INA / OUTA / 1OUT / + / -)."""
+    (+IN / IN+ / IN1+ / 1IN- / -INA / OUTA / 1OUT / + / -). Bare "+" / "-"
+    pins count only on a part whose library, value or description reads as
+    an amplifier or comparator (a module with + / - supply pins is none)."""
+    comp = nl.components.get(ref) or {}
+    amp = bool(_AMP_PART.search(" ".join((comp.get("lib_id", ""), comp.get("value", ""),
+                                          comp.get("description", "")))))
     ch: dict[str, dict] = defaultdict(dict)
     for p in nl.pins.get(ref, []):
         name = (p.name or "").replace("~", "").replace("{", "").replace("}", "").upper()
         m = _OPA_PIN.match(name)
         if not m:
+            continue
+        if m.group("s3") and not amp:
             continue
         if m.group("pre2") is not None and name.startswith(m.group("pre2") + "OUT"):
             key = m.group("pre2") or m.group("ch2") or ""
@@ -543,8 +584,8 @@ def _opamp_pins(nl: Netlist, ref: str) -> dict[str, dict]:
     # a single-channel symbol whose output pin has no name (KiCAD "~"):
     # the one unnamed output-typed pin is OUT
     open_ = [k for k, v in ch.items() if {"+", "-"} <= set(v) and "out" not in v]
-    unnamed = [p for p in nl.pins.get(ref, []) if p.type.split("+")[0] == "output"
-               and (p.name or "").strip("~ ") == ""]
+    unnamed = [p for p in nl.pins.get(ref, []) if p.type.split("+")[0] in (
+        "output", "open_collector") and (p.name or "").strip("~ ") == ""]
     if len(ch) == 1 and len(open_) == 1 and len(unnamed) == 1:
         ch[open_[0]]["out"] = unnamed[0].net
     return {k: v for k, v in ch.items() if {"+", "-", "out"} <= set(v)}
@@ -565,7 +606,7 @@ def find_opamp_stages(nl: Netlist, specs: dict) -> list[dict]:
     for ref in sorted(nl.components):
         if kind(ref) not in ("U", "IC") or not _fitted(nl, ref):
             continue
-        for ch, pins in sorted(_opamp_pins(nl, ref).items()):
+        for ch, pins in sorted(opamp_pins(nl, ref).items()):
             inv, non, o = pins["-"], pins["+"], pins["out"]
             rec = {"ref": ref, "channel": ch or None, "in_plus": non, "in_minus": inv, "out": o}
             rf = _r_between(nl, o, inv)
@@ -800,68 +841,67 @@ def via_inductance_h(height_mm: float, drill_mm: float) -> float:
     return 0.2e-9 * height_mm * (math.log(4 * height_mm / drill_mm) + 1)
 
 
-def mounting_inductance(tree: list, caps: list[str]) -> dict[str, dict]:
-    """For each capacitor ref: its ground pad's nearest ground via, the via
-    barrel from the cap's layer to the nearest ground plane (stackup
-    thicknesses) and its partial inductance, plus the pad-to-via connection
-    as a strip over the plane (track width when a ground track joins them,
-    else the pad width for a pour). A first-order mounting estimate; the
-    cap's own ESL comes only from its datasheet."""
+def mounting_inductance(tree: list, caps: list[str], board=None) -> dict[str, dict]:
+    """For each capacitor ref, the mounting loop on both pads: each pad's
+    nearest via of its own net, the via barrel from the cap's layer to the
+    first layer below that carries that net as a plane (ground: a ground
+    plane; supply: a layer with that rail's copper), and the pad-to-via
+    connection as a strip over the plane (track width when a track of that
+    net joins them, else the pad width for a pour). `l_h` is the sum of both
+    sides; a side without a via of its net within 3 mm (a rail routed by a
+    track to its IC) is left out and named in `sides_missing`. A first-order
+    estimate; the cap's own ESL comes only from its datasheet. `board`: an
+    `emc_review.Board` already built from `tree` (else one is built)."""
     from kicad_claude.adapters import emc_review, pcb_netlist
+    from kicad_claude.adapters.pcb_editor import net_of
     from kicad_claude.adapters.pcb_geometry import is_ground_net
 
-    b = emc_review.load_board(tree, 1.0)
+    b = board if board is not None else emc_review.load_board(tree, 1.0)
     roles = {r["layer"]: r["role"] for r in emc_review.layer_roles(b)}
-    gvias = []
+    vias = defaultdict(list)                   # net -> [((x, y), drill)]
     for node in tree[1:]:
         if isinstance(node, list) and node and str(node[0]) == "via":
             v = [x for x in node[1:] if isinstance(x, list)]
             at = next((x for x in v if str(x[0]) == "at"), None)
             dr = next((x for x in v if str(x[0]) == "drill"), None)
-            from kicad_claude.adapters.pcb_editor import net_of
-            if at and is_ground_net(net_of(node, tree)):
-                gvias.append(((float(at[1]), float(at[2])), float(dr[1]) if dr else 0.3))
+            if at:
+                vias[net_of(node, tree) or ""].append(
+                    ((float(at[1]), float(at[2])), float(dr[1]) if dr else 0.3))
+    gvias = [v for n, vs in vias.items() if is_ground_net(n) for v in vs]
     pads = defaultdict(list)
     for p in pcb_netlist.list_pads(tree):
         pads[p["ref"]].append(p)
-    tracks_by_layer = defaultdict(list)
+    tracks_by = defaultdict(list)              # (layer, net) -> tracks
     for t in pcb_netlist._tracks(tree):
-        if is_ground_net(t["net_name"]):
-            tracks_by_layer[t["layer"]].append(t)
-    out = {}
-    for c in caps:
-        gp = [p for p in pads.get(c, []) if is_ground_net(p["net_name"])]
-        if not gp or not gvias:
-            continue
-        pad = gp[0]
-        (vx, vy), drill = min(gvias, key=lambda v: math.dist(v[0], pad["point"]))
+        tracks_by[(t["layer"], t["net_name"])].append(t)
+
+    def diel(i):            # a board with no stackup has no dielectrics: no estimate
+        return b.dielectrics[i] if 0 <= i < len(b.dielectrics) else {}
+
+    def side(pad, cands, is_plane):
+        if not cands:
+            return None
+        (vx, vy), drill = min(cands, key=lambda v: math.dist(v[0], pad["point"]))
+        dist = math.dist((vx, vy), pad["point"])
+        if dist > 3.0:
+            return None
         layer = pad["layers"][0] if pad["layers"] else b.layers[0]
         k = b.layers.index(layer) if layer in b.layers else 0
-        # walk from the cap's layer into the board to the first ground plane;
-        # dielectrics[j] sits between layers[j] and layers[j + 1]
-        h, found = 0.0, None
         down = k < len(b.layers) - 1
-
-        def diel(i):            # a board with no stackup has no dielectrics: no estimate
-            return b.dielectrics[i] if 0 <= i < len(b.dielectrics) else {}
-        j = k
+        h, found, j = 0.0, None, k
         while 0 <= (j + 1 if down else j - 1) < len(b.layers):
             d = diel(j) if down else diel(j - 1)
             j = j + 1 if down else j - 1
             h += d.get("thickness_mm") or 0.0
-            if roles.get(b.layers[j]) == "ground_plane":
+            if is_plane(b.layers[j]):
                 found = b.layers[j]
                 break
         if not found or not h:
-            continue
-        dist = math.dist((vx, vy), pad["point"])
-        # pad -> via: a ground track that starts at the pad and ends at the
-        # via (single segment), else the pour, modelled as a strip of the
-        # pad's width over the plane below the cap's layer
+            return None
         h_strip = diel(k)["thickness_mm"] if down and diel(k).get("thickness_mm") \
             else (diel(k - 1).get("thickness_mm") if k else None) or h
         track = None
-        for t in tracks_by_layer.get(layer, []):
+        for t in tracks_by.get((layer, pad["net_name"]), []):
             ends = (t["start"], t["end"])
             if any(math.dist(e, pad["point"]) <= pad["radius_mm"] for e in ends) and \
                     any(math.dist(e, (vx, vy)) <= 0.05 for e in ends):
@@ -874,10 +914,31 @@ def mounting_inductance(tree: list, caps: list[str]) -> dict[str, dict]:
             w, method, length = pad["radius_mm"] * math.sqrt(2), "pour (pad-width strip)", dist
         l_trace = strip_inductance_h(length, w, h_strip)
         l_via = via_inductance_h(h, drill)
-        out[c] = {"via_at": [vx, vy], "via_drill_mm": drill, "plane": found,
-                  "height_mm": round(h, 4), "pad_to_via_mm": round(dist, 3),
-                  "connection": method, "strip_width_mm": round(w, 3),
-                  "l_via_h": l_via, "l_trace_h": l_trace, "l_h": l_via + l_trace}
+        return {"via_at": [vx, vy], "via_drill_mm": drill, "plane": found,
+                "height_mm": round(h, 4), "pad_to_via_mm": round(dist, 3),
+                "connection": method, "strip_width_mm": round(w, 3),
+                "l_via_h": l_via, "l_trace_h": l_trace, "l_h": l_via + l_trace}
+
+    out = {}
+    for c in caps:
+        ps = pads.get(c, [])
+        gp = [p for p in ps if is_ground_net(p["net_name"])]
+        sp = [p for p in ps if not is_ground_net(p["net_name"])]
+        if not gp:
+            continue
+        g = side(gp[0], gvias, lambda ly: roles.get(ly) == "ground_plane")
+        if g is None:
+            continue
+        rail = sp[0]["net_name"] if sp else ""
+        s_ = side(sp[0], vias.get(rail, []),
+                  lambda ly: bool(b.fill.get(ly, {}).get(rail))) if sp else None
+        rec = dict(g)                           # the ground side keeps the old keys
+        rec["ground_side"] = g
+        rec["supply_side"] = s_
+        rec["sides_missing"] = [] if s_ else [f"supply ({rail or '?'}): no via of the rail "
+                                               "within 3 mm to a layer with its copper"]
+        rec["l_h"] = g["l_h"] + (s_["l_h"] if s_ else 0.0)
+        out[c] = rec
     return out
 
 
