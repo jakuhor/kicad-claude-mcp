@@ -173,3 +173,63 @@ class TestDcModelOp10:
         voh = {"U1": {"mpn": "P", "pin_models": {"GPIO": {"v_oh": _sv(min=2.7, unit="V")}}}}
         on2 = dc_model.solve(nl, {"VBUS": (20.0, "c")}, voh, {"Q2": "on"})
         assert on2["volts"]["NG"][0] == pytest.approx(2.7)
+
+
+class TestUnknownSupplies:
+    """Field report (firbox base_board vs kicad-happy, 2026-11-12): a rail fed
+    through a load switch from a USB-PD contract has no known voltage; tied to
+    ground only through an EN divider it solved to a few mV and failed every
+    VIN / EN check, and an LED string walked across it through a TVS."""
+
+    def _board(self, tmp_path):
+        comps = [_comp("U1", "BUCK"), _comp("R1", "1430k"), _comp("R2", "100k"),
+                 _comp("J1", "USB_C", lib="Connector:USB_C"), _comp("D6", "SMF24A"),
+                 _comp("D3", "RED", lib="Device:LED"), _comp("D8", "CCR"), _comp("C1", "1u")]
+        nets = [_net(1, "VBUS", ("J1", "1", "VBUS", "passive"), ("D6", "1", "K", "passive"),
+                     ("D8", "1", "A", "passive"), ("C1", "1", "", "passive")),
+                _net(2, "VIN", ("U1", "1", "VIN", "power_in"), ("R1", "1", "", "passive")),
+                _net(3, "EN", ("U1", "2", "EN", "input"), ("R1", "2", "", "passive"),
+                     ("R2", "1", "", "passive")),
+                _net(4, "LA", ("D8", "2", "K", "passive"), ("D3", "2", "A", "passive")),
+                _net(5, "GND", ("U1", "9", "GND", "power_in"), ("R2", "2", "", "passive"),
+                     ("D6", "2", "A", "passive"), ("D3", "1", "K", "passive"),
+                     ("C1", "2", "", "passive"))]
+        return _nl(tmp_path, comps, nets)
+
+    def test_unsourced_rail_stays_unknown(self, tmp_path):
+        nl = self._board(tmp_path)
+        specs = {"U1": {"mpn": "B", "regulator": {"en_pullup_current": {
+            "typ": 1e-6, "unit": "A", "page": 1}}}}
+        volts = dc_model.solve(nl, {}, specs)["volts"]
+        assert "VIN" not in volts and "EN" not in volts
+        # with the rail given, the divider solves as before
+        volts = dc_model.solve(nl, {"VIN": (20.0, "caller")}, specs)["volts"]
+        assert volts["EN"][0] == pytest.approx(20 * 100 / 1530 + 1e-6 * 1430e3 * 100 / 1530,
+                                               rel=1e-6)
+
+    def test_led_string_stops_at_unknown_rail(self, tmp_path):
+        nl = self._board(tmp_path)
+        specs = {"D3": {"mpn": "L", "category": "led",
+                        "electrical": {"VF": {"typ": 1.9, "unit": "V", "page": 1}}},
+                 "D8": {"mpn": "C", "category": "current_regulator",
+                        "electrical": {"I_reg": {"typ": 0.01, "unit": "A", "page": 1},
+                                       "V_min": {"max": 1.8, "unit": "V", "page": 1}}}}
+        f: list = []
+        rows = part_ratings.check_leds(nl, specs, {}, f, lambda *a: None)
+        assert "known voltage" in rows[0]["status"] and not f      # not across D6 to GND
+        rows = part_ratings.check_leds(nl, specs, {"VBUS": 20.0}, f, lambda *a: None)
+        assert rows[0]["top"] == "VBUS" and rows[0]["v_ccr"] == pytest.approx(18.1)
+
+
+def test_all_passive_vendor_symbol_gets_supply_pins(tmp_path):
+    comps = [_comp("IC5", "M95080"), _comp("U2", "TYPED"), _comp("C1", "100n")]
+    nets = [_net(1, "+3V3", ("IC5", "8", "VCC", "passive"), ("U2", "1", "VCC", "passive"),
+                 ("C1", "1", "", "passive")),
+            _net(2, "GND", ("IC5", "4", "VSS", "passive"), ("U2", "2", "GND", "power_in"),
+                 ("C1", "2", "", "passive")),
+            _net(3, "SCK", ("IC5", "6", "C", "passive"), ("U2", "3", "SCK", "output"))]
+    nl = _nl(tmp_path, comps, nets)
+    types = {(p.ref, p.name): p.type for ps in nl.pins.values() for p in ps}
+    assert types[("IC5", "VCC")] == types[("IC5", "VSS")] == "power_in"
+    assert types[("IC5", "C")] == "passive" and nl.components["IC5"]["pin_types"] == "inferred"
+    assert types[("U2", "VCC")] == "passive"          # a typed symbol is left alone

@@ -365,6 +365,9 @@ def test_assembly_checks(tmp_path):
     r = ar.check_assembly(tree, "both", min_spacing_mm=0.5)
     assert ("AS-CRTYD-SPACING", "R3,R4") in {(f["rule"], f["ref"]) for f in r["findings"]}
     assert not any(f["rule"] == "AS-SIDE" for f in r["findings"])
+    # default auto: the board's own sides; a second side is an info, not an error
+    side = [f for f in ar.check_assembly(tree)["findings"] if f["rule"] == "AS-SIDE"]
+    assert [(f["severity"], f["ref"]) for f in side] == [("info", "C1")]
 
 
 def test_cross_verify(tmp_path):
@@ -608,3 +611,75 @@ def test_dfm_round_pads_are_round(tmp_path):
     r = dfm.analyze(_dfm_board(tmp_path, extra=extra), "jlcpcb_2l_default",
                     ps.FAB_PRESETS["jlcpcb_2l_default"]["rules"])
     assert not [f for f in r["findings"] if f["rule"] == "DFM-SPACING"]
+
+
+def test_testpoint_coverage(tmp_path):
+    from kicad_claude.adapters import assembly_review as ar
+    from kicad_claude.adapters import sch_io
+
+    def part(ref, x, nets, lib="L:R"):
+        ps = " ".join(f'(pad "{i + 1}" smd rect (at {i} 0) (size 0.5 0.5) (layers "F.Cu") '
+                      f'(net "{n}"))' for i, n in enumerate(nets))
+        return f'(footprint "{lib}" (layer "F.Cu") (at {x} 5) (property "Reference" "{ref}") {ps})'
+    items = [part("R1", 2, ["+3V3", "SIG"]), part("R2", 5, ["SIG", "GND"]),
+             part("C1", 8, ["+3V3", "GND"]), part("C2", 11, ["+5V", "GND"]),
+             part("U1", 14, ["+5V", "OTHER"]), part("TP1", 17, ["+3V3"], "TestPoint:TP")]
+    p = tmp_path / "t.kicad_pcb"
+    p.write_text('(kicad_pcb (version 20260206) (layers (0 "F.Cu" signal)) '
+                 '(gr_rect (start 0 0) (end 20 10) (layer "Edge.Cuts")) '
+                 + " ".join(items) + ")", encoding="utf-8")
+    r = ar.check_assembly(sch_io.parse_file(p), heights=False)
+    assert r["testpoints"] == {"nets": 4, "with_testpoint": 1, "rails_without": ["+5V"]}
+    tp = next(f for f in r["findings"] if f["rule"] == "AS-TESTPOINT")
+    assert tp["severity"] == "info" and "1 of 4 nets" in tp["message"] and "+5V" in tp["message"]
+
+
+def _pour_pcb(tmp_path, items, zone_mode=""):
+    from kicad_claude.adapters import sch_io
+    gnd = ('(zone (net "GND") (layer "F.Cu") ' + zone_mode
+           + '(polygon (pts (xy 8 0) (xy 20 0) (xy 20 10) (xy 8 10))) (filled_polygon (layer "F.Cu") '
+           '(pts (xy 8 0) (xy 20 0) (xy 20 10) (xy 8 10))))')
+    p = tmp_path / "z.kicad_pcb"
+    p.write_text('(kicad_pcb (version 20260206) (layers (0 "F.Cu" signal)) '
+                 '(gr_rect (start 0 0) (end 20 10) (layer "Edge.Cuts")) '
+                 + " ".join(items) + " " + gnd + ")", encoding="utf-8")
+    return sch_io.parse_file(p)
+
+
+def _passive(ref, x, y, rot=0, lib="Capacitor_SMD:C_0402_1005Metric", nets=("SIG", "GND"),
+             pad2=""):
+    return (f'(footprint "{lib}" (layer "F.Cu") (at {x} {y} {rot}) (attr smd) '
+            f'(property "Reference" "{ref}") '
+            f'(pad "1" smd rect (at -0.5 0) (size 0.5 0.5) (layers "F.Cu") (net "{nets[0]}")) '
+            f'(pad "2" smd rect (at 0.5 0) (size 0.5 0.5) (layers "F.Cu") (net "{nets[1]}"){pad2}))')
+
+
+def test_tombstoning_needs_a_solid_pour_pad(tmp_path):
+    from kicad_claude.adapters import assembly_review as ar
+    # C1: pad 2 (GND) inside the pour at x 8..20, pad 1 on a track outside it
+    tree = _pour_pcb(tmp_path, [_passive("C1", 7.8, 5)], "(connect_pads yes (clearance 0.3)) ")
+    r = ar.check_assembly(tree, heights=False)
+    assert [(f["rule"], f["severity"], f["ref"]) for f in r["findings"]
+            if f["rule"] == "AS-TOMBSTONE"] == [("AS-TOMBSTONE", "warning", "C1")]
+    # default thermal reliefs: the remedy is in place, nothing reported
+    tree = _pour_pcb(tmp_path, [_passive("C1", 7.8, 5)], "(connect_pads (clearance 0.3)) ")
+    assert not ar.check_assembly(tree, heights=False)["tombstoning"]
+    # a pad-level relief override beats a solid zone; 0603 is out of scope
+    tree = _pour_pcb(tmp_path, [_passive("C1", 7.8, 5, pad2=" (zone_connect 1)"),
+                           _passive("C2", 7.8, 2, lib="Capacitor_SMD:C_0603_1608Metric")],
+                "(connect_pads yes (clearance 0.3)) ")
+    assert not ar.check_assembly(tree, heights=False)["tombstoning"]
+    # via in the GND pad straight into the plane, away from any pour on F.Cu
+    via = '(via (at 3.5 5) (size 0.4) (drill 0.2) (layers "F.Cu" "B.Cu") (net "GND"))'
+    tb = ar.check_assembly(_pour_pcb(tmp_path, [_passive("C3", 3, 5), via]),
+                           heights=False)["tombstoning"]
+    assert [(t["ref"], t["connection"]) for t in tb] == [("C3", "via")]
+
+
+def test_passive_orientation_majority(tmp_path):
+    from kicad_claude.adapters import assembly_review as ar
+    items = [_passive(f"R{i}", 2 + i, 8, rot, nets=("A", "B"))
+             for i, rot in enumerate([0, 180, 0, 0, 0, 90, 270])]
+    r = ar.check_assembly(_pour_pcb(tmp_path, items), heights=False)
+    o = next(f for f in r["findings"] if f["rule"] == "AS-ORIENT")
+    assert o["ref"] == "R5,R6" and "2 of 7" in o["message"]

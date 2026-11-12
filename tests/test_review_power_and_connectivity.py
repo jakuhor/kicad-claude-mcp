@@ -192,6 +192,7 @@ def test_connectivity_review(tmp_path):
     assert ("CR-PWR-NC", "U1") in rules                 # VDDA unconnected
     assert ("CR-PWR-DNP", "U4") in rules                # only via DNP L1
     assert ("CR-DEC-NONE", "U4") in rules
+    assert not any(f["rule"] == "CR-PWR-UNSRC" for f in r["findings"])
     assert not any(f["rule"] == "CR-DEC-NONE" and f["ref"] == "U1" for f in r["findings"])
     assert ("CR-OD-PULL", "U4") in rules                # ~{INT} without pull-up
     assert ("CR-I2C-PULLUP", "U1,U2,U3") in rules       # SCL has none
@@ -312,3 +313,21 @@ def test_sleep_current_divider_and_ldo_iq(tmp_path):
     off = _budget(tmp_path, specs, {"U1": "off"})["sleep_current"]
     assert "+5V" in off["rails_off"] and "R1" not in {x["ref"] for x in off["items"]}
     assert "U1: no I_shdn extracted" in off["nodata"]
+
+
+def test_unsourced_rail_names_a_mistyped_output(tmp_path):
+    # a module's LDO output typed power_in sources the rail: one finding per
+    # part and net, naming the pin to fix (AIRDOS05 vs kicad-happy, 2026-11-12)
+    comps = [_comp("U16", "BT_MODULE"), _comp("U15", "LVL")]
+    nets = [_net(1, "+1.8V", ("U16", "A5", "MLDO_OUT", "power_in"),
+                 ("U16", "A17", "VDD_IO", "power_in"), ("U16", "B18", "VDD_IO", "power_in"),
+                 ("U15", "1", "VCCA", "power_in")),
+            _net(2, "GND", ("U16", "G1", "GND", "power_in"), ("U15", "2", "GND", "power_in"))]
+    p = tmp_path / "u.net"
+    p.write_text(f'(export (version "E") (components {" ".join(comps)}) (nets {" ".join(nets)}))',
+                 encoding="utf-8")
+    r = cr.analyze(pr.parse_netlist(p))
+    un = [f for f in r["findings"] if f["rule"] == "CR-PWR-UNSRC"]
+    assert [f["ref"] for f in un] == ["U15", "U16"]
+    assert all("U16.MLDO_OUT looks like the source" in f["message"] for f in un)
+    assert "MLDO_OUT, VDD_IO on +1.8V" in un[1]["message"]

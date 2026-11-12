@@ -249,7 +249,14 @@ def register(mcp) -> None:
             layer (EM-STACK-REF), floating ground islands (EM-GND-ISLAND),
             ground nets and the parts joining them (EM-GND-DOMAINS), signals
             crossing a change of reference-plane net without a bridging cap
-            (EM-SPLIT-CROSS), ground-via stitching vs λ/20 at `f_max_hz`
+            (EM-SPLIT-CROSS), signal and supply vias whose layer change moves
+            the return current to another plane (each layer's nearest adjacent
+            pour; both only within 2x dielectric): same plane net needs a via
+            of that net reaching both planes within 2x the first dielectric,
+            at least 1 mm; different plane nets need a capacitor between them
+            within 5 mm (EM-VIA-STITCH, one per net; warning for clock /
+            high-speed signals; `via_transitions`), ground-via
+            stitching vs λ/20 at `f_max_hz`
             (EM-STITCH), ground at the board edge (EM-EDGE-GND), connector
             ground pins (EM-CONN-GND);
           - `switching` — per switching regulator (from the schematic and the
@@ -259,15 +266,19 @@ def register(mcp) -> None:
             (`fcc-class-b|fcc-class-a|cispr-class-b|cispr-class-a`; EM-SW-RAD),
             switching inductors near the edge or a connector;
           - `decoupling` — every IC supply pin (power_in, from the netlist)
-            to its nearest capacitor on the same net (EM-DEC-DIST > 
-            `decap_max_mm`, EM-DEC-NONE), each cap's ground pad to the nearest
+            to its nearest capacitor on the same net (EM-DEC-DIST >
+            `decap_max_mm`, EM-DEC-NONE; one finding per IC and net), each cap's ground pad to the nearest
             ground via (EM-DEC-VIA > `cap_via_max_mm`), per-rail capacitor bank
             vs a target impedance `pdn={"+3V3": 0.05}` or
             `pdn={"+3V3": {"ripple": 0.03, "i_step": 0.5}}` (EM-PDN; ESL / ESR
-            only from extracted cap datasheets — never assumed);
+            only from extracted cap datasheets — never assumed); every bank
+            also gets `z_profile_ohm` at 100 kHz / 1 / 10 / 100 MHz (series
+            C-ESR-L per cap, L = datasheet ESL + layout mounting inductance; no
+            plane capacitance, unknown ESR = 0, as `z_profile_basis` states);
           - `io` — every connector line: TVS / ESD diode present and its
             distance (EM-IO-ESD, EM-IO-ESD-DIST > `esd_max_mm`), series filter
-            on signal lines (EM-IO-FILTER); signal tracks within
+            on signal lines (EM-IO-FILTER; both one finding per connector,
+            lines in `nets`); signal tracks within
             `edge_keepout_mm` of the edge (EM-EDGE-TRACE); clocks near
             connectors (EM-CLK-CONN); crystal-to-IC distance (EM-XTAL-DIST);
             diff-pair skew (EM-DIFF-SKEW > `diff_skew_ps`); clock / high-speed
@@ -295,9 +306,11 @@ def register(mcp) -> None:
         worst margin per band in `harmonic_screen` (`screening_only: true`);
         a negative margin is EM-HARM-LIMIT. An invalid profile is an error.
 
-        `fsw={"U1": 500e3, "U2/ch1": 1.8e6}` — switching frequencies; not
-        taken from the datasheet because it depends on RT/SYNC (the spec value
-        is shown as a hint). `iout` — load currents (default: the datasheet
+        `fsw={"U1": 500e3, "U2/ch1": 1.8e6}` — switching frequencies. The
+        datasheet value is used only when the schematic meets its stated
+        condition (RT pin floating, or one resistor to ground of the stated
+        value within 1 %, with any SYNC / CLKIN pin idle; `fsw_source` says
+        which); otherwise it is a hint. `iout` — load currents (default: the datasheet
         IOUT max, worst case). `rail_voltages` — unregulated inputs, as for
         `analyze_power_tree`. Results are first-pass estimators, not sign-off.
         """

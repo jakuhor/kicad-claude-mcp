@@ -399,3 +399,53 @@ def test_behavioural_opamp_bandwidth(tmp_path):
     assert b["model"] == "behavioural, from datasheet OPX1 p.5: OPAMP_OPX1"
     assert b["simulated"]["gain_lf"] == pytest.approx(2.0, rel=0.01)
     assert b["simulated"]["f_3db_hz"] == pytest.approx(1e6 / 3, rel=0.15)    # GBW / NG
+
+
+def test_opamp_with_bare_sign_pins_and_unnamed_output(tmp_path):
+    # MLAB-style symbol (AIRDOS05): pins "+", "-", and an unnamed output pin
+    comps = [_comp("U1", "AD8691"), _comp("R4", "10k"), _comp("R5", "100k")]
+    nets = [_net(1, "REF", ("U1", "3", "+", "input")),
+            _net(2, "INV", ("U1", "4", "-", "input"), ("R4", "1", "", "passive"),
+                 ("R5", "1", "", "passive")),
+            _net(3, "OUT", ("U1", "1", "", "output"), ("R5", "2", "", "passive")),
+            _net(4, "IN", ("R4", "2", "", "passive")),
+            _net(5, "VCC5", ("U1", "5", "V+", "power_in")),
+            _net(6, "GNDA", ("U1", "2", "V-", "power_in"))]
+    st = sa.find_opamp_stages(_nl(tmp_path, comps, nets), {})
+    assert [(s["ref"], s["topology"], s["gain"]) for s in st] == [("U1", "inverting", -10.0)]
+    from kicad_claude.adapters import circuit_review
+    assert circuit_review.opamp_channels(_nl(tmp_path, comps, nets), {})["U1"][""]["out"] == "OUT"
+
+
+def test_rc_highpass_dc_block():
+    # OP-18: rail -> 100n -> SMA with 10k bleed (firbox C61 / R50): fc 159 Hz;
+    # a feed-forward cap on an FB node and a node also fed by a fitted R are not
+    from kicad_claude.adapters.power_review import Netlist, Pin
+
+    nl = Netlist()
+
+    def add(ref, num, name, typ, net, value=None):
+        p = Pin(ref, num, name, typ, net)
+        nl.pins[ref].append(p)
+        nl.nets.setdefault(net, []).append(p)
+        if value:
+            nl.components[ref] = {"value": value}
+    add("C61", "1", "", "passive", "+20V", "100n")
+    add("C61", "2", "", "passive", "SMA", "100n")
+    add("R50", "1", "", "passive", "SMA", "10k")
+    add("R50", "2", "", "passive", "GND", "10k")
+    add("J5", "1", "In", "passive", "SMA", "SMA")
+    add("C37", "1", "", "passive", "-18V", "10n")
+    add("C37", "2", "", "passive", "FBN", "10n")
+    add("R34", "1", "", "passive", "FBN", "10k")
+    add("R34", "2", "", "passive", "GND", "10k")
+    add("U5", "5", "FB", "input", "FBN", "LDO")
+    hp = sa.find_rc_highpass(nl, {"+20V", "-18V", "SMA"})
+    assert [(h["series_cap"], h["shunt_r"], h["fc_hz"]) for h in hp] == [("C61", ["R50"], 159.155)]
+    assert "J5 goes off-board" in hp[0]["load"]
+    # a 50 ohm instrument on the SMA sets the corner: 1 / (2 pi (10k || 50) 100n)
+    hp = sa.find_rc_highpass(nl, {"+20V", "-18V", "SMA"}, loads={"SMA": 50})
+    assert hp[0]["fc_hz"] == pytest.approx(1 / (2 * math.pi * (1 / (1e-4 + 0.02)) * 1e-7), rel=1e-4)
+    add("R49", "1", "", "passive", "+20V", "0R")      # a fitted DC path: no longer a high-pass
+    add("R49", "2", "", "passive", "SMA", "0R")
+    assert sa.find_rc_highpass(nl, {"+20V", "-18V", "SMA"}) == []

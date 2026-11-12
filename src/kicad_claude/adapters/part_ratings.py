@@ -1104,6 +1104,11 @@ def check_leds(nl: Netlist, specs: dict, volts: dict, findings: list, therm) -> 
             nonlocal r_total, ccr
             seen = {prev}
             while _net_v(net, volts) is None:
+                # a supply or connector net of unknown voltage ends the string:
+                # walking on would cross a TVS or a load to ground
+                if any(p.type.split("+")[0] in ("power_in", "power_out")
+                       or kind(p.ref) in ("J", "P", "CN") for p in nl.nets.get(net, [])):
+                    return None
                 nxt = None
                 for p in nl.nets.get(net, []):
                     if p.ref in seen or p.ref in chain:
@@ -1144,7 +1149,7 @@ def check_leds(nl: Netlist, specs: dict, volts: dict, findings: list, therm) -> 
         row = {"ref": ref, "chain": chain, "series_r": r_total or None, "ccr": ccr,
                "switch_assumed_on": switch}
         out.append(row)
-        if top is None or bot is None:
+        if top is None or bot is None or top == bot:
             row["status"] = "string does not end on nets of known voltage (GPIO-driven?)"
             continue
         vs = _net_v(top, volts) - _net_v(bot, volts)

@@ -373,6 +373,16 @@ def solve(nl: Netlist, known: dict, specs: dict | None = None,
     zs = zeners(nl, specs)
     clamps_def = [{"kind": "pin", **pm} for pm in pms if "clamp" in pm] + \
                  [{"kind": "zener", **z} for z in zs]
+    # A node carrying a supply pin or a connector pin is held by a source the
+    # model does not know (a USB-PD contract behind a load switch, a bench
+    # input). Tied to ground only through dividers and pin currents, it would
+    # solve to a few mV and fail every VIN / EN check, so such a group stays
+    # unsolved unless it also reaches a known non-ground node.
+    gnd_g = uf.find(gnd)
+    supply_like = {uf.find(p.net) for ps in nl.pins.values() for p in ps
+                   if not is_ground(p.net) and not is_unconnected(p.net)
+                   and (p.type.split("+")[0] in ("power_in", "power_out")
+                        or kind(p.ref) in ("J", "P", "CN"))}
 
     def run():
         fixed: dict[str, tuple[float, str]] = {}
@@ -397,7 +407,7 @@ def solve(nl: Netlist, known: dict, specs: dict | None = None,
         for u in unknown:
             if u in seen:
                 continue
-            stack, members, touches = [u], [], False
+            stack, members, touches, live = [u], [], False, False
             seen.add(u)
             while stack:
                 x = stack.pop()
@@ -405,10 +415,11 @@ def solve(nl: Netlist, known: dict, specs: dict | None = None,
                 for y, _r in adj[x]:
                     if y in kv:
                         touches = True
+                        live = live or y != gnd_g
                     elif y not in seen:
                         seen.add(y)
                         stack.append(y)
-            if touches:
+            if touches and (live or not any(m in supply_like for m in members)):
                 for m in members:
                     comp[m] = True
         idx = {g: i for i, g in enumerate(sorted(comp))}

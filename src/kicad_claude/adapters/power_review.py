@@ -134,7 +134,29 @@ def parse_netlist(path: Path) -> Netlist:
             pins.append(p)
             nl.pins[ref].append(p)
         nl.nets[name] = pins
+    _infer_untyped_supply_pins(nl)
     return nl
+
+
+_SUPPLY_NAME = re.compile(r"^(A|D|P|IO)?V(CC|DD|IN|BAT|IO|S\+|\+)\w*$|^(A|D|P)?(GND|VSS|VEE)\w*$",
+                          re.I)
+
+
+def _infer_untyped_supply_pins(nl: Netlist) -> None:
+    """A vendor symbol (SnapEDA, Ultra Librarian) often types every pin
+    passive, so no supply check would see its VCC. For an IC whose pins are
+    all passive, pins named like a supply or ground become power_in; the
+    component records `pin_types: "inferred"`. Typed symbols are untouched."""
+    for ref, pins in nl.pins.items():
+        if not re.match(r"(U|IC)\d", ref) or not pins:
+            continue
+        if any(p.type not in ("passive", "") for p in pins):
+            continue
+        hit = [p for p in pins if _SUPPLY_NAME.match(p.name or "")]
+        for p in hit:
+            p.type = "power_in"
+        if hit and ref in nl.components:
+            nl.components[ref]["pin_types"] = "inferred"
 
 
 # ---- value parsing --------------------------------------------------------- #

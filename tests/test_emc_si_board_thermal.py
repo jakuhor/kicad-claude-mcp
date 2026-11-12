@@ -90,6 +90,7 @@ def test_hot_spot_proximity(tmp_path):
     r = _run(_board(tmp_path, 0, extra), nl=_nl(caps))      # U1 rise 50 K
     got = {(f["rule"], f["ref"]) for f in r["findings"]}
     assert ("TH-MLCC-HOT", "C1") in got                       # 5 mm
+    assert {f["severity"] for f in r["findings"] if f["rule"] == "TH-MLCC-HOT"} == {"info"}
     assert ("TH-MLCC-HOT", "C2") not in got                   # 15 mm
     assert ("TH-ELCO-HOT", "C3") in got
     assert not any(ref == "C4" for _, ref in got)             # C0G: no drift
@@ -118,3 +119,42 @@ def test_analyze_board_thermal_tool(tmp_path, monkeypatch):
     u1 = next(p for p in r["parts"] if p["ref"] == "U1")
     assert u1["rth_source"] == "package_typical (assumed)"
     assert r["assumptions"]["ambient_source"].startswith("default")
+
+
+def test_thermal_via_footprint_counts_its_own_holes(tmp_path):
+    # a "_ThermalVias" footprint: the vias are plated holes numbered like the EP
+    holes = " ".join(f'(pad "17" thru_hole circle (at {dx} {dy}) (size 0.5 0.5) (drill 0.3) '
+                     f'(layers "*.Cu") (net "GND"))'
+                     for dx in (-0.6, 0, 0.6) for dy in (-0.6, 0, 0.6))
+    _board(tmp_path, 0)                                   # writes t.kicad_pcb
+    p = tmp_path / "t.kicad_pcb"
+    p.write_text(p.read_text(encoding="utf-8").replace(
+        '(net "GND"))', '(net "GND")) ' + holes, 1), encoding="utf-8")
+    row = _run(sch_io.parse_file(p))["parts"][0]
+    assert row["exposed_pads"][0]["vias"] == 9 and row["exposed_pads"][0]["adequacy"] == "good"
+
+
+def test_low_power_exposed_pad_vias_are_info(tmp_path):
+    # OP-18: a 0.2 W LDO with 2 vias (firbox U8) is reported, as info
+    low = {"dissipation": [{"ref": "U1", "p_w": 0.2, "method": "test"}]}
+    r = bt.analyze(_board(tmp_path, 2), _nl(), {}, low, 25.0, 25.0)
+    v = [f for f in r["findings"] if f["rule"] == "TH-VIAS"]
+    assert [(f["severity"], f["ref"]) for f in v] == [("info", "U1")]
+    assert r["low_power_vias"][0]["vias"] == 2
+    # no load given at all: still checked from the footprint
+    r = bt.analyze(_board(tmp_path, 0), _nl(), {}, {"dissipation": []}, 25.0, 25.0)
+    assert [f["ref"] for f in r["findings"] if f["rule"] == "TH-VIAS"] == ["U1"]
+
+
+def test_split_exposed_pad_is_one_row(tmp_path):
+    # two copper pads with the EP number (firbox U2 pad 29): one row, areas added
+    _board(tmp_path, 9)
+    p = tmp_path / "t.kicad_pcb"
+    p.write_text(p.read_text(encoding="utf-8").replace(
+        '(pad "17" smd rect (at 0 0) (size 1.7 1.7) (layers "F.Cu") (net "GND"))',
+        '(pad "17" smd rect (at 0 -0.45) (size 1.7 0.85) (layers "F.Cu") (net "GND")) '
+        '(pad "17" smd rect (at 0 0.45) (size 1.7 0.85) (layers "F.Cu") (net "GND"))'),
+        encoding="utf-8")
+    ep = [e for e in _run(sch_io.parse_file(p))["parts"][0]["exposed_pads"] if e["pad"] == "17"]
+    assert len(ep) == 1 and ep[0]["area_mm2"] == pytest.approx(2.89, abs=0.02)
+    assert ep[0]["vias"] == 9                  # union of both halves, none twice

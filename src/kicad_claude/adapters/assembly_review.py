@@ -124,7 +124,11 @@ def footprints(tree: list) -> list[dict]:
                 pat = find_child(pad, "at")
                 size = find_child(pad, "size")
                 px, py = (float(pat[1]), float(pat[2])) if pat else (0.0, 0.0)
+                pn = find_child(pad, "net")          # (net "N") in 10, (net 3 "N") before
+                zc = find_child(pad, "zone_connect")
                 pads.append({"number": str(pad[1]), "type": str(pad[2]),
+                             "net": str(pn[-1]) if pn and len(pn) > 1 else "",
+                             "zone_connect": int(zc[1]) if zc and len(zc) > 1 else None,
                              "at": pad_to_board_xy(fx, fy, rot, px, py),
                              "r": (math.hypot(float(size[1]), float(size[2])) / 2
                                    if size and len(size) > 2 else 0.3)})
@@ -140,7 +144,9 @@ def footprints(tree: list) -> list[dict]:
                            "scale": xyz("scale", (1.0, 1.0, 1.0)),
                            "rotate": xyz("rotate", (0.0, 0.0, 0.0))})
         out.append({"ref": get_footprint_reference(fp) or "?", "lib": str(fp[1]) if len(fp) > 1 else "",
-                    "x": fx, "y": fy, "side": side, "attrs": attrs, "props": props,
+                    "x": fx, "y": fy, "rot": rot, "side": side, "attrs": attrs, "props": props,
+                    "zone_connect": (lambda z: int(z[1]) if z and len(z) > 1 else None)(
+                        find_child(fp, "zone_connect")),
                     "hull": _hull(crt), "segments": segs, "silk_items": silk,
                     "silk_points": silk_pts, "pads": pads, "models": models})
     return out
@@ -308,7 +314,143 @@ def pin1_marked(f: dict) -> bool:
     return False
 
 
-def check_assembly(tree: list, assembly_sides: str = "top", min_spacing_mm: float = 0.0,
+_SMALL_PKG = re.compile(r"(?<!\d)(01005|0201|0402)(?!\d)|_(0603|1005)Metric")
+
+
+def _tombstoning(tree: list, fps: list[dict], findings: list) -> list[dict]:
+    """0201 / 0402 passives with one pad joined solid to a filled pour of its
+    own net (pad, footprint or zone setting) and the other only on a track:
+    the pour pad reflows late and the part stands up. A via inside the pad
+    to a pour of the pad's net (any layer) sinks heat the same way. Thermal
+    reliefs are the remedy, so a relieved pad is not reported."""
+    from kicad_claude.adapters.pcb_editor import net_of
+    from kicad_claude.adapters.pcb_geometry import _pts_polygon, point_in_polygon
+    polys = defaultdict(list)                  # (layer, net) -> [(polygon, zone mode)]
+    for z in find_children(tree, "zone"):
+        if find_child(z, "keepout") is not None:
+            continue
+        cp = find_child(z, "connect_pads")
+        tok = str(cp[1]) if cp and len(cp) > 1 and not isinstance(cp[1], list) else ""
+        mode = {"yes": "solid", "no": None, "thru_hole_only": "solid"}.get(tok, "relief")
+        net = net_of(z, tree)
+        for fpoly in find_children(z, "filled_polygon"):
+            ly = find_child(fpoly, "layer")
+            poly = _pts_polygon(find_child(fpoly, "pts"))
+            if net and ly and len(poly) >= 3:
+                polys[(str(ly[1]), net)].append((poly, mode))
+    if not polys:
+        return []
+    by_code = {0: None, 1: "relief", 2: "solid", 3: "relief"}   # KiCAD ZONE_CONNECTION
+    poured = {n for _, n in polys}
+    vias = []
+    for v in find_children(tree, "via"):
+        at = find_child(v, "at")
+        if at and len(at) > 2:
+            vias.append(((float(at[1]), float(at[2])), net_of(v, tree)))
+
+    def state(f, pad, layer):
+        ps = polys.get((layer, pad.get("net") or ""), [])
+        x, y = pad["at"]
+        if pad.get("net") in poured and any(n == pad.get("net") and math.dist(pt, (x, y))
+                                            <= 0.7 * pad["r"] for pt, n in vias):
+            return "via"                       # via in pad: straight into a plane
+        rad = pad["r"] + 0.3
+        pts = [(x, y)] + [(x + rad * math.cos(a * math.pi / 4), y + rad * math.sin(a * math.pi / 4))
+                          for a in range(8)]
+        hit = [m for poly, m in ps if any(point_in_polygon(px, py, poly) for px, py in pts)]
+        if not hit:
+            return None
+        for code in (pad.get("zone_connect"), f.get("zone_connect")):   # pad, then footprint
+            if code is not None:
+                return by_code.get(code, "relief")
+        return "solid" if "solid" in hit else ("relief" if "relief" in hit else None)
+    out = []
+    for f in fps:
+        if "dnp" in f["attrs"] or "smd" not in f["attrs"] or len(f["pads"]) != 2 \
+                or not re.match(r"(R|C|L|FB)\d", f["ref"]):
+            continue
+        m = _SMALL_PKG.search(f["lib"])
+        if not m:
+            continue
+        layer = "F.Cu" if f["side"] == "F" else "B.Cu"
+        st = [state(f, p, layer) for p in f["pads"]]
+        # thermal reliefs are the remedy: only a solid pour pad facing a track pad counts
+        if not (({"solid", "via"} & set(st)) and (None in st)):
+            continue
+        k = 0 if st[0] else 1
+        pour, how = f["pads"][k], st[k]
+        row = {"ref": f["ref"], "package": m.group(1) or m.group(2), "pad_in_pour": pour["number"],
+               "pour_net": pour.get("net"), "connection": how}
+        out.append(row)
+        findings.append(_f("warning", "AS-TOMBSTONE", f["ref"],
+                           f"{f['ref']} ({row['package']}): pad {pour['number']} is "
+                           + (f"joined solid to the {pour.get('net')} pour" if how == "solid" else
+                              f"on a via in pad into the {pour.get('net')} plane")
+                           + ", the other pad only to a track - unequal heating in reflow can "
+                           "stand the part up: " + ("use a thermal relief on that pad."
+                                                    if how == "solid" else
+                                                    "move the via off the pad (dog-bone).")))
+    return out
+
+
+def _orientation(fps: list[dict], findings: list) -> list[dict]:
+    """Two-pad SMD passives per side against the side's majority angle (0
+    and 180 count as one): pick-and-place and AOI like one orientation."""
+    from collections import Counter
+    out = []
+    for side in ("F", "B"):
+        parts = [(f["ref"], round(f.get("rot", 0.0)) % 180) for f in fps
+                 if f["side"] == side and "dnp" not in f["attrs"] and "smd" in f["attrs"]
+                 and len(f["pads"]) == 2 and re.match(r"(R|C|L)\d", f["ref"])]
+        if len(parts) < 5:
+            continue
+        major, n = Counter(a for _, a in parts).most_common(1)[0]
+        off = [r for r, a in parts if a != major]
+        if len(off) / len(parts) < 0.10:
+            continue
+        name = "top" if side == "F" else "bottom"
+        out.append({"side": name, "passives": len(parts), "majority_deg": major,
+                    "deviating": off})
+        findings.append(_f("info", "AS-ORIENT", ",".join(off[:20]),
+                           f"{len(off)} of {len(parts)} two-pad passives on the {name} side are "
+                           f"not at the majority {major} deg (0 / 180 alike): one orientation "
+                           "eases pick-and-place and optical inspection."))
+    return out
+
+
+def _testpoint_coverage(fps: list[dict], findings: list) -> dict:
+    """Nets reached by a test-point footprint (TP* reference or a TestPoint
+    library); supply rails without one are named, since bring-up probes
+    them first. Info only: bed-of-nails coverage is the test house's call."""
+    from kicad_claude.adapters.emc_review import is_power_net
+    pads_on = defaultdict(int)
+    tp_nets = set()
+    for f in fps:
+        if "dnp" in f["attrs"]:
+            continue
+        is_tp = bool(re.match(r"TP\d", f["ref"])) or "testpoint" in f["lib"].lower()
+        for p in f["pads"]:
+            n = p.get("net") or ""
+            if not n or n.rsplit("/", 1)[-1].startswith("unconnected-"):
+                continue
+            if is_tp:
+                tp_nets.add(n)
+            else:
+                pads_on[n] += 1
+    nets = {n for n, k in pads_on.items() if k >= 2 or n in tp_nets}
+    if not nets:
+        return {}
+    rails = sorted(n for n in nets if is_power_net(n) and n not in tp_nets)
+    got = len(nets & tp_nets)
+    findings.append(_f("info", "AS-TESTPOINT", "",
+                       f"Test points reach {got} of {len(nets)} nets ({100 * got // len(nets)} %)"
+                       + (f"; supply rails without one: {', '.join(rails[:12])}"
+                          f"{' …' if len(rails) > 12 else ''}." if rails else
+                          "; every supply rail has one.")))
+    return {"nets": len(nets), "with_testpoint": got, "rails_without": rails}
+
+
+def check_assembly(tree: list, assembly_sides: str = "auto", min_spacing_mm: float = 0.0,
                    edge_clearance_mm: float = 0.3, fiducials_min: int = 2,
                    tall_mm: float = 5.0, tall_edge_mm: float = 3.0,
                    max_height_top_mm: float | None = None,
@@ -319,7 +461,20 @@ def check_assembly(tree: list, assembly_sides: str = "top", min_spacing_mm: floa
     fitted = [f for f in fps if "dnp" not in f["attrs"] and "exclude_from_pos_files" not in f["attrs"]]
     smd = [f for f in fitted if "smd" in f["attrs"]]
     tht = [f for f in fitted if "through_hole" in f["attrs"]]
-    sides = {"top": {"F"}, "bottom": {"B"}, "both": {"F", "B"}}[assembly_sides]
+    if assembly_sides == "auto":
+        # the board says where the parts are; a side the assembler skips is
+        # the caller's to state, so only the cost of a second side is noted
+        by = {s: [f["ref"] for f in smd if f["side"] == s] for s in ("F", "B")}
+        if by["F"] and by["B"]:
+            few = min(by.values(), key=len)
+            side = "bottom" if few is by["B"] else "top"
+            findings.append(_f("info", "AS-SIDE", ",".join(few[:20]),
+                               f"SMD parts on both sides ({len(by['F'])} top, {len(by['B'])} "
+                               f"bottom): a second reflow pass for the {len(few)} on the {side}. "
+                               "Pass assembly_sides to check against your assembler."))
+        sides = {"F", "B"}
+    else:
+        sides = {"top": {"F"}, "bottom": {"B"}, "both": {"F", "B"}}[assembly_sides]
 
     for f in smd:
         if f["side"] not in sides:
@@ -400,6 +555,10 @@ def check_assembly(tree: list, assembly_sides: str = "top", min_spacing_mm: floa
                                "Polarized part whose silkscreen has no mark nearer pad 1 than the "
                                "other pads (no pin-1 dot / cathode bar / chamfer found)."))
 
+    testpoints = _testpoint_coverage(fps, findings)
+    tombstones = _tombstoning(tree, fps, findings)
+    orientation = _orientation(fps, findings)
+
     height_rows = []
     if heights:
         from kicad_claude.utils.kicad_config import path_vars
@@ -443,6 +602,7 @@ def check_assembly(tree: list, assembly_sides: str = "top", min_spacing_mm: floa
     return {"footprints": len(fps), "fitted": len(fitted), "smd": len(smd), "tht": len(tht),
             "fiducials": [f["ref"] for f in fid], "courtyard_conflicts": pairs,
             "edge": edge, "heights": sorted(height_rows, key=lambda r: -r["height_mm"]),
+            "testpoints": testpoints, "tombstoning": tombstones, "orientation": orientation,
             "findings": findings,
             "counts": {k: sum(1 for x in findings if x["severity"] == k) for k in order}}
 

@@ -179,6 +179,66 @@ def find_rc(nl: Netlist, ladder_nets: set) -> list[dict]:
     return out
 
 
+_FB_PIN = re.compile(r"^(FB|ADJ|VFB|NFB|FB\d|SET)$", re.I)
+
+
+def find_rc_highpass(nl: Netlist, rails: set, skip: set = frozenset(),
+                     loads: dict | None = None) -> list[dict]:
+    """First-order high-pass: a series capacitor into a node whose only DC
+    path is resistance to ground or to a rail (AC coupling with a bias /
+    bleed resistor, an SMA DC block). fc = 1 / (2 pi R C), R the shunt
+    resistors in parallel with the caller's load on the node (`loads`, ohm:
+    a 50 ohm instrument on an SMA sets the corner, not the 10k bleed);
+    without one the corner is the open-load value and says so."""
+    out = []
+    for node, pins in nl.nets.items():
+        # a rail carried only through a DNP link is still a candidate: the DC
+        # test below rejects any fitted path that holds the node
+        if is_ground(node) or is_unconnected(node) or node in skip:
+            continue
+        if any(p.type.split("+")[0] in ("power_in", "power_out") for p in pins
+               if kind(p.ref) not in PASSIVE):
+            continue
+        if any(_FB_PIN.match((p.name or "").strip()) for p in pins if kind(p.ref) not in PASSIVE):
+            continue                           # a feed-forward cap on a feedback divider
+        series, shunt, other = [], [], False
+        for p in pins:
+            if not _fitted(nl, p.ref):
+                continue
+            ends = _two(nl, p.ref)
+            k = kind(p.ref)
+            if k in ("C", "R") and ends:
+                far = ends[1] if ends[0] == node else ends[0]
+                if k == "C" and not is_ground(far):
+                    series.append((p.ref, far))
+                elif k == "R" and (is_ground(far) or far in rails):
+                    shunt.append(p.ref)
+                elif k == "C":
+                    other = True               # a cap to ground: a band-pass, not this
+                else:
+                    other = True               # a series R carries DC in
+            elif k in ("L", "FB", "D"):
+                other = True
+        if len(series) != 1 or not shunt or other:
+            continue
+        c = parse_value(nl.components[series[0][0]]["value"].split("@")[0])
+        rv = [parse_value(nl.components[r]["value"]) for r in shunt]
+        if not c or not all(rv):
+            continue
+        g = sum(1 / v for v in rv)
+        load = (loads or {}).get(node)
+        r_th = 1 / (g + (1 / load if load else 0.0))
+        conn = sorted({p.ref for p in pins if kind(p.ref) in ("J", "P", "CN")})
+        out.append({"node": node, "input": series[0][1], "series_cap": series[0][0],
+                    "shunt_r": shunt, "r_ohm": round(r_th, 3), "c_f": float(f"{c:.4g}"),
+                    "fc_hz": round(1 / (2 * math.pi * r_th * c), 3),
+                    "load": f"{load:g} ohm (caller)" if load else
+                    "open" + (f" - {', '.join(conn)} goes off-board: pass loads={{net: ohm}} "
+                              "for what is plugged in" if conn else ""),
+                    "drives": _active_on(nl, node)})
+    return out
+
+
 # ---- LC ladders ------------------------------------------------------------------ #
 
 
@@ -480,6 +540,13 @@ def _opamp_pins(nl: Netlist, ref: str) -> dict[str, dict]:
             continue
         key = m.group("pre") or m.group("ch") or m.group("ch3") or ""
         ch[key][sign] = p.net
+    # a single-channel symbol whose output pin has no name (KiCAD "~"):
+    # the one unnamed output-typed pin is OUT
+    open_ = [k for k, v in ch.items() if {"+", "-"} <= set(v) and "out" not in v]
+    unnamed = [p for p in nl.pins.get(ref, []) if p.type.split("+")[0] == "output"
+               and (p.name or "").strip("~ ") == ""]
+    if len(ch) == 1 and len(open_) == 1 and len(unnamed) == 1:
+        ch[open_[0]]["out"] = unnamed[0].net
     return {k: v for k, v in ch.items() if {"+", "-", "out"} <= set(v)}
 
 
@@ -890,6 +957,7 @@ def analyze(nl: Netlist, types: tuple[str, ...] = TYPES, volts: dict | None = No
         result["dividers"] = divs
     if "rc" in types:
         result["rc_filters"] = find_rc(nl, ladder_nets | rails)
+        result["rc_highpass"] = find_rc_highpass(nl, rails, ladder_nets, loads)
     if "lc" in types:
         ng = _sim(sim)
         lads = []

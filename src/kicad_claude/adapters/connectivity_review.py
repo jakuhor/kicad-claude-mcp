@@ -166,6 +166,9 @@ def sourced_nets(nl: Netlist, include_dnp: bool = False) -> dict[str, str]:
 # ---- checks --------------------------------------------------------------- #
 
 
+_OUT_PIN_RE = re.compile(r"(OUT\d*|VREG)$", re.I)
+
+
 def check_power_pins(nl: Netlist, findings: list, sources: dict[str, str]) -> list[dict]:
     reg_pins = {(r["ref"], p.number) for r in detect_regulators(nl)
                 for role in ("vin", "vout") for p in r["roles"].get(role, [])}
@@ -178,6 +181,7 @@ def check_power_pins(nl: Netlist, findings: list, sources: dict[str, str]) -> li
         if not pins:
             continue
         rails: dict[str, list[str]] = defaultdict(list)
+        unsrc: dict[str, list[str]] = defaultdict(list)
         grounds: set[str] = set()
         for p in pins:
             label = p.name or p.number
@@ -204,10 +208,19 @@ def check_power_pins(nl: Netlist, findings: list, sources: dict[str, str]) -> li
                                    f"Pin {label} is on {p.net}, reachable only through a "
                                    f"DNP part ({with_dnp[p.net]}): unpowered as assembled."))
             else:
-                findings.append(_f("warning", "CR-PWR-UNSRC", ref,
-                                   f"Pin {label} is on {p.net}, which has no source: no "
-                                   "regulator output, power_out pin, connector, or series "
-                                   "L / ferrite / R / diode / transistor path from one."))
+                unsrc[p.net].append(label)
+        for net, labels in unsrc.items():
+            # an output-named pin typed power_in (a module's LDO_OUT) is the
+            # usual cause: name it so the symbol gets fixed, not the board
+            hint = sorted({f"{q.ref}.{q.name}" for q in nl.nets.get(net, [])
+                           if base_type(q) == "power_in" and _OUT_PIN_RE.search(q.name or "")})
+            findings.append(_f("warning", "CR-PWR-UNSRC", ref,
+                               f"Pin{'s' if len(set(labels)) > 1 else ''} "
+                               f"{', '.join(sorted(set(labels)))} on {net}, which has no source: "
+                               "no regulator output, power_out pin, connector, or series "
+                               "L / ferrite / R / diode / transistor path from one."
+                               + (f" {', '.join(hint)} looks like the source but its symbol "
+                                  "types it power_in: fix the pin type." if hint else "")))
         if len(grounds) > 1:
             findings.append(_f("info", "CR-GND-MIX", ref,
                                f"Ground pins on more than one ground net: {', '.join(sorted(grounds))} "

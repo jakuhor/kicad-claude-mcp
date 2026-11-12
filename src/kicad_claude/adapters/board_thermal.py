@@ -32,6 +32,7 @@ analyze_thermal_pad_vias (pad search box, drill weighting, recommended counts).
 from __future__ import annotations
 
 import math
+import re
 import statistics
 
 from kicad_claude.adapters import datasheet_specs as dss
@@ -78,7 +79,11 @@ def footprints(tree: list) -> dict[str, dict]:
             px, py = float(at[1]), float(at[2])
             pt = pad_to_board_xy(fx, fy, fa, px, py)
             layers = find_child(pad, "layers")
+            drill = find_child(pad, "drill")
+            dval = next((float(x) for x in (drill or [])[1:]
+                         if isinstance(x, (int, float))), None)
             pads.append({"number": str(pad[1]), "type": str(pad[2]) if len(pad) > 2 else "",
+                         "drill": dval,
                          "w": float(size[1]), "h": float(size[2]), "x": pt[0], "y": pt[1],
                          # absolute orientation as KiCAD writes it; omitted = 0
                          "angle": float(at[3]) if len(at) > 3 else 0.0,
@@ -118,6 +123,11 @@ def exposed_pads(fp: dict) -> list[dict]:
     return out
 
 
+def _recommended(area: float) -> tuple[int, int]:
+    return ((5, 9) if area < 10 else (9, 16) if area < 25
+            else (max(9, int(area * 0.5)), max(16, int(area * 0.8))))
+
+
 def pad_vias(pad: dict, all_vias: list[dict]) -> dict:
     """Vias inside 1.5x the pad's (rotated) box on its net: count, drill-
     weighted count Σ(d / 0.3 mm)², and adequacy against the recommended
@@ -125,8 +135,8 @@ def pad_vias(pad: dict, all_vias: list[dict]) -> dict:
     0.8 per mm²)."""
     a = math.radians(pad["angle"])
     ca, sa = math.cos(a), math.sin(a)
-    n, eff = 0, 0.0
-    for v in all_vias:
+    n, eff, ids = 0, 0.0, set()
+    for i, v in enumerate(all_vias):
         if pad["net"] and v["net"] != pad["net"]:
             continue
         dx, dy = v["x"] - pad["x"], v["y"] - pad["y"]
@@ -134,15 +144,40 @@ def pad_vias(pad: dict, all_vias: list[dict]) -> dict:
         if abs(lx) <= pad["w"] * 0.75 and abs(ly) <= pad["h"] * 0.75:
             n += 1
             eff += (v["drill"] / 0.3) ** 2
+            ids.add((i, (v["drill"] / 0.3) ** 2))
     area = pad["w"] * pad["h"]
-    lo, hi = ((5, 9) if area < 10 else (9, 16) if area < 25
-              else (max(9, int(area * 0.5)), max(16, int(area * 0.8))))
+    lo, hi = _recommended(area)
     best = max(eff, n)        # drill size is secondary: the raw count may decide
     adequacy = ("good" if best >= hi else "adequate" if best >= lo
                 else "insufficient" if n else "none")
     return {"pad": pad["number"], "net": pad["net"], "area_mm2": round(area, 2), "vias": n,
             "effective_vias": round(eff, 2), "recommended_min": lo, "recommended": hi,
-            "adequacy": adequacy}
+            "adequacy": adequacy, "_via_ids": ids}
+
+
+def _merge_split_pads(rows: list[dict]) -> list[dict]:
+    """One row per pad number: an exposed pad drawn as several copper pads
+    (same number) is one pad - areas add, and its vias are the union of the
+    vias under each part (a via under two overlapping search boxes counts
+    once)."""
+    by: dict[str, dict] = {}
+    for r in rows:
+        m = by.get(r["pad"])
+        if m is None:
+            by[r["pad"]] = dict(r)
+            continue
+        m["area_mm2"] = round(m["area_mm2"] + r["area_mm2"], 2)
+        m["_via_ids"] = m["_via_ids"] | r["_via_ids"]
+        m["vias"] = len(m["_via_ids"])
+        m["effective_vias"] = round(sum(w for _, w in m["_via_ids"]), 2)
+        lo, hi = _recommended(m["area_mm2"])
+        best = max(m["effective_vias"], m["vias"])
+        m.update(recommended_min=lo, recommended=hi,
+                 adequacy="good" if best >= hi else "adequate" if best >= lo
+                 else "insufficient" if m["vias"] else "none")
+    for m in by.values():
+        m.pop("_via_ids", None)
+    return list(by.values())
 
 
 def _cap_kind(nl, ref: str, rec: dict | None) -> str | None:
@@ -173,7 +208,11 @@ def analyze(tree: list, nl, specs: dict, ratings: dict, ambient_c: float,
         tjm = dss.rated(rec, "thermal", "tj_max") or dss.rated(rec, "absolute_max", "TJ")
         pkg = thermal_pkg.classify(fp["lib"])
         eps = [] if ref[:2] in ("BT", "TP") or ref[:1] == "J" else exposed_pads(fp)
-        ep = sorted((pad_vias(p, all_vias) for p in eps), key=lambda e: -e["area_mm2"])
+        # a "_ThermalVias" footprint carries its vias as plated holes of its own
+        own = [{"x": p["x"], "y": p["y"], "drill": p["drill"] or 0.3, "net": p["net"]}
+               for p in fp["pads"] if p["type"] == "thru_hole" and p.get("drill")]
+        ep = sorted(_merge_split_pads([pad_vias(p, all_vias + own) for p in eps]),
+                    key=lambda e: -e["area_mm2"])
         adequacy = ep[0]["adequacy"] if ep else None      # the main (largest) pad
         if rth:
             rth_v, src, corr = rth[0], f"datasheet {rec.get('mpn')} p.{rth[1]}", 1.0
@@ -216,6 +255,26 @@ def analyze(tree: list, nl, specs: dict, ratings: dict, ambient_c: float,
                                f"{p_w:.3g} W part has {e['vias']} thermal via(s) on {e['net'] or 'its net'}"
                                f"; at least {e['recommended_min']} (ideally {e['recommended']}) "
                                "recommended."))
+    # exposed pads of parts below VIA_POWER_W (or with no load given): the
+    # via count still sets how the part sheds heat once it does dissipate
+    seen = {r["ref"] for r in parts if r["p_w"] > VIA_POWER_W}
+    low_vias = []
+    for ref, fp in sorted(fps.items()):
+        if ref in seen or not re.match(r"(U|IC|Q)\d", ref) \
+                or (nl.components.get(ref) or {}).get("dnp"):
+            continue
+        own = [{"x": p["x"], "y": p["y"], "drill": p["drill"] or 0.3, "net": p["net"]}
+               for p in fp["pads"] if p["type"] == "thru_hole" and p.get("drill")]
+        ep = sorted(_merge_split_pads([pad_vias(p, all_vias + own) for p in exposed_pads(fp)]),
+                    key=lambda e: -e["area_mm2"])
+        if ep and ep[0]["adequacy"] in ("none", "insufficient"):
+            e = ep[0]
+            low_vias.append({"ref": ref, **e})
+            findings.append(_f("info", "TH-VIAS", ref,
+                               f"Exposed pad {e['pad']} ({e['area_mm2']:g} mm²) has {e['vias']} "
+                               f"thermal via(s) on {e['net'] or 'its net'}; at least "
+                               f"{e['recommended_min']} (ideally {e['recommended']}) recommended "
+                               f"(info: dissipation below {VIA_POWER_W:g} W or not known)."))
     # B4: hot-spot proximity
     hot = [r for r in parts if (r.get("rise_k") or 0) >= HOT_RISE_K]
     near = []
@@ -232,15 +291,19 @@ def analyze(tree: list, nl, specs: dict, ratings: dict, ambient_c: float,
             near.append({"cap": ref, "kind": k, "source": h["ref"], "distance_mm": round(dist, 2),
                          "source_rise_k": h["rise_k"]})
             if k == "mlcc":
-                findings.append(_f("warning", "TH-MLCC-HOT", ref,
-                                   f"Class-II MLCC {ref} {dist:.1f} mm from {h['ref']} (rise "
-                                   f"{h['rise_k']:.0f} K): X5R / X7R capacitance drifts with "
-                                   "temperature - move it or check the derated value."))
+                # info: a switcher's own input / output caps belong this close
+                findings.append(_f("info", "TH-MLCC-HOT", ref,
+                                   f"Class-II MLCC {ref} {dist:.1f} mm from {h['ref']} (junction "
+                                   f"rise {h['rise_k']:.0f} K; the board at the cap runs cooler, "
+                                   "falling with distance): X5R / X7R capacitance drifts with "
+                                   "temperature - check the derated value (C0G / NP0 where "
+                                   "it is critical)."))
             else:
                 findings.append(_f("warning", "TH-ELCO-HOT", ref,
-                                   f"Electrolytic {ref} {dist:.1f} mm from {h['ref']} (rise "
-                                   f"{h['rise_k']:.0f} K): its life halves per 10 K - move it "
-                                   "away or derate its lifetime."))
+                                   f"Electrolytic {ref} {dist:.1f} mm from {h['ref']} (junction "
+                                   f"rise {h['rise_k']:.0f} K; the board at the cap runs cooler): "
+                                   "its life halves per 10 K - move it away or derate its "
+                                   "lifetime at the measured board temperature."))
             break
     for ref, why in sorted(nodata.items()):
         findings.append(_f("info", "TH-NODATA", ref, f"{why}: extract its datasheet "
@@ -252,5 +315,5 @@ def analyze(tree: list, nl, specs: dict, ratings: dict, ambient_c: float,
                             "board_correction": CORRECTION,
                             "note": "Board correction only on package-typical Rθ; datasheet "
                                     "Rθ_JA is the JEDEC test board."},
-            "parts": parts, "hot_spots": near, "findings": findings,
+            "parts": parts, "low_power_vias": low_vias, "hot_spots": near, "findings": findings,
             "counts": {k: sum(1 for f in findings if f["severity"] == k) for k in order}}

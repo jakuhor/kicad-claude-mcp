@@ -249,6 +249,74 @@ def _nl(pins):
     return nl
 
 
+def test_via_layer_change_stitching():
+    # OP-18 / kicad-happy RP-001: F.Cu -> B.Cu moves the return from In1 to In2
+    planes = (zone("GND", "In1.Cu", 0, 0, 40, 20), zone("GND", "In2.Cu", 0, 0, 40, 20))
+    sig = (seg(5, 10, 20, 10, "SCLK"), seg(20, 10, 35, 10, "SCLK", layer="B.Cu"),
+           via(20, 10, "SCLK"))
+    f = by_rule(er.analyze(board(*planes, *sig), ("ground",), plan=False))
+    st = f["EM-VIA-STITCH"]
+    assert len(st) == 1 and st[0]["severity"] == "warning" and "In1.Cu / In2.Cu" in st[0]["message"]
+    # a ground via 0.8 mm away (radius = 2 x 0.2 mm, at least 1 mm) stitches it
+    f = by_rule(er.analyze(board(*planes, *sig, via(20.8, 10, "GND")), ("ground",), plan=False))
+    assert "EM-VIA-STITCH" not in f
+    # F.Cu -> In2.Cu: both reference In1, the return stays put
+    sig2 = (seg(5, 10, 20, 10, "SCLK"), seg(20, 10, 35, 10, "SCLK", layer="In2.Cu"),
+            via(20, 10, "SCLK"))
+    r = er.analyze(board(zone("GND", "In1.Cu", 0, 0, 40, 20), *sig2), ("ground",), plan=False)
+    assert r["ground"]["via_transitions"] == [] and "EM-VIA-STITCH" not in by_rule(r)
+    # ... unless B.Cu has a pour 0.2 mm under In2 (In1 is 1.0 mm away): In2 then
+    # refers to B.Cu and the return moves In1 -> B.Cu (firbox stackup)
+    r = er.analyze(board(zone("GND", "In1.Cu", 0, 0, 40, 20), zone("GND", "B.Cu", 0, 0, 40, 20),
+                         *sig2), ("ground",), plan=False)
+    st = by_rule(r)["EM-VIA-STITCH"]
+    assert len(st) == 1 and "B.Cu / In1.Cu" in st[0]["message"]
+
+
+def test_via_stitch_supply_nets_and_plane_nets():
+    def sig(n):
+        return seg(5, 10, 20, 10, n), seg(20, 10, 35, 10, n, layer="B.Cu"), via(20, 10, n)
+    # a supply trace changing layers: its AC return moves too (info)
+    g = (zone("GND", "In1.Cu", 0, 0, 40, 20), zone("GND", "In2.Cu", 0, 0, 40, 20))
+    st = by_rule(er.analyze(board(*g, *sig("+3V3")), ("ground",), plan=False))["EM-VIA-STITCH"]
+    assert st[0]["severity"] == "info" and st[0]["message"].startswith("Supply net +3V3")
+    # GND above, +5V below: no via can join them, a cap between the nets can
+    gp = (zone("GND", "In1.Cu", 0, 0, 40, 20), zone("+5V", "In2.Cu", 0, 0, 40, 20))
+    st = by_rule(er.analyze(board(*gp, *sig("SCLK")), ("ground",), plan=False))["EM-VIA-STITCH"]
+    assert "stitching capacitor" in st[0]["message"]
+    cap = fp("C1", 22, 10, [("1", 0, 0, "+5V"), ("2", 1, 0, "GND")], "100n")
+    r = er.analyze(board(*gp, *sig("SCLK"), cap), ("ground",), plan=False)
+    assert "EM-VIA-STITCH" not in by_rule(r)
+    # GNDA planes: a GND via next to it is no stitch
+    ga = (zone("GNDA", "In1.Cu", 0, 0, 40, 20), zone("GNDA", "In2.Cu", 0, 0, 40, 20))
+    r = er.analyze(board(*ga, *sig("SCLK"), via(20.8, 10, "GND")), ("ground",), plan=False)
+    assert "no GNDA via" in by_rule(r)["EM-VIA-STITCH"][0]["message"]
+    r = er.analyze(board(*ga, *sig("SCLK"), via(20.8, 10, "GNDA")), ("ground",), plan=False)
+    assert "EM-VIA-STITCH" not in by_rule(r)
+
+
+def test_fsw_from_rt_strap():
+    hint = {"typ": 1.8e6, "conditions": "RT = 46.4k"}
+    nl = _nl([("U2", "5", "RT", "passive", "RTN"), ("R28", "1", "", "passive", "RTN"),
+              ("R28", "2", "", "passive", "GND"), ("TP1", "1", "", "passive", "RTN")])
+    nl.components = {"R28": {"value": "46.4k"}, "TP1": {"value": "TestPoint"}}
+    f, why = er.fsw_from_strap(nl, "U2", hint)
+    assert f == 1.8e6 and "R28 46.4k" in why
+    # SYNC driven by an MCU clock: RT no longer sets fsw
+    nl_s = _nl([("U2", "5", "RT", "passive", "RTN"), ("R28", "1", "", "passive", "RTN"),
+                ("R28", "2", "", "passive", "GND"), ("U2", "6", "SYNC", "input", "CLK"),
+                ("U9", "3", "PWM", "output", "CLK")])
+    nl_s.components = {"R28": {"value": "46.4k"}}
+    assert er.fsw_from_strap(nl_s, "U2", hint) is None
+    nl.components["R28"]["value"] = "30.9k"                 # another frequency
+    assert er.fsw_from_strap(nl, "U2", hint) is None
+    floating = {"typ": 5e5, "conditions": "RT floating"}
+    nl2 = _nl([("U1", "3", "RT", "passive", "unconnected-(U1-RT-Pad3)")])
+    nl2.components = {}
+    assert er.fsw_from_strap(nl2, "U1", floating)[0] == 5e5
+    assert er.fsw_from_strap(nl, "U2", floating) is None    # a resistor is fitted
+
+
 def test_decoupling_group():
     tree = board(
         zone("GND", "In1.Cu", 0, 0, 40, 20),
@@ -273,6 +341,11 @@ def test_decoupling_group():
     assert any(x["ref"] == "C2" for x in f["EM-DEC-VIA"])
     bank = d["banks"]["+3V3"]
     assert bank["c_total_f"] == pytest.approx(1e-7)
+    # OP-18: impedance profile with no target; 100 kHz is the capacitive asymptote
+    assert set(bank["z_profile_ohm"]) == {"100000", "1e+06", "1e+07", "1e+08"}
+    assert bank["z_profile_ohm"]["100000"] == pytest.approx(1 / (2 * math.pi * 1e5 * 1e-7), rel=0.01)
+    assert "mounting inductance" in bank["z_profile_basis"]
+    assert "z_profile_ohm" in d["banks"]["VIO"]                  # no pdn target for VIO
     assert bank["z_target_ohm"] == pytest.approx(3.3 * 0.03 / 0.1)
     assert bank["meets_target_above_hz"] == round(1 / (2 * math.pi * 1e-7 * bank["z_target_ohm"]))
     assert "ESL known for 0/1" in f["EM-PDN"][0]["message"]
@@ -281,6 +354,27 @@ def test_decoupling_group():
                   fp("U1", 10, 10, [("1", 0, 0, "+3V3"), ("2", 0, 1, "GND")], "MCU"))
     r = er.analyze(tree2, ("decoupling",), power=power, nl=nl, plan=False)
     assert "EM-DEC-NONE" in by_rule(r)
+    # caps there but DNP on the board (stale flags): said so, not "no capacitor"
+    c9 = fp("C9", 11, 11, [("1", 0, 0, "+3V3"), ("2", 1, 0, "GND")], "100n").replace(
+        '(property "Value"', '(attr smd dnp) (property "Value"')
+    tree3 = board(zone("GND", "In1.Cu", 0, 0, 40, 20),
+                  fp("U1", 10, 10, [("1", 0, 0, "+3V3"), ("2", 0, 1, "GND")], "MCU"), c9)
+    msg = by_rule(er.analyze(tree3, ("decoupling",), power=power, nl=nl, plan=False))
+    assert "only capacitors marked DNP on the board (C9)" in msg["EM-DEC-NONE"][0]["message"]
+
+
+def test_decoupling_findings_group_per_ic_and_net():
+    # OP-18: 3 VDD pins on one rail, no cap -> one EM-DEC-NONE naming all three
+    tree = board(zone("GND", "In1.Cu", 0, 0, 40, 20),
+                 fp("U1", 10, 10, [("1", 0, 0, "+1V8"), ("2", 0, 1, "+1V8"), ("3", 0, 2, "+1V8"),
+                                   ("4", 0, 3, "GND")], "BGA"))
+    nl = _nl([("U1", n, "VDD_IO", "power_in", "+1V8") for n in ("1", "2", "3")]
+             + [("U1", "4", "GND", "power_in", "GND")])
+    r = er.analyze(tree, ("decoupling",), power={"regulators": [], "rail_voltages": {}},
+                   nl=nl, plan=False)
+    none = by_rule(r)["EM-DEC-NONE"]
+    assert len(none) == 1 and "VDD_IO(1), VDD_IO(2), VDD_IO(3) on +1V8" in none[0]["message"]
+    assert len(r["decoupling"]["supply_pins"]) == 3          # per-pin data kept
 
 
 # ---- I/O, signals, test plan ------------------------------------------------------- #
@@ -303,7 +397,7 @@ def test_io_group_and_test_plan():
     esd = {x["net"]: x for x in f["EM-IO-ESD"]}
     assert "USB_N" in esd and esd["USB_N"]["severity"] == "warning"
     assert f["EM-IO-ESD-DIST"][0]["net"] == "USB_P"      # D1 18 mm from the pin
-    assert {x["net"] for x in f["EM-IO-FILTER"]} == {"USB_P", "USB_N"}
+    assert [x["nets"] for x in f["EM-IO-FILTER"]] == [["USB_P", "USB_N"]]   # one per connector
     assert any(x["net"] == "MCLK" and x["severity"] == "warning" for x in f["EM-EDGE-TRACE"])
     assert any(x["net"] == "BCLK" for x in f["EM-CLK-CONN"])
     assert f["EM-XTAL-DIST"][0]["ref"] == "Y1"

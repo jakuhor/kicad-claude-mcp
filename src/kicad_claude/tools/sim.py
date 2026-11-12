@@ -177,7 +177,11 @@ def register(mcp) -> None:
           cache (SP-DIV-VOUT), plus Monte Carlo with `monte_carlo=N`.
           SP-TOL when a resistor has no Tolerance field.
         - `rc` — RC low-pass nodes feeding an active input: corner frequency
-          with the Thevenin resistance of every resistor on the node.
+          with the Thevenin resistance of every resistor on the node; and
+          first-order high-pass nodes (a series cap into resistance to ground
+          or a rail, no other DC path; feedback nodes skipped) in
+          `rc_highpass`, with `loads` on the node in the corner (else
+          "open").
         - `lc` — LC / ferrite / pi ladders (series L between nodes with
           capacitors to ground; switch nodes of converters excluded), with
           R-C damping branches, run as an ngspice AC sweep from the ladder's
@@ -189,7 +193,7 @@ def register(mcp) -> None:
           `source_ohm={"<input net>": 0.1}` a source resistance; with an open
           load the peaking is an upper bound and SP-LC-PEAK is only info.
 
-        - `opamp` — op-amp stages from pin names (+IN / IN+ / 1IN- / OUTA …):
+        - `opamp` — op-amp stages from pin names (+IN / IN+ / 1IN- / OUTA / + / - …; an unnamed output pin is OUT):
           follower / non-inverting / inverting, gain and noise gain from the
           feedback resistors, feedback-cap pole, and closed-loop bandwidth
           GBW / noise gain when the spec cache has the op-amp's `GBW`

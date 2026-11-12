@@ -393,6 +393,36 @@ def check_ground_stackup(b: Board, findings: list, f_max_hz: float,
                            "capacitor joining the two within 5 mm: the return current has to "
                            "detour.", **c))
 
+    # each signal layer change that moves the return current to another plane
+    trans = _via_transitions(b, roles)
+    bad = defaultdict(list)
+    for t in trans:
+        if not t["stitched"]:
+            bad[t["net"]].append(t)
+
+    def _sev(net, ts):
+        return "warning" if ts[0]["kind"] == "signal" and _fast(net) else "info"
+    order = sorted(bad.items(), key=lambda kv: (_sev(*kv) != "warning", kv[0]))
+    for net, ts in order[:20]:
+        n_all = sum(1 for t in trans if t["net"] == net)
+        t0 = ts[0]
+        what = (f"no {t0['stitch_net']} via reaching both planes within {t0['radius_mm']:g} mm"
+                if t0["stitch"] == "via" else
+                f"the planes are different nets ({' / '.join(t0['reference_nets'])}), so the "
+                f"return crosses through a capacitor between them - none within "
+                f"{t0['radius_mm']:g} mm")
+        fix = (f"add a {t0['stitch_net']} via next to the {t0['kind']} via" if t0["stitch"] == "via"
+               else "add a stitching capacitor between the two plane nets next to the via")
+        findings.append(_f(_sev(net, ts), "EM-VIA-STITCH",
+                           f"{t0['kind'].capitalize()} net {net}: {len(ts)} of {n_all} layer "
+                           f"change(s) move the return current between "
+                           f"{' / '.join(t0['reference_planes'])}; {what} (first at "
+                           f"({t0['at'][0]}, {t0['at'][1]}), nearest {t0['nearest_mm']} mm): "
+                           f"{fix}.", net=net, count=len(ts)))
+    if len(bad) > 20:
+        findings.append(_f("info", "EM-VIA-STITCH", f"{len(bad) - 20} more nets have unstitched "
+                           "layer changes (see `ground.via_transitions`)."))
+
     # via stitching between ground planes / pours (λ/20 at f_max)
     eps = b.eps_r()
     spacing = stitch_spacing_mm or lambda_over_20_mm(f_max_hz, eps)
@@ -418,8 +448,13 @@ def check_ground_stackup(b: Board, findings: list, f_max_hz: float,
 
     return {"layers": roles, "planes": planes, "dielectrics": b.dielectrics,
             "ground_nets": gnets, "ground_joins": joins, "islands": islands,
-            "split_crossings": crossings, "stitching": stitch, "edge": edge,
+            "split_crossings": crossings, "via_transitions": trans, "stitching": stitch,
+            "edge": edge,
             "connectors": conn}
+
+
+def _fast(net: str) -> bool:
+    return bool(CLOCK_RE.search(leaf(net)) or HIGH_SPEED_RE.search(leaf(net)))
 
 
 def _ref_layers(b: Board, roles: list[dict], layer: str) -> list[str]:
@@ -465,6 +500,105 @@ def _split_crossings(b: Board, roles: list[dict]) -> list[dict]:
                         out.append({"net": t["net_name"], "layer": t["layer"], "reference": ref,
                                     "from": prev[0], "to": net, "at": [round(x, 2), round(y, 2)]})
                 prev = (net, x, y)
+    return out
+
+
+def _plane_net_near(b: Board, layer: str, pt: tuple, r0: float) -> str | None:
+    """The plane net around a via: the fill has an antipad at the via
+    itself, so sample rings outside it (to 2 mm) and take the majority."""
+    seen = defaultdict(int)
+    for k in range(1, 5):
+        rad = r0 + 0.4 * k
+        for a in range(8):
+            n = b.net_at(layer, pt[0] + rad * math.cos(a * math.pi / 4),
+                         pt[1] + rad * math.sin(a * math.pi / 4))
+            if n:
+                seen[n] += 1
+        if seen:
+            return max(seen, key=seen.get)
+    return None
+
+
+def _via_transitions(b: Board, roles: list[dict]) -> list[dict]:
+    """Signal and supply vias whose tracks leave on layers with different
+    reference planes: the return current (for a supply, its AC part) must
+    move between those planes at the via. Each layer's reference is the
+    nearest adjacent pour at the via - both neighbours only when their
+    dielectrics are within 2x (a stripline); a 2-layer board with pours on
+    both sides counts.
+    - Same plane net on both layers: a via (or through-hole pad) of that net
+      spanning both plane layers within 2x the first dielectric, at least
+      1 mm (kicad-happy RP-001), gives the return its short way.
+    - Different plane nets (GND / +5V, GND / GND_USB): no via can join them;
+      the return crosses through a capacitor between the two nets, so one
+      within 5 mm (as EM-SPLIT-CROSS) is the stitch."""
+    h = next((d["thickness_mm"] for d in b.dielectrics if d.get("thickness_mm")), 0.2)
+    radius, cap_radius = max(2 * h, 1.0), 5.0
+    joins = [(v["point"], v["net_name"], set(v["layers"])) for v in b.vias]
+    joins += [(p["point"], p["net_name"], set(p["layers"])) for p in b.pads
+              if len(p["layers"]) > 1]
+    cap_nets, cap_pos = defaultdict(set), {}
+    for p in b.pads:
+        if re.match(r"C\d", p["ref"]):
+            cap_nets[p["ref"]].add(p["net_name"])
+            cap_pos.setdefault(p["ref"], p["point"])
+    caps = [(cap_pos[r], frozenset(ns)) for r, ns in cap_nets.items() if len(ns) == 2]
+    ends = defaultdict(list)                   # net -> [(point, layer)]
+    for t in b.tracks:
+        for pt in (t["start"], t["end"]):
+            ends[t["net_name"]].append((pt, t["layer"]))
+    out = []
+    for v in b.vias:
+        net = v["net_name"]
+        if not net or is_ground_net(net) or leaf(net).startswith("unconnected-"):
+            continue                            # a ground via is itself a stitch
+        r = v.get("radius_mm", 0.3) + 0.05
+        used = sorted({ly for pt, ly in ends.get(net, []) if math.dist(pt, v["point"]) <= r
+                       and ly in v["layers"]})
+        if len(used) < 2:
+            continue
+        refs = {}
+        for ly in used:
+            k = b.layers.index(ly)              # the adjacent pour at this spot, any role
+            cand = []
+            for n in (k - 1, k + 1):
+                if 0 <= n < len(b.layers):
+                    d = b.dielectrics[min(k, n)] if min(k, n) < len(b.dielectrics) else {}
+                    cand.append((b.layers[n], _plane_net_near(b, b.layers[n], v["point"], r),
+                                 d.get("thickness_mm")))
+            cand = [c for c in cand if c[1]]
+            # the return current crowds into the nearest plane: a neighbour
+            # more than 2x farther is not the reference (In2 under a 1 mm core
+            # with B.Cu 0.2 mm away refers to B.Cu); unknown thickness keeps both
+            th = [t for _, _, t in cand if t]
+            if len(th) == len(cand) and th:
+                cand = [c for c in cand if c[2] <= 2 * min(th)]
+            refs[ly] = [(rl, n) for rl, n, _ in cand]
+        if any(not refs[ly] for ly in used) or any(
+                {rl for rl, _ in refs[a]} & {rl for rl, _ in refs[b_]}
+                for a in used for b_ in used if a < b_):
+            continue                            # same plane on both sides, or none
+        planes = sorted({rl for ly in used for rl, _ in refs[ly]})
+        nets = sorted({n for ly in used for _, n in refs[ly]})
+        sides = [{n for _, n in refs[ly]} for ly in used]
+        common = set.intersection(*sides)
+        rec = {"net": net, "kind": "signal" if is_signal_net(net) else "supply",
+               "at": [round(v["point"][0], 2), round(v["point"][1], 2)], "layers": used,
+               "reference_planes": planes, "reference_nets": nets}
+        if common:
+            # a via of the plane net that reaches every reference layer
+            need = {rl for ly in used for rl, n in refs[ly] if n in common}
+            d = min((math.dist(v["point"], pt) for pt, n, lys in joins
+                     if n in common and need <= lys), default=math.inf)
+            rec.update(stitch="via", stitch_net=sorted(common)[0], radius_mm=round(radius, 2),
+                       nearest_mm=None if d == math.inf else round(d, 2), stitched=d <= radius)
+        else:
+            pairs = {frozenset((x, y)) for x in sides[0] for y in sides[1] if x != y}
+            d = min((math.dist(v["point"], pt) for pt, ns in caps if ns in pairs),
+                    default=math.inf)
+            rec.update(stitch="capacitor", radius_mm=cap_radius,
+                       nearest_mm=None if d == math.inf else round(d, 2), stitched=d <= cap_radius)
+        out.append(rec)
     return out
 
 
@@ -676,6 +810,53 @@ def _input_loop(b: Board, ref: str, vin_net: str, pads_by_ref: dict) -> dict | N
             "same_side": (cv["layers"][:1] == vp["layers"][:1])}
 
 
+_RT_PIN = re.compile(r"^(RT|RT/SYNC|RT/CLK|FSW|FREQ|ROSC)$", re.I)
+_SYNC_PIN = re.compile(r"SYNC|CLKIN|EXTCLK|^CLK$", re.I)
+
+
+def fsw_from_strap(nl, ref: str, hint: dict | None) -> tuple[float, str] | None:
+    """The datasheet fsw when the schematic meets its stated condition: the
+    RT pin floating ("RT floating / open") or one resistor to ground of the
+    stated value ("RT = 46.4k", within 1 %). Anything else stays the caller's."""
+    if not hint or nl is None or not (hint.get("typ") or hint.get("max")):
+        return None
+    from kicad_claude.adapters.power_review import is_unconnected, kind, parse_value
+    cond = hint.get("conditions") or ""
+    pin = next((p for p in nl.pins.get(ref, []) if _RT_PIN.match((p.name or "").strip())), None)
+    if pin is None:
+        return None
+    hz = float(hint.get("typ") or hint.get("max"))
+    # a clock on SYNC overrides RT: the strap holds only with SYNC idle
+    # (grounded, open, or reached only by test points and resistors to ground)
+    for sp in nl.pins.get(ref, []):
+        if sp is pin or not _SYNC_PIN.search((sp.name or "").strip()):
+            continue
+        if is_ground_net(sp.net) or is_unconnected(sp.net):
+            continue
+        for q in nl.nets.get(sp.net, []):
+            if q.ref == ref or kind(q.ref) == "TP" or nl.components.get(q.ref, {}).get("dnp"):
+                continue
+            far = [x.net for x in nl.pins.get(q.ref, []) if x.net != sp.net]
+            if not (kind(q.ref) == "R" and far and is_ground_net(far[0])):
+                return None
+    others = [q for q in nl.nets.get(pin.net, []) if q.ref != ref]
+    if re.search(r"\b(float|floating|open|unconnected|NC)\b", cond, re.I):
+        if is_unconnected(pin.net) or not others:
+            return hz, f"RT pin {pin.name} floating, as the datasheet condition '{cond}'"
+        return None
+    m = re.search(r"R_?T\w*\s*=\s*([\d.]+\s*[kKM]?)", cond)
+    want = parse_value(m.group(1).replace(" ", "")) if m else None
+    res = [q for q in others if kind(q.ref) == "R" and not nl.components.get(q.ref, {}).get("dnp")]
+    if not want or len(res) != 1 or len([q for q in others if kind(q.ref) != "TP"]) != 1:
+        return None
+    r = res[0]
+    far = [p.net for p in nl.pins.get(r.ref, []) if p.net != pin.net]
+    have = parse_value(nl.components.get(r.ref, {}).get("value", ""))
+    if far and is_ground_net(far[0]) and have and abs(have - want) <= 0.01 * want:
+        return hz, f"{r.ref} {nl.components[r.ref]['value']} on {pin.name} to ground matches '{cond}'"
+    return None
+
+
 def check_switching(b: Board, findings: list, regulators: list[dict], nl,
                     rail_volts: dict, fsw: dict, iout: dict, specs: dict,
                     standard: str, rise_time_s: float) -> list[dict]:
@@ -717,6 +898,12 @@ def check_switching(b: Board, findings: list, regulators: list[dict], nl,
 
         f = fsw.get(name, fsw.get(ref))
         hint = ((specs.get(ref) or {}).get("regulator") or {}).get("fsw")
+        strap = None if f else fsw_from_strap(nl, ref, hint)
+        if strap:
+            f = strap[0]
+            rec["fsw_source"] = f"datasheet {(specs.get(ref) or {}).get('mpn')}: {strap[1]}"
+        elif f:
+            rec["fsw_source"] = "caller"
         if not f:
             findings.append(_f("info", "EM-SW-FSW",
                                f"{name}: no switching frequency given (fsw={{'{name}': Hz}}); "
@@ -813,6 +1000,8 @@ def check_switching(b: Board, findings: list, regulators: list[dict], nl,
 
 # ---- group: decoupling & PDN ---------------------------------------------------- #
 
+PDN_FREQS = (1e5, 1e6, 1e7, 1e8)          # rail impedance profile (Hz)
+
 
 def _two_pin_parts(b: Board) -> dict[str, list[dict]]:
     by_ref = defaultdict(list)
@@ -864,15 +1053,33 @@ def check_decoupling(b: Board, findings: list, nl, rail_volts: dict, specs: dict
                 rec = {"ref": ref, "pin": f"{p.name or p.number}({p.number})", "net": p.net,
                        "nearest_cap": cr, "distance_mm": round(d, 2) if cr else None}
                 pins.append(rec)
-                if cr is None:
-                    findings.append(_f("warning", "EM-DEC-NONE",
-                                       f"{ref} pin {rec['pin']} on {p.net}: no capacitor to ground "
-                                       "on that net anywhere on the board.", ref=ref))
-                elif d > decap_max_mm:
-                    findings.append(_f("warning", "EM-DEC-DIST",
-                                       f"{ref} pin {rec['pin']} on {p.net}: nearest decoupling cap "
-                                       f"{cr} is {d:.1f} mm away (> {decap_max_mm} mm); its mounting "
-                                       "inductance grows with the trace.", ref=ref))
+        # one finding per IC and net (a BGA's 13 VDD_IO balls are one decision)
+        groups = defaultdict(list)
+        for rec in pins:
+            groups[(rec["ref"], rec["net"])].append(rec)
+        for (ref, net), rows in groups.items():
+            names = ", ".join(r["pin"] for r in rows)
+            if all(r["nearest_cap"] is None for r in rows):
+                dnp = sorted(c for c, v in caps.items() if v["rail"] == net)
+                findings.append(_f("warning", "EM-DEC-NONE",
+                                   f"{ref} pin{'s' if len(rows) > 1 else ''} {names} on {net}: " + (
+                                       f"only capacitors marked DNP on the board "
+                                       f"({', '.join(dnp[:5])}{' …' if len(dnp) > 5 else ''}) "
+                                       "- if they are fitted, the board's DNP flags are stale "
+                                       "(update the PCB from the schematic)." if dnp else
+                                       "no capacitor to ground on that net anywhere on the "
+                                       "board."), ref=ref, net=net))
+                continue
+            far = [r for r in rows if r["distance_mm"] is not None
+                   and r["distance_mm"] > decap_max_mm]
+            if far:
+                w = max(far, key=lambda r: r["distance_mm"])
+                findings.append(_f("warning", "EM-DEC-DIST",
+                                   f"{ref} pin{'s' if len(far) > 1 else ''} "
+                                   f"{', '.join(r['pin'] for r in far)} on {net}: nearest "
+                                   f"decoupling cap up to {w['distance_mm']:.1f} mm away ({w['pin']} "
+                                   f"-> {w['nearest_cap']}; > {decap_max_mm} mm); its mounting "
+                                   "inductance grows with the trace.", ref=ref, net=net))
 
     # 2. cap ground pad -> nearest ground via (path to the plane)
     gvias = [v["point"] for v in b.vias if is_ground_net(v["net_name"])]
@@ -913,7 +1120,39 @@ def check_decoupling(b: Board, findings: list, nl, rail_volts: dict, specs: dict
         esl = (el.get("ESL") or {}).get("typ") or (el.get("ESL") or {}).get("max")
         if esl:
             bank["_inv_esl"] += 1.0 / esl
+        esr = (el.get("ESR") or {}).get("typ") or (el.get("ESR") or {}).get("max")
+        c_eff = (val * (ratio if val and ratio is not None else 1.0)) if val else None
+        bank.setdefault("_branches", []).append((cr, c_eff, esr, esl))
+    # rail impedance for every bank, target or not: each cap a series C-ESR-L
+    # branch, L = datasheet ESL + the layout's mounting inductance (nothing assumed)
+    mount = {}
+    if banks:
+        try:
+            from kicad_claude.adapters import spice_auto
+            mount = {c: v["l_h"] for c, v in spice_auto.mounting_inductance(
+                b.tree, sorted({c for bk in banks.values() for c in bk["caps"]})).items()
+                if v.get("l_h")}
+        except (ValueError, KeyError):
+            mount = {}
     for rail, bank in banks.items():
+        br = bank.pop("_branches", [])
+        if br and all(c for _, c, _, _ in br):
+            prof = {}
+            for f in PDN_FREQS:
+                w = 2 * math.pi * f
+                y = 0j
+                for cr, c, esr, esl in br:
+                    lh = (esl or 0.0) + mount.get(cr, 0.0)
+                    y += 1 / complex(esr or 0.0, w * lh - 1 / (w * c))
+                prof[f"{f:g}"] = float(f"{abs(1 / y):.3g}") if y else None
+            bank["z_profile_ohm"] = prof
+            bank["z_profile_basis"] = (
+                f"C{' (DC-bias derated)' if bank.get('dc_bias_derated') else ''}; ESR from "
+                f"{bank['esr_known']}/{bank['count']} datasheets (else 0); L = datasheet ESL "
+                f"({bank['esl_known']}/{bank['count']}) + layout mounting inductance "
+                f"({sum(1 for cr, *_ in br if cr in mount)}/{bank['count']}). Not included: "
+                "plane capacitance (it dominates near 100 MHz) and spreading inductance; an "
+                "unknown ESR (0) makes resonance dips too deep and anti-resonance peaks too high")
         inv = bank.pop("_inv_esl")
         bank["c_total_f"] = float(f"{bank['c_total_f']:.4g}")
         if inv and bank["esl_known"] == bank["count"]:
@@ -1020,17 +1259,17 @@ def check_io_signals(b: Board, findings: list, specs: dict, edge_keepout_mm: flo
                    "esd": tvs, "esd_distance_mm": round(dist, 1) if dist is not None else None,
                    "series_parts": series.get(net, [])}
             io.append(rec)
+    # one finding per connector (and line kind): a 50-pin header is one
+    # decision, not 50; `nets` lists the lines
     seen_net = set()
+    no_esd, no_filt = defaultdict(list), defaultdict(list)
     for rec in io:
         key = (rec["connector"], rec["net"])
         if key in seen_net:
             continue
         seen_net.add(key)
         if not rec["esd"]:
-            findings.append(_f("warning" if rec["kind"] == "signal" else "info", "EM-IO-ESD",
-                               f"{rec['connector']} line {rec['net']} ({rec['kind']}) has no "
-                               "TVS / ESD diode to ground (by value, library or datasheet "
-                               "category).", ref=rec["connector"], net=rec["net"]))
+            no_esd[(rec["connector"], rec["kind"])].append(rec["net"])
         elif rec["esd_distance_mm"] is not None and rec["esd_distance_mm"] > esd_max_mm:
             findings.append(_f("warning", "EM-IO-ESD-DIST",
                                f"{rec['connector']} line {rec['net']}: protection "
@@ -1038,10 +1277,24 @@ def check_io_signals(b: Board, findings: list, specs: dict, edge_keepout_mm: flo
                                f"pin (> {esd_max_mm} mm); the ESD current runs through the board "
                                "before it is clamped.", ref=rec["connector"], net=rec["net"]))
         if rec["kind"] == "signal" and not rec["series_parts"]:
-            findings.append(_f("info", "EM-IO-FILTER",
-                               f"{rec['connector']} signal {rec['net']} leaves the board with no "
-                               "series R / ferrite / inductor (no common-mode or edge-rate "
-                               "filtering).", ref=rec["connector"], net=rec["net"]))
+            no_filt[rec["connector"]].append(rec["net"])
+
+    def _lines(nets):
+        return ", ".join(nets[:8]) + (f" and {len(nets) - 8} more" if len(nets) > 8 else "")
+    for (ref, k), nets in no_esd.items():
+        one = len(nets) == 1
+        findings.append(_f("warning" if k == "signal" else "info", "EM-IO-ESD",
+                           f"{ref} {k} line{'' if one else f's ({len(nets)})'} {_lines(nets)} "
+                           f"{'has' if one else 'have'} no TVS / ESD diode to ground (by value, "
+                           "library or datasheet category). Board-to-board and test headers "
+                           "need none.", ref=ref, net=nets[0], nets=nets))
+    for ref, nets in no_filt.items():
+        one = len(nets) == 1
+        findings.append(_f("info", "EM-IO-FILTER",
+                           f"{ref} signal{'' if one else f's ({len(nets)})'} {_lines(nets)} "
+                           f"{'leaves' if one else 'leave'} the board with no series R / ferrite "
+                           "/ inductor (no common-mode or edge-rate filtering).",
+                           ref=ref, net=nets[0], nets=nets))
 
     # tracks near the board edge
     near_edge = defaultdict(float)

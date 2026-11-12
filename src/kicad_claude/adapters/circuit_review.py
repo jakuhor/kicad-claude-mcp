@@ -711,27 +711,14 @@ def check_feedback(nl: Netlist, findings: list, pt: dict, specs: dict,
 
 # ---- audio & analog ---------------------------------------------------------- #
 
-_OPA = re.compile(r"^(?P<pre>\d?)(?:(?P<s>[+-])IN|IN(?P<s2>[+-]))(?P<ch>[A-D\d]?)$|"
-                  r"^(?P<opre>\d?)OUT(?P<och>[A-D\d]?)$")
-
-
 def opamp_channels(nl: Netlist, specs: dict) -> dict[str, dict[str, dict[str, str]]]:
     """{ref: {channel: {"+": net, "-": net, "out": net}}} for parts with
     op-amp pin names (or category opamp)."""
+    # one pin matcher with the SPICE stages (bare "+" / "-", unnamed output)
+    from kicad_claude.adapters.spice_auto import _opamp_pins
     out = {}
     for ref in ics(nl):
-        ch: dict[str, dict] = defaultdict(dict)
-        for p in nl.pins.get(ref, []):
-            m = _OPA.match(pn(p))
-            if not m:
-                continue
-            if m.group("opre") is not None or m.group("och") is not None and "OUT" in pn(p):
-                c = m.group("opre") or m.group("och") or ""
-                ch[c]["out"] = p.net
-            else:
-                c = m.group("pre") or m.group("ch") or ""
-                ch[c][m.group("s") or m.group("s2")] = p.net
-        full = {c: v for c, v in ch.items() if {"+", "-", "out"} <= set(v)}
+        full = _opamp_pins(nl, ref)
         if full and ((specs.get(ref) or {}).get("category") in ("opamp", None, "")
                      and not any(btype(p) == "power_out" for p in nl.pins.get(ref, []))):
             out[ref] = full

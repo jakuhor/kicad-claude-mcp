@@ -502,7 +502,7 @@ def register(mcp) -> None:
     @mcp.tool()
 
     @on_board
-    def review_assembly(assembly_sides: Literal["top", "bottom", "both"] = "top", min_spacing_mm: float = 0.0,
+    def review_assembly(assembly_sides: Literal["auto", "top", "bottom", "both"] = "auto", min_spacing_mm: float = 0.0,
                         edge_clearance_mm: float = 0.3, fiducials_min: int = 2,
                         tall_mm: float = 5.0, tall_edge_mm: float = 3.0,
                         max_height_top_mm: float | None = None,
@@ -546,8 +546,15 @@ def register(mcp) -> None:
         `edge_clearance_mm` of the edge (AS-EDGE; info for connectors),
         footprints with no courtyard (AS-NO-CRTYD), SMD parts on a side the
         assembler will not populate (`assembly_sides` top|bottom|both;
-        AS-SIDE, error), through-hole parts (AS-THT), fiducials per populated
-        side (AS-FIDUCIAL), polarized parts with no silkscreen of their own
+        AS-SIDE, error; default auto: the board's own sides, one AS-SIDE
+        info when SMD parts sit on both), through-hole parts (AS-THT), fiducials per populated
+        side (AS-FIDUCIAL), test-point coverage and supply rails without a
+        test point (AS-TESTPOINT, info; `testpoints`), 0201 / 0402 passives
+        with one pad joined solid to a pour (or on a via in pad into a
+        plane) and the other on a track
+        (AS-TOMBSTONE, warning; thermal reliefs are not reported), two-pad
+        passives off the side's majority angle (AS-ORIENT, info, at >= 10 %),
+        polarized parts with no silkscreen of their own
         (AS-SILK-POLARITY) or no mark nearer pad 1 than the other pads
         (AS-PIN1-MARK: pin-1 dot, cathode bar, chamfer). DNP parts are skipped.
 
@@ -564,8 +571,8 @@ def register(mcp) -> None:
         pins with no pad of that number (XV-PADS, error), Value / Footprint /
         MPN differing between schematic and board (XV-FIELD).
         """
-        if assembly_sides not in ("top", "bottom", "both"):
-            raise ValueError("assembly_sides must be top, bottom or both")
+        if assembly_sides not in ("auto", "top", "bottom", "both"):
+            raise ValueError("assembly_sides must be auto, top, bottom or both")
         tree = sch_io.parse_file(state.get_active_board_path())
         out = assembly_review.check_assembly(tree, assembly_sides, min_spacing_mm,
                                              edge_clearance_mm, fiducials_min, tall_mm,
@@ -594,7 +601,7 @@ def register(mcp) -> None:
     def fab_release_gate(preset: str = "", fab_dir: str = "",
                          rail_voltages: dict[str, float] | None = None,
                          require_mpn: bool = False, check_lifecycle: bool = False,
-                         assembly_sides: Literal["top", "bottom", "both"] = "top",
+                         assembly_sides: Literal["auto", "top", "bottom", "both"] = "auto",
                          loads: dict[str, float] | None = None,
                          netlist_path: str = "") -> dict:
         """One release verdict for the active project, FAB-READY or NOT FAB-READY,
