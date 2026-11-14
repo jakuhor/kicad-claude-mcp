@@ -1,6 +1,7 @@
 """Freerouting JAR runner.
 
-Invokes `java -jar freerouting.jar -de input.dsn -do output.ses -mp <passes>`
+Invokes `java -jar freerouting.jar -de input.dsn -do output.ses
+--router.autorouter.max_passes=<passes>` (Freerouting 2.5.0, Java 25+)
 with timeouts and parses progress lines from stdout.
 
 Required environment:
@@ -25,25 +26,29 @@ class FreeroutingError(RuntimeError):
     pass
 
 
-# Match the summary lines Freerouting 2.x prints, e.g.:
-#   "INFO   Routing took 0:00:42 to complete"
-#   "INFO   Total trace length: 287.5 mm"
-#   "INFO   Total of 12 vias"
-_PATTERNS = {
-    "completion_pct": re.compile(r"(\d+(?:\.\d+)?)\s*% completed", re.IGNORECASE),
-    "via_count": re.compile(r"(?:total of\s+)?(\d+)\s+vias", re.IGNORECASE),
-    "trace_length_mm": re.compile(
-        r"total\s+trace\s+length[:\s]+(\d+(?:\.\d+)?)\s*mm", re.IGNORECASE
-    ),
-    "duration": re.compile(r"routing took\s+(\d+:\d+:\d+)", re.IGNORECASE),
-    "passes_done": re.compile(r"pass\s+(\d+)\s+complete", re.IGNORECASE),
-}
+# Match the summary lines Freerouting 2.5 prints, e.g.:
+#   "Auto-routing pass #5 on board '…' was completed in 0.12 seconds with
+#    score 619.05 (6 unrouted and 0 violations)"
+#   "Auto-routing stage completed: started with 10 unrouted nets, completed in
+#    1.19 seconds, final score: 619.05 (6 unrouted and 0 violations), …"
+_PASS = re.compile(r"auto-routing pass #(\d+)", re.IGNORECASE)
+_RESULT = re.compile(
+    r"score:?\s+(?:of\s+)?(\d+(?:\.\d+)?)\s+\((\d+)\s+unrouted\s+and\s+(\d+)\s+violations\)",
+    re.IGNORECASE,
+)
+_STAGE = re.compile(
+    r"auto-routing stage completed: started with (\d+) unrouted nets?, "
+    r"completed in (\d+(?:\.\d+)?) seconds",
+    re.IGNORECASE,
+)
 
 
 def find_freerouting_jar() -> Path | None:
     """Resolve the Freerouting JAR path.
 
-    Order: FREEROUTING_JAR env > <repo>/third_party/freerouting.jar.
+    Order: FREEROUTING_JAR env > `<repo>/third_party/freerouting*.jar`. The
+    release downloads are named `freerouting-2.5.0.jar`, so the versioned names
+    are matched too, newest version first.
     """
     env = os.environ.get("FREEROUTING_JAR")
     if env:
@@ -51,11 +56,22 @@ def find_freerouting_jar() -> Path | None:
         if p.is_file():
             return p
 
-    repo_root = Path(__file__).resolve().parents[3]
-    candidate = repo_root / "third_party" / "freerouting.jar"
+    third_party = Path(__file__).resolve().parents[3] / "third_party"
+    candidate = third_party / "freerouting.jar"
     if candidate.is_file():
         return candidate
-    return None
+    versioned = sorted(
+        (p for p in third_party.glob("freerouting*.jar") if p.is_file()),
+        key=lambda p: _version_key(p.stem),
+        reverse=True,
+    )
+    return versioned[0] if versioned else None
+
+
+def _version_key(stem: str) -> tuple[int, ...]:
+    """Sort key from a jar's name: `freerouting-2.5.0` -> (2, 5, 0)."""
+    digits = re.findall(r"\d+", stem)
+    return tuple(int(d) for d in digits) or (0,)
 
 
 def find_java() -> Path | None:
@@ -75,39 +91,31 @@ def _ensure_environment() -> tuple[Path, Path]:
         )
     java = find_java()
     if java is None:
-        raise FreeroutingError("`java` not on PATH; install Java 21+")
+        raise FreeroutingError("`java` not on PATH; install Java 25+ (Freerouting 2.5.0)")
     return jar, java
 
 
 def _parse_stats(combined_output: str) -> dict:
-    """Pull whatever stats Freerouting prints into a dict. Best-effort.
+    """Pull the routing summary Freerouting 2.5 prints into a dict. Best-effort.
 
-    For progress fields (`completion_pct`, `passes_done`) we take the LAST
-    match so the final state is reported. Totals (`via_count`,
-    `trace_length_mm`) and `duration` use the first/only match.
+    `passes_done`, `score`, `unrouted` and `violations` come from the last
+    pass / optimizer line (the final state); `unrouted_start` and
+    `duration_s` from the auto-routing stage summary.
     """
     stats: dict = {}
-    last_match_keys = {"completion_pct", "passes_done"}
-
-    for key, pattern in _PATTERNS.items():
-        matches = pattern.findall(combined_output)
-        if not matches:
-            continue
-        stats[key] = matches[-1] if key in last_match_keys else matches[0]
-
-    # Coerce numbers where possible.
-    for k in ("via_count", "passes_done"):
-        if k in stats:
-            try:
-                stats[k] = int(stats[k])
-            except ValueError:
-                pass
-    for k in ("completion_pct", "trace_length_mm"):
-        if k in stats:
-            try:
-                stats[k] = float(stats[k])
-            except ValueError:
-                pass
+    passes = _PASS.findall(combined_output)
+    if passes:
+        stats["passes_done"] = int(passes[-1])
+    results = _RESULT.findall(combined_output)
+    if results:
+        score, unrouted, violations = results[-1]
+        stats["score"] = float(score)
+        stats["unrouted"] = int(unrouted)
+        stats["violations"] = int(violations)
+    stage = _STAGE.search(combined_output)
+    if stage:
+        stats["unrouted_start"] = int(stage.group(1))
+        stats["duration_s"] = float(stage.group(2))
     return stats
 
 
@@ -140,8 +148,7 @@ def route(
         str(dsn_path),
         "-do",
         str(ses_path),
-        "-mp",
-        str(passes),
+        f"--router.autorouter.max_passes={passes}",
     ]
     if threads is not None:
         cmd += ["-mt", str(threads)]
@@ -153,7 +160,7 @@ def route(
         r = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=timeout_seconds,
             check=False,
         )

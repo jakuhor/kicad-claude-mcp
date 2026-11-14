@@ -1,0 +1,572 @@
+"""PCB editing.
+
+Strategy:
+- Unit tests against the blank-template PCB and a synthetic footprint def.
+- Integration test: build a tiny board with real KiCAD library footprints
+  and verify kicad-cli pcb drc parses it (marked @pytest.mark.slow).
+"""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+import sexpdata
+
+from kicad_claude import state
+from kicad_claude.adapters import pcb_editor as ed
+from kicad_claude.adapters import sch_io
+from kicad_claude.indexer import kicad_libs
+from kicad_claude.templates.blank import write_blank_project
+from kicad_claude.tools.library import index as lib_tools
+from kicad_claude.tools.pcb import layout as pcb_tools
+from kicad_claude.utils.kicad_paths import find_kicad_cli, find_footprint_lib_dirs
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture
+def blank_project(tmp_path: Path):
+    state.clear_active()
+    files = write_blank_project(tmp_path / "demo", "demo")
+    state.set_active(tmp_path / "demo", "demo")
+    yield files
+    state.clear_active()
+
+
+# ===== Board outline ======================================================= #
+
+
+def test_set_board_outline_appends_gr_rect_on_edge_cuts(blank_project):
+    pcb = blank_project["pcb"]
+    tree = sch_io.parse_file(pcb)
+    result = ed.set_board_outline(tree, 50, 30)
+    assert result["width_mm"] == 50
+    assert result["height_mm"] == 30
+
+    rects = sch_io.find_children(tree, "gr_rect")
+    edge_rects = [r for r in rects if (sch_io.find_child(r, "layer") or [None, ""])[1] == "Edge.Cuts"]
+    assert len(edge_rects) == 1
+
+
+def test_set_board_outline_replaces_previous_outline(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    ed.set_board_outline(tree, 50, 30)
+    ed.set_board_outline(tree, 80, 40)
+    edge_rects = [
+        r for r in sch_io.find_children(tree, "gr_rect")
+        if (sch_io.find_child(r, "layer") or [None, ""])[1] == "Edge.Cuts"
+    ]
+    assert len(edge_rects) == 1
+
+
+def test_set_board_outline_rejects_unknown_shape(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    with pytest.raises(ValueError):
+        ed.set_board_outline(tree, 50, 30, shape="circle")
+
+
+# ===== Footprint placement (synthetic .kicad_mod) ========================== #
+
+
+def _make_synth_fp_def() -> list:
+    """Parse the MiniFP fixture as a footprint def."""
+    return ed.fetch_footprint_def(FIXTURES / "MiniFP.pretty" / "Mini_R_0603.kicad_mod")
+
+
+def test_add_footprint_via_editor(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    fp_def = _make_synth_fp_def()
+    ed.add_footprint(
+        tree,
+        qualified_lib_id="MiniFP:Mini_R_0603",
+        reference="R1",
+        value="10k",
+        x_mm=20,
+        y_mm=15,
+        rotation=0,
+        layer="F.Cu",
+        fp_def_node=fp_def,
+    )
+    fp = ed.find_footprint_by_reference(tree, "R1")
+    assert fp is not None
+    layer = sch_io.find_child(fp, "layer")
+    assert layer[1] == "F.Cu"
+    at = sch_io.find_child(fp, "at")
+    # Issue 2: coordinates are KiCAD-native, no Y flip.
+    assert at[1] == 20.0
+    assert at[2] == 15.0
+
+
+def test_add_footprint_rejects_bad_layer(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    with pytest.raises(ValueError, match="layer"):
+        ed.add_footprint(
+            tree, qualified_lib_id="x:y", reference="R1", value="v",
+            x_mm=0, y_mm=0, layer="F.Bogus", fp_def_node=_make_synth_fp_def()
+        )
+
+
+def test_duplicate_footprint_reference_rejected(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    fp_def = _make_synth_fp_def()
+    ed.add_footprint(
+        tree, qualified_lib_id="MiniFP:Mini_R_0603", reference="R1",
+        value="10k", x_mm=10, y_mm=10, fp_def_node=fp_def,
+    )
+    with pytest.raises(ValueError, match="already exists"):
+        ed.add_footprint(
+            tree, qualified_lib_id="MiniFP:Mini_R_0603", reference="R1",
+            value="other", x_mm=20, y_mm=20, fp_def_node=_make_synth_fp_def(),
+        )
+
+
+def test_remove_footprint(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    fp_def = _make_synth_fp_def()
+    ed.add_footprint(
+        tree, qualified_lib_id="MiniFP:Mini_R_0603", reference="R1",
+        value="10k", x_mm=10, y_mm=10, fp_def_node=fp_def,
+    )
+    assert ed.remove_footprint(tree, "R1") is True
+    assert ed.remove_footprint(tree, "DNE") is False
+
+
+def test_move_footprint(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    fp_def = _make_synth_fp_def()
+    ed.add_footprint(
+        tree, qualified_lib_id="MiniFP:Mini_R_0603", reference="R1",
+        value="10k", x_mm=10, y_mm=10, fp_def_node=fp_def,
+    )
+    ed.move_footprint(tree, "R1", x_mm=30, y_mm=25, rotation=90, layer="B.Cu")
+    fp = ed.find_footprint_by_reference(tree, "R1")
+    at = sch_io.find_child(fp, "at")
+    layer = sch_io.find_child(fp, "layer")
+    assert at[1] == 30.0
+    assert at[2] == 25.0
+    assert at[3] == 90
+    assert layer[1] == "B.Cu"
+
+
+# ===== place_footprints_grid =============================================== #
+
+
+def test_place_footprints_grid_distributes_unplaced(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    # Simulate "Update PCB from Schematic" — KiCAD stacks footprints at
+    # KiCAD-(0, 0). We add via the editor (which uses MCP coords) then force
+    # the underlying `at` to (0, 0) to match the real GUI state.
+    for ref in ("R1", "R2", "R3", "C1", "C2"):
+        ed.add_footprint(
+            tree, qualified_lib_id="MiniFP:Mini_R_0603", reference=ref,
+            value="x", x_mm=0, y_mm=0,
+            fp_def_node=ed.fetch_footprint_def(
+                FIXTURES / "MiniFP.pretty" / "Mini_R_0603.kicad_mod"
+            ),
+        )
+        at = sch_io.find_child(ed.find_footprint_by_reference(tree, ref), "at")
+        at[1] = 0.0
+        at[2] = 0.0
+
+    summary = ed.place_footprints_grid(tree, spacing_mm=10, columns=3, origin_mcp=(15, 15))
+    assert summary["placed"] == 5
+    # All footprints should now have unique non-origin positions.
+    positions = []
+    for fp in ed.iter_footprints(tree):
+        at = sch_io.find_child(fp, "at")
+        positions.append((float(at[1]), float(at[2])))
+    assert len(set(positions)) == 5
+    # All footprints now have unique non-origin positions
+    positions = []
+    for fp in ed.iter_footprints(tree):
+        at = sch_io.find_child(fp, "at")
+        positions.append((float(at[1]), float(at[2])))
+    assert len(set(positions)) == 5
+
+
+# ===== Tracks / vias ======================================================= #
+
+
+def test_add_track_persists(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    ed.add_track(tree, 10, 10, 30, 10, width_mm=0.25)
+    sch_io.write_file(blank_project["pcb"], tree)
+    tree2 = sch_io.parse_file(blank_project["pcb"])
+    segs = sch_io.find_children(tree2, "segment")
+    assert len(segs) == 1
+    assert sch_io.find_child(segs[0], "width")[1] == 0.25
+
+
+def test_add_via_persists(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    ed.add_via(tree, 20, 15, drill_mm=0.4, diameter_mm=0.8)
+    sch_io.write_file(blank_project["pcb"], tree)
+    tree2 = sch_io.parse_file(blank_project["pcb"])
+    vias = sch_io.find_children(tree2, "via")
+    assert len(vias) == 1
+    drill = sch_io.find_child(vias[0], "drill")
+    assert drill[1] == 0.4
+
+
+# ===== Tool layer ========================================================== #
+
+
+def _patched_index(tmp_path):
+    """Build an index pointing at the MiniFP fixture."""
+    fp_dir = tmp_path / "fps"
+    fp_dir.mkdir()
+    shutil.copytree(FIXTURES / "MiniFP.pretty", fp_dir / "MiniFP.pretty")
+    return kicad_libs.build_index(symbol_dirs=[], footprint_dirs=[fp_dir])
+
+
+def _make_mcp(monkeypatch, tmp_path):
+    from mcp.server.fastmcp import FastMCP
+    idx = _patched_index(tmp_path)
+    monkeypatch.setattr(lib_tools, "load_cache", lambda: idx)
+    monkeypatch.setattr(lib_tools, "_index", None)
+    mcp = FastMCP("t")
+    pcb_tools.register(mcp)
+    return mcp
+
+
+def _call(mcp, name, **kwargs):
+    return mcp._tool_manager.get_tool(name).fn(**kwargs)
+
+
+def test_pcb_tools_end_to_end(blank_project, tmp_path, monkeypatch):
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    _call(mcp, "set_board_outline", width_mm=50, height_mm=30)
+    _call(mcp, "add_footprint", lib_id="MiniFP:Mini_R_0603",
+          reference="R1", value="10k", x_mm=20, y_mm=20)
+    _call(mcp, "add_footprint", lib_id="MiniFP:Mini_R_0603",
+          reference="R2", value="1k", x_mm=40, y_mm=20)
+    _call(mcp, "add_track", x1_mm=20, y1_mm=20, x2_mm=40, y2_mm=20)
+    _call(mcp, "add_via", x_mm=30, y_mm=20)
+
+    fps = _call(mcp, "list_footprints")
+    assert {fp["reference"] for fp in fps} == {"R1", "R2"}
+
+    # Read schematic back to confirm persistence
+    tree = sch_io.parse_file(blank_project["pcb"])
+    assert len(sch_io.find_children(tree, "footprint")) == 2
+    assert len(sch_io.find_children(tree, "segment")) == 1
+    assert len(sch_io.find_children(tree, "via")) == 1
+
+
+def test_move_footprint_via_tool(blank_project, tmp_path, monkeypatch):
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    _call(mcp, "add_footprint", lib_id="MiniFP:Mini_R_0603",
+          reference="R1", value="v", x_mm=20, y_mm=20)
+    _call(mcp, "move_footprint", reference="R1", x_mm=30, y_mm=25, rotation=180)
+    fps = _call(mcp, "list_footprints")
+    r1 = next(fp for fp in fps if fp["reference"] == "R1")
+    assert r1["position_mm"] == [30.0, 25.0]
+
+
+# ===== Acceptance: small board with KiCAD official footprints ============== #
+
+
+@pytest.mark.slow
+def test_acceptance_small_board_with_real_libs(tmp_path):
+    """Build a 50x30 board with 2 SMD resistors + a track, then run kicad-cli pcb drc."""
+    cli = find_kicad_cli()
+    if not cli or not find_footprint_lib_dirs():
+        pytest.skip("kicad-cli or footprint libs not available")
+
+    cached = kicad_libs.load_cache()
+    if cached is None:
+        pytest.skip("library index not built; run index_libraries first")
+    state.clear_active()
+    lib_tools._index = cached
+
+    files = write_blank_project(tmp_path / "tinyboard", "tinyboard")
+    state.set_active(tmp_path / "tinyboard", "tinyboard")
+
+    from mcp.server.fastmcp import FastMCP
+    mcp = FastMCP("t")
+    pcb_tools.register(mcp)
+
+    _call(mcp, "set_board_outline", width_mm=50, height_mm=30)
+    _call(mcp, "add_footprint",
+          lib_id="Resistor_SMD:R_0603_1608Metric", reference="R1",
+          value="10k", x_mm=20, y_mm=20)
+    _call(mcp, "add_footprint",
+          lib_id="Resistor_SMD:R_0603_1608Metric", reference="R2",
+          value="1k", x_mm=35, y_mm=20)
+    _call(mcp, "add_track", x1_mm=20, y1_mm=20, x2_mm=35, y2_mm=20)
+
+    pcb_path = files["pcb"]
+    state.clear_active()
+
+    r = subprocess.run(
+        [str(cli), "pcb", "drc", str(pcb_path)],
+        capture_output=True, text=True, timeout=60, cwd=tmp_path,
+    )
+    # DRC will report unconnected/clearance issues but the file MUST parse.
+    assert r.returncode == 0, f"drc parse failed: stderr={r.stderr}"
+
+
+# ===== Float spelling preserved on round-trip ============================== #
+
+
+def test_number_spelling_survives_round_trip(tmp_path: Path):
+    """Untouched numbers are written back exactly as the board spells them.
+
+    KiCAD 10 keeps a negative zero in a 3D model's `(xyz ...)` (`{:.10g}` of
+    -0.0 is `-0`, and `int("-0")` would drop the sign), and prints a value
+    below 0.0001 as a plain decimal, never an exponent.
+    """
+    src = (
+        "(kicad_pcb\n"
+        "\t(version 20260206)\n"
+        '\t(generator "pcbnew")\n'
+        '\t(generator_version "10.0")\n'
+        '\t(footprint "X"\n'
+        '\t\t(model "m.wrl"\n'
+        "\t\t\t(offset\n"
+        "\t\t\t\t(xyz 0 -0 -0)\n"
+        "\t\t\t)\n"
+        "\t\t\t(scale\n"
+        "\t\t\t\t(xyz 1 1 0.00001)\n"
+        "\t\t\t)\n"
+        "\t\t)\n"
+        "\t)\n"
+        ")\n"
+    )
+    pcb = tmp_path / "raw.kicad_pcb"
+    pcb.write_text(src, encoding="utf-8", newline="")
+
+    tree = sch_io.parse_file(pcb)
+    assert sch_io.dumps(tree) == src
+
+
+def test_mutated_float_uses_kicad_formatting(tmp_path: Path):
+    """A value we replace is spelled by `_format_float`, not by the old token."""
+    pcb = tmp_path / "raw.kicad_pcb"
+    pcb.write_text(
+        "(kicad_pcb\n\t(version 20260206)\n\t(thickness 1.6)\n)\n",
+        encoding="utf-8",
+        newline="",
+    )
+    tree = sch_io.parse_file(pcb)
+    node = sch_io.find_child(tree, "thickness")
+    assert float(node[1]) == 1.6
+    node[1] = 0.8
+    assert "(thickness 0.8)" in sch_io.dumps(tree)
+
+
+def test_place_footprints_grid_can_arrange_already_placed_parts(tmp_path: Path):
+    """`update_pcb_from_schematic` places new parts below the outline, not at (0,0)."""
+    from kicad_claude.adapters import pcb_editor as ed
+    from kicad_claude.adapters import sch_io
+    from kicad_claude.templates.blank import write_blank_project
+
+    files = write_blank_project(tmp_path / "g", "g")
+    tree = sch_io.parse_file(files["pcb"])
+    fp_def = [
+        sch_io.sym("footprint"), "L:R",
+        [sch_io.sym("property"), "Reference", "REF**",
+         [sch_io.sym("at"), 0, 0, 0]],
+        [sch_io.sym("property"), "Value", "V",
+         [sch_io.sym("at"), 0, 0, 0]],
+    ]
+    for i, ref in enumerate(("R1", "R2")):
+        ed.add_footprint(tree, qualified_lib_id="L:R", reference=ref, value="1k",
+                         x_mm=60 + i * 5, y_mm=60, fp_def_node=fp_def)
+
+    assert ed.place_footprints_grid(tree)["placed"] == 0
+    res = ed.place_footprints_grid(tree, spacing_mm=10, columns=2,
+                                   origin_mcp=(20.0, 20.0), only_unplaced=False)
+    assert res["placed"] == 2
+    positions = {f["reference"]: f["position_mm"]
+                 for f in ed.list_footprints_summary(tree)}
+    assert positions["R1"] == [20.0, 20.0]
+    assert positions["R2"] == [30.0, 20.0]
+
+
+# ===== Pad angles follow the footprint (defects report 2026-09-20, #1) ===== #
+
+
+def _extra_fp_def(name: str) -> list:
+    return ed.fetch_footprint_def(FIXTURES / "ExtraFP.pretty" / f"{name}.kicad_mod")
+
+
+def _pad_angles(fp: list) -> list[float]:
+    out = []
+    for pad in sch_io.find_children(fp, "pad"):
+        at = sch_io.find_child(pad, "at")
+        out.append(float(at[3]) if len(at) >= 4 else 0.0)
+    return out
+
+
+def test_move_footprint_rotates_pads_with_the_footprint(blank_project):
+    """A pad's angle is absolute, so rotating the footprint must rotate it too."""
+    tree = sch_io.parse_file(blank_project["pcb"])
+    ed.add_footprint(
+        tree, qualified_lib_id="ExtraFP:Pads_2P", reference="U1", value="v",
+        x_mm=10, y_mm=10, fp_def_node=_extra_fp_def("Pads_2P"),
+    )
+    fp = ed.find_footprint_by_reference(tree, "U1")
+    assert _pad_angles(fp) == [0.0, 45.0]
+
+    ed.move_footprint(tree, "U1", x_mm=10, y_mm=10, rotation=90)
+    assert _pad_angles(fp) == [90.0, 135.0]
+
+    # Rotating back takes the pads with it — the delta, not the absolute value.
+    ed.move_footprint(tree, "U1", x_mm=10, y_mm=10, rotation=0)
+    assert _pad_angles(fp) == [0.0, 45.0]
+
+
+def test_move_footprint_without_rotation_leaves_pads_alone(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    ed.add_footprint(
+        tree, qualified_lib_id="ExtraFP:Pads_2P", reference="U1", value="v",
+        x_mm=10, y_mm=10, rotation=90, fp_def_node=_extra_fp_def("Pads_2P"),
+    )
+    fp = ed.find_footprint_by_reference(tree, "U1")
+    assert _pad_angles(fp) == [90.0, 135.0]  # applied at placement time
+    ed.move_footprint(tree, "U1", x_mm=40, y_mm=20)
+    assert _pad_angles(fp) == [90.0, 135.0]
+
+
+# ===== KiCad 6 footprints keep their reference (defects report #3) ========= #
+
+
+def test_legacy_fp_text_footprint_gets_its_reference(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    ed.add_footprint(
+        tree, qualified_lib_id="ExtraFP:Legacy_2P", reference="L9", value="100uH",
+        x_mm=10, y_mm=10, fp_def_node=_extra_fp_def("Legacy_2P"),
+    )
+    fp = ed.find_footprint_by_reference(tree, "L9")
+    assert fp is not None
+    assert ed.get_fp_text(fp, "reference") == "L9"
+    assert ed.get_fp_text(fp, "value") == "100uH"
+    assert ed.all_footprint_references(tree) == ["L9"]
+
+
+def test_set_footprint_property_writes_legacy_fp_text(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    ed.add_footprint(
+        tree, qualified_lib_id="ExtraFP:Legacy_2P", reference="L9", value="100uH",
+        x_mm=10, y_mm=10, fp_def_node=_extra_fp_def("Legacy_2P"),
+    )
+    fp = ed.find_footprint_by_reference(tree, "L9")
+    assert ed.set_footprint_property(fp, "Value", "220uH") is True
+    assert ed.get_fp_text(fp, "value") == "220uH"
+    # No second, conflicting field was added.
+    assert sch_io.get_property(fp, "Value") is None
+    assert ed.set_footprint_property(fp, "Value", "220uH") is False
+
+
+@pytest.mark.slow
+def test_acceptance_rotating_a_real_footprint_keeps_drc_clean(tmp_path):
+    """#1 — a rotated USB-C used to short its own lands (54 extra violations).
+
+    The check is rotation invariance: the same footprint must produce the same
+    DRC errors at 0° and at 90°. The handful it produces at 0° belong to the
+    library footprint against the blank project's default rules.
+    """
+    from kicad_claude.adapters import kicad_cli
+
+    cli = find_kicad_cli()
+    fp_dirs = find_footprint_lib_dirs()
+    if not cli or not fp_dirs:
+        pytest.skip("kicad-cli or footprint libs not available")
+    mod = next(
+        (d / "Connector_USB.pretty" /
+         "USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal.kicad_mod"
+         for d in fp_dirs
+         if (d / "Connector_USB.pretty").is_dir()),
+        None,
+    )
+    if mod is None or not mod.is_file():
+        pytest.skip("Connector_USB library not available")
+
+    counts = {}
+    for rotation in (0, 90):
+        files = write_blank_project(tmp_path / f"rot{rotation}", "rot")
+        tree = sch_io.parse_file(files["pcb"])
+        ed.set_board_outline(tree, 40, 40)
+        ed.add_footprint(
+            tree,
+            qualified_lib_id=(
+                "Connector_USB:"
+                "USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal"
+            ),
+            reference="J1", value="USB_C", x_mm=20, y_mm=20,
+            fp_def_node=ed.fetch_footprint_def(mod),
+        )
+        ed.move_footprint(tree, "J1", x_mm=20, y_mm=20, rotation=rotation)
+        sch_io.write_file(files["pcb"], tree)
+        report = kicad_cli.run_drc(files["pcb"], schematic_parity=False)
+        counts[rotation] = report["errors"]
+        types = {v["type"] for v in report["violations"]}
+        assert "shorting_items" not in types
+
+    assert counts[90] == counts[0]
+
+
+# ===== remove_board_items (v2.0) =========================================== #
+
+
+_ROUTING = """(kicad_pcb
+  (segment (start 10 10) (end 20 10) (width 0.25) (layer "F.Cu") (net "GND") (uuid "s1"))
+  (segment (start 20 10) (end 20 20) (width 0.25) (layer "B.Cu") (net "GND") (uuid "s2"))
+  (via (at 20 10) (size 0.8) (drill 0.4) (layers "F.Cu" "B.Cu") (net "GND") (uuid "v1"))
+  (segment (start 10 30) (end 20 30) (width 0.25) (layer "F.Cu") (net "VCC") (uuid "s3"))
+)"""
+
+
+def _routed_board(path):
+    """Tracks and a via in KiCAD 10's net-by-name form, on nets no pad has."""
+    tree = sch_io.parse_file(path)
+    tree.extend(sexpdata.loads(_ROUTING)[1:])
+    sch_io.write_file(path, tree)
+
+
+def test_remove_board_items_rips_up_a_net(blank_project, tmp_path, monkeypatch):
+    _routed_board(blank_project["pcb"])
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    dry = _call(mcp, "remove_board_items", net="GND", dry_run=True)
+    assert dry["by_kind"] == {"track": 2, "via": 1}
+    assert len(sch_io.find_children(sch_io.parse_file(blank_project["pcb"]), "segment")) == 3
+
+    res = _call(mcp, "remove_board_items", net="GND")
+    assert res["removed_count"] == 3 and res["backup"]
+    tree = sch_io.parse_file(blank_project["pcb"])
+    assert [ed.net_of(s) for s in sch_io.find_children(tree, "segment")] == ["VCC"]
+    assert sch_io.find_children(tree, "via") == []
+
+
+def test_remove_board_items_one_layer_spares_vias(blank_project, tmp_path, monkeypatch):
+    _routed_board(blank_project["pcb"])
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    res = _call(mcp, "remove_board_items", net="GND", layer="B.Cu")
+    assert res["by_kind"] == {"track": 1}
+    tree = sch_io.parse_file(blank_project["pcb"])
+    assert len(sch_io.find_children(tree, "via")) == 1
+
+
+def test_remove_board_items_by_uuid(blank_project, tmp_path, monkeypatch):
+    _routed_board(blank_project["pcb"])
+    via = sch_io.find_children(sch_io.parse_file(blank_project["pcb"]), "via")[0]
+    uid = str(sch_io.find_child(via, "uuid")[1])
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    res = _call(mcp, "remove_board_items", uuid=uid)
+    assert res["items"] == [{"kind": "via", "uuid": uid, "net": "GND",
+                             "layers": ["F.Cu", "B.Cu"]}]
+    assert sch_io.find_children(sch_io.parse_file(blank_project["pcb"]), "via") == []
+
+
+def test_remove_board_items_refuses_without_target(blank_project, tmp_path, monkeypatch):
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    with pytest.raises(ValueError, match="uuid or a net"):
+        _call(mcp, "remove_board_items")
+    with pytest.raises(KeyError, match="no track"):
+        _call(mcp, "remove_board_items", uuid="nope")
+    with pytest.raises(ValueError, match="unknown kind"):
+        _call(mcp, "remove_board_items", net="GND", kinds=["pad"])

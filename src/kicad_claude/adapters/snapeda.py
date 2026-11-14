@@ -9,13 +9,13 @@ What we *can* do:
 - (Best effort) probe DigiKey's product detail for ECAD model links — those
   often point at SnapEDA / Ultra Librarian.
 
-For Phase 4 we rely on the manual fallback flow:
+The import relies on the manual fallback flow:
     1. The user opens https://www.snapeda.com/parts/<MPN>
     2. Logs in, downloads the KiCad ZIP
     3. Drops it into ./vendor_parts/
     4. Calls `import_vendor_zip` to register it in the project
 
-This keeps Phase 4 reliable without depending on third-party site internals.
+This stays reliable without depending on third-party site internals.
 """
 
 from __future__ import annotations

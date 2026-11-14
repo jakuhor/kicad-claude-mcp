@@ -11,7 +11,7 @@ import logging
 import subprocess
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
 
 from kicad_claude.utils.kicad_paths import find_kicad_cli
 
@@ -26,9 +26,10 @@ def _ensure_cli() -> Path:
     cli = find_kicad_cli()
     if cli is None:
         raise KicadCliError(
-            "`kicad-cli` not found on PATH and not in the standard install path. "
-            "Add it to PATH (macOS: /Applications/KiCad/KiCad.app/Contents/MacOS) "
-            "or set KICAD_CLI in the environment."
+            "`kicad-cli` not found. Searched $KICAD_CLI, PATH and the standard "
+            r"install paths (Windows: %ProgramFiles%\KiCad\<version>\bin\kicad-cli.exe"
+            ", macOS: /Applications/KiCad/KiCad.app/Contents/MacOS, "
+            "Linux: /usr/bin). Set KICAD_CLI to the binary or add it to PATH."
         )
     return cli
 
@@ -39,7 +40,7 @@ def _run(args: list[str], *, timeout: float = 120.0, cwd: Path | None = None) ->
     cmd = [str(cli), *args]
     try:
         r = subprocess.run(
-            cmd, capture_output=True, text=True,
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=timeout, check=False, cwd=str(cwd) if cwd else None,
         )
     except subprocess.TimeoutExpired as e:
@@ -71,7 +72,7 @@ def _summarize_violations(violations: list[dict]) -> Counter:
 def _shape_violation(v: dict) -> dict:
     """Trim a raw kicad-cli violation to the fields useful to the caller."""
     items = v.get("items") or []
-    return {
+    shaped = {
         "type": v.get("type") or v.get("error_type") or "",
         "severity": (v.get("severity") or "").lower(),
         "description": v.get("description", ""),
@@ -87,6 +88,9 @@ def _shape_violation(v: dict) -> dict:
             for it in items
         ],
     }
+    if v.get("sheet"):
+        shaped["sheet"] = v["sheet"]
+    return shaped
 
 
 # --------------------------------------------------------------------------- #
@@ -123,7 +127,7 @@ def run_erc(
         str(sch_path),
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)
     except subprocess.TimeoutExpired as e:
         raise KicadCliError(f"kicad-cli sch erc timed out after {timeout}s") from e
     if r.returncode != 0 or not output_json.is_file():
@@ -132,12 +136,48 @@ def run_erc(
             f"stderr: {r.stderr[-300:]}"
         )
 
-    data = json.loads(output_json.read_text())
-    return _shape_erc(data, output_json)
+    data = json.loads(output_json.read_text(encoding="utf-8"))
+    out = _shape_erc(data, output_json)
+    out["cli_path"] = str(cli)
+    return out
+
+
+def _erc_violations(data: dict) -> tuple[list[dict], list[dict]]:
+    """Return (violations, per-sheet counts) from an ERC report.
+
+    KiCAD 10 nests violations per sheet:
+        {"sheets": [{"path": "/", "uuid_path": "...", "violations": [...]}]}
+    Older reports put a flat `violations` list at the top level. Both are read;
+    each violation carries the `sheet` it came from (empty for a flat report).
+    """
+    sheets = data.get("sheets")
+    if not isinstance(sheets, list):
+        return list(data.get("violations") or []), []
+
+    violations: list[dict] = []
+    per_sheet: list[dict] = []
+    for sheet in sheets:
+        if not isinstance(sheet, dict):
+            continue
+        sheet_path = sheet.get("path", "")
+        found = list(sheet.get("violations") or [])
+        for v in found:
+            violations.append({**v, "sheet": sheet_path})
+        counts = _summarize_violations(found)
+        per_sheet.append({
+            "sheet": sheet_path,
+            "uuid_path": sheet.get("uuid_path", ""),
+            "errors": counts.get("error", 0),
+            "warnings": counts.get("warning", 0),
+            "total_violations": sum(counts.values()),
+        })
+    # A report can carry both shapes; keep whatever the flat key holds too.
+    violations.extend(data.get("violations") or [])
+    return violations, per_sheet
 
 
 def _shape_erc(data: dict, raw_path: Path) -> dict:
-    violations = data.get("violations") or []
+    violations, per_sheet = _erc_violations(data)
     counts = _summarize_violations(violations)
     return {
         "kind": "erc",
@@ -149,6 +189,7 @@ def _shape_erc(data: dict, raw_path: Path) -> dict:
         "exclusions": counts.get("exclusion", 0),
         "total_violations": sum(counts.values()),
         "violations": [_shape_violation(v) for v in violations],
+        "sheets": per_sheet,
         "raw_path": str(raw_path),
     }
 
@@ -197,7 +238,7 @@ def run_drc(
         cmd.insert(-1, "--save-board")
 
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)
     except subprocess.TimeoutExpired as e:
         raise KicadCliError(f"kicad-cli pcb drc timed out after {timeout}s") from e
     if r.returncode != 0 or not output_json.is_file():
@@ -206,8 +247,10 @@ def run_drc(
             f"stderr: {r.stderr[-300:]}"
         )
 
-    data = json.loads(output_json.read_text())
-    return _shape_drc(data, output_json)
+    data = json.loads(output_json.read_text(encoding="utf-8"))
+    out = _shape_drc(data, output_json)
+    out["cli_path"] = str(cli)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -517,6 +560,15 @@ def export_step(
     }
 
 
+# What "the board" means for an SVG: copper, silkscreen, mask and the outline.
+DEFAULT_SVG_LAYERS = (
+    "F.Cu", "B.Cu",
+    "F.Silkscreen", "B.Silkscreen",
+    "F.Mask", "B.Mask",
+    "Edge.Cuts",
+)
+
+
 def export_pcb_svg(
     pcb_path: Path,
     output_dir: Path,
@@ -526,7 +578,12 @@ def export_pcb_svg(
     black_and_white: bool = False,
     timeout: float = 60.0,
 ) -> dict:
-    """Run `kicad-cli pcb export svg`. By default writes one SVG per layer."""
+    """Run `kicad-cli pcb export svg`, one SVG per layer.
+
+    `kicad-cli` has no "every layer" default — called without `--layers` it
+    exits 1 with "At least one layer must be specified" — so `layers=None`
+    means the documentation set in `DEFAULT_SVG_LAYERS`.
+    """
     pcb_path = Path(pcb_path).expanduser().resolve()
     output_dir = Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -534,8 +591,7 @@ def export_pcb_svg(
     args = ["pcb", "export", "svg",
             "-o", str(output_dir),
             "--mode-multi"]
-    if layers:
-        args += ["--layers", ",".join(layers)]
+    args += ["--layers", ",".join(layers or DEFAULT_SVG_LAYERS)]
     if fit_page_to_board:
         args.append("--fit-page-to-board")
     if black_and_white:

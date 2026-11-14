@@ -1,0 +1,1230 @@
+"""Part ratings against a per-rail current model.
+
+The netlist knows voltages (power tree) but not currents. The caller gives
+the load on each rail (`loads={"+5VD": 0.4}` amps, the downstream boards'
+budget); this module carries it up the tree:
+
+  - through series links (L / ferrite / 0 R) unchanged;
+  - through a linear regulator unchanged (Iin = Iout, quiescent ignored);
+  - through a switching regulator as power, Iin = |Vout| Iout / (eta Vin),
+    with `efficiency` per regulator (caller) or a stated default;
+  - from each root rail on up to its connector through the series chain
+    (inductors, common-mode choke windings, low-ohm resistors, FET
+    drain-source paths, series diodes).
+
+With those currents and the datasheet spec cache it checks:
+
+  RT-L-ISAT / RT-L-IRMS   inductor peak vs Isat, average vs Irms (buck
+                          ripple from L, fsw, Vin, Vout; other topologies
+                          average only);
+  RT-CMC-I                common-mode choke current vs I_rated;
+  RT-CONN-I               connector current per contact vs I_rated;
+  RT-REG-IOUT             regulator output vs recommended IOUT / current
+                          limit;
+  RT-TJ                   Tj = Ta + rth_ja P vs tj_max: linear (Vin-Vout)
+                          Iout, switcher Pout (1-eta)/eta, FET I^2 RDS(on)
+                          per die, series diode VF I, CCR (V across) I;
+                          rth_ja from the datasheet, else the package-typical
+                          table (`thermal_pkg`, labelled assumed, finding at
+                          most a warning);
+  RT-FET-ID / RT-D-IF     FET and diode current vs rating;
+  RT-LED                  LED current (series R and VF, or the CCR's
+                          I_reg) vs IF max; CCR headroom vs V_min;
+  RT-R-P                  resistor dissipation vs its power rating (datasheet
+                          or Power field) and the profile's derating;
+  RT-FUSE                 fuse / PTC hold or rated current vs the rail
+                          current through it (I_hold, I_trip, I_rated or the
+                          Current field);
+  RT-OVERSPEC             (info) capacitor >= 4x its voltage (>= 50 V
+                          rating), fuse >= 5x its load, regulator IOUT >= 10x
+                          its load: a cost / size hint;
+  RT-NODATA               a part that carries current but has no extracted
+                          rating.
+
+Every rating cites the spec record's page. No component value comes from
+general knowledge: a part without an extraction is listed, not guessed
+(the one exception: the labelled package Rθ_JA estimate in `thermal_pkg`).
+Assumptions the caller can override (efficiency, ambient) are returned.
+"""
+
+from __future__ import annotations
+
+import re
+from collections import defaultdict
+
+from kicad_claude.adapters import datasheet_specs as dss
+from kicad_claude.adapters import thermal_pkg
+from kicad_claude.adapters.power_review import (
+    Netlist,
+    _two_terminal,
+    is_ground,
+    is_unconnected,
+    kind,
+    parse_value,
+)
+
+LED_RE = re.compile(r"\bLED\b|LED_|_LED", re.I)
+
+
+def _f(sev: str, rule: str, ref: str, msg: str, **kw) -> dict:
+    return {"severity": sev, "rule": rule, "ref": ref, "message": msg, **kw}
+
+
+def resolve(name: str, nets) -> str | None:
+    """Net by exact name, else the one net whose last path part matches."""
+    if name in nets:
+        return name
+    tail = name.lstrip("/")
+    hits = [n for n in nets if n.split("/")[-1] == tail or n.lstrip("/") == tail]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _src(rec: dict, page) -> str:
+    return f"{rec.get('mpn')} p.{page}"
+
+
+# ---- current model ------------------------------------------------------------ #
+
+
+_V_IN = re.compile(r"V_?IN\w*\s*=\s*(-?\d+(?:\.\d+)?)", re.I)
+_V_OUT = re.compile(r"V_?OUT\w*\s*=\s*(-?\d+(?:\.\d+)?)", re.I)
+
+
+def efficiency_from_curves(rec: dict | None, vin, vout, iout: float,
+                           channel: str | None = None) -> tuple[float, str] | None:
+    """Efficiency at `iout` from the record's `curves.efficiency*` (x A of
+    output current, y %): the curve whose stated VIN / VOUT are closest
+    (relative), a channel-named curve (`efficiency_ch2`) first."""
+    curves = {k: v for k, v in ((rec or {}).get("curves") or {}).items()
+              if k.lower().startswith("efficiency") and v.get("y_unit") == "%"
+              and v.get("x_unit") == "A"}
+    if channel:
+        own = {k: v for k, v in curves.items() if k.lower().endswith(f"ch{channel}")}
+        curves = own or {k: v for k, v in curves.items() if "_ch" not in k.lower()} or curves
+    if not curves or iout is None:
+        return None
+
+    def dist(cv):
+        c = cv.get("conditions", "")
+        d = 0.0
+        for rx, v in ((_V_IN, vin), (_V_OUT, vout)):
+            m = rx.search(c)
+            if m and v:
+                d += abs(abs(float(m.group(1))) - abs(v)) / abs(v)
+            elif v:
+                d += 1.0
+        return d
+    name, cv = min(curves.items(), key=lambda kv: dist(kv[1]))
+    far = dist(cv) > 0.3
+    pts = cv["points"]
+    eta = dss.curve_at(cv, iout) / 100.0
+    out_of_range = iout < pts[0][0] or iout > pts[-1][0]
+    return eta, (f"{rec.get('mpn')} curves.{name} p.{cv.get('page')} ({cv.get('conditions', '')})"
+                 + (" - load outside the curve, end value used" if out_of_range else "")
+                 + (f" - FAR from this stage (VIN {vin:g} V, VOUT {vout:g} V): an estimate"
+                    if far and vin is not None and vout is not None else ""))
+
+
+def rail_currents(nl: Netlist, pt: dict, loads: dict, efficiency: dict | None = None,
+                  default_eta: float = 0.85, specs: dict | None = None) -> dict:
+    """{"rails": {net: A}, "regulators": {name: {...}}, "links": {ref: A},
+    "unattributed_roots": [...], "assumed_eta": [...]}."""
+    efficiency = efficiency or {}
+    regs = {r["name"]: r for r in pt["regulators"]}
+    volts = {n: v["volts"] for n, v in pt["rail_voltages"].items()}
+    load = defaultdict(float)
+    unresolved = []
+    for name, amps in (loads or {}).items():
+        n = resolve(name, nl.nets)
+        if n is None:
+            unresolved.append(name)
+        else:
+            load[n] += float(amps)
+    rails: dict[str, float] = {}
+    links: dict[str, float] = {}
+    rio: dict[str, dict] = {}
+    assumed = []
+
+    def eta_of(r, iout=None, vin=None, vout=None):
+        for k in (r["name"], r["ref"]):
+            if k in efficiency:
+                return float(efficiency[k]), "caller"
+        cur = efficiency_from_curves((specs or {}).get(r["ref"]), vin, vout, iout,
+                                     r.get("channel"))
+        if cur:
+            return cur
+        assumed.append(r["name"])
+        return default_eta, "assumed"
+
+    def node_i(node: dict) -> float:
+        n = node["rail"]
+        i = load.get(n, 0.0)
+        for ch in node["linked"]:
+            ci = node_i(ch)
+            links[ch["via"]["ref"]] = links.get(ch["via"]["ref"], 0.0) + ci
+            i += ci
+        for rr in node["regulators"]:
+            r = regs[rr["regulator"]]
+            iout = node_i(rr["output"]) if "output" in rr else (
+                rails.get(r["output_net"]) or load.get(r["output_net"], 0.0))
+            i += reg_in(r, iout)
+        rails[n] = i
+        return i
+
+    def reg_in(r: dict, iout: float) -> float:
+        vin, vout = volts.get(r["input_net"]), volts.get(r["output_net"])
+        rec = {"iout": iout, "vin": vin, "vout": vout, "topology": r["topology"]}
+        if r["topology"] == "linear":
+            rec["iin"] = iout
+            if vin is not None and vout is not None:
+                rec["p_loss"] = abs(vin - vout) * iout
+        else:
+            eta, how = eta_of(r, iout, vin, vout)
+            rec.update(eta=eta, eta_source=how)
+            if vin and vout is not None:
+                pout = abs(vout) * iout
+                rec["iin"] = pout / (eta * abs(vin))
+                rec["p_loss"] = pout * (1 - eta) / eta
+            else:
+                rec["iin"] = None
+        rio[r["name"]] = rec
+        return rec["iin"] or 0.0
+
+    roots = list(pt["tree"])
+    for t in roots:
+        node_i(t)
+    # A root fed by a pin of a regulator IC whose VIN is on another root is
+    # an internal stage of that IC (LT8471 Skyhook): carry its power up.
+    for t in roots:
+        n = t["rail"]
+        on_root = {p.ref for p in nl.nets.get(n, [])}
+        host = next((r for r in pt["regulators"] if r["ref"] in on_root
+                     and r["input_net"] != n and r["input_net"] in rails), None)
+        if host and rails.get(n):
+            eta, how = eta_of(host)
+            vin, vn = volts.get(host["input_net"]), volts.get(n)
+            if vin and vn:
+                extra = abs(vn) * rails[n] / (eta * abs(vin))
+                rails[host["input_net"]] += extra
+                rio.setdefault(f"{host['ref']}/internal:{n}", {
+                    "iout": rails[n], "vin": vin, "vout": vn, "eta": eta, "eta_source": how,
+                    "iin": extra, "p_loss": abs(vn) * rails[n] * (1 - eta) / eta,
+                    "topology": "switching (internal stage)"})
+    return {"rails": rails, "regulators": rio, "links": links, "loads": dict(load),
+            "loads_unresolved": unresolved, "assumed_eta": sorted(set(assumed)),
+            "default_eta": default_eta,
+            "internal_roots": [k.split(":", 1)[1] for k in rio if ":" in k]}
+
+
+def _fet_dies(nl: Netlist, ref: str) -> list[tuple[str, str]]:
+    """(drain net, source net) per die from pin names D/S (D1/S1 ...)."""
+    d, s = defaultdict(set), defaultdict(set)
+    for p in nl.pins.get(ref, []):
+        m = re.fullmatch(r"([DS])(\d?)", p.name.upper())
+        if m:
+            (d if m.group(1) == "D" else s)[m.group(2)].add(p.net)
+    if set(d) == {""} and set(s) == {""} and (len(d[""]) > 1 or len(s[""]) > 1):
+        # dual die with generic names: pair every drain net with every source net
+        return [(a, b) for a in d[""] for b in s[""]]
+    return [(a, b) for ch in d for a in d[ch] for b in s.get(ch, ())]
+
+
+POWER_PIN_RE = re.compile(r"VBUS|VIN|VCC|VDD|PWR|POWER|^V\+|^\+|^\d+V", re.I)
+
+
+def _power_entry(nl: Netlist, net: str) -> dict[str, list[str]]:
+    """Connectors that bring power in on `net`: two or more contacts on it,
+    or a contact named like a supply. A one-contact SMA / test header is a
+    tap, not a source."""
+    by = defaultdict(list)
+    for p in nl.nets.get(net, []):
+        if kind(p.ref) in ("J", "P", "CN"):
+            by[p.ref].append(p)
+    return {r: [p.number for p in ps] for r, ps in by.items()
+            if len(ps) >= 2 or any(POWER_PIN_RE.search(p.name or "") for p in ps)}
+
+
+def _hops(nl: Netlist, ref: str, specs: dict) -> tuple[str, list[tuple[str, str]]]:
+    comp = nl.components.get(ref, {})
+    k = kind(ref)
+    cat = (specs.get(ref) or {}).get("category", "")
+    if k in ("L", "FB", "FL"):
+        ends = _two_terminal(nl, ref)
+        if ends:
+            return "inductor", [ends]
+        ng = [q.net for q in nl.pins.get(ref, []) if not is_ground(q.net)]
+        # CMC: the supply winding is the pair of non-ground pins
+        return "cmc", [(ng[0], ng[1])] if len(ng) == 2 else []
+    if k == "R":
+        v = parse_value(comp.get("value", ""))
+        ends = _two_terminal(nl, ref)
+        return "resistor", [ends] if ends and v is not None and v <= 1.0 else []
+    if k in ("F", "FU") or cat == "fuse":
+        ends = _two_terminal(nl, ref)
+        return "fuse", [ends] if ends else []
+    if k == "Q":
+        return "fet", _fet_dies(nl, ref)
+    if k == "D" and cat not in ("tvs", "zener") and not LED_RE.search(
+            f"{comp.get('lib_id', '')} {comp.get('value', '')}"):
+        ends = _two_terminal(nl, ref)
+        return "diode", [ends] if ends else []
+    return "", []
+
+
+def series_chain(nl: Netlist, start: str, specs: dict) -> dict:
+    """Shortest series path from `start` to a power-entry connector through
+    inductors, CMC windings, <= 1 Ohm resistors, FET drain-source (a dual
+    FET contributes one hop per die), fuses and series diodes: {"parts": [{ref,
+    kind, from, to, dnp}], "connectors": {ref: [pins]}}; empty when no
+    connector is reachable that way."""
+    here = _power_entry(nl, start)
+    if here:
+        return {"parts": [], "connectors": here}
+    prev: dict[str, tuple[str, str, str] | None] = {start: None}
+    frontier = [start]
+    found = None
+    while frontier and not found:
+        nxt = []
+        for n in frontier:
+            for p in nl.nets.get(n, []):
+                pk, hops = _hops(nl, p.ref, specs)
+                for a, c in hops:
+                    if n not in (a, c) or is_ground(a) or is_ground(c):
+                        continue
+                    o = c if a == n else a
+                    if o in prev or is_unconnected(o):
+                        continue
+                    prev[o] = (n, p.ref, pk)
+                    if _power_entry(nl, o):
+                        found = o
+                        break
+                    nxt.append(o)
+                if found:
+                    break
+            if found:
+                break
+        frontier = nxt
+    if not found:
+        return {"parts": [], "connectors": {}}
+    parts, n = [], found
+    while prev[n]:
+        m, ref, pk = prev[n]
+        parts.append({"ref": ref, "kind": pk, "from": m, "to": n,
+                      "dnp": nl.components.get(ref, {}).get("dnp", False)})
+        n = m
+    return {"parts": parts[::-1], "connectors": _power_entry(nl, found)}
+
+
+# ---- checks ------------------------------------------------------------------- #
+
+
+def _regulator_inductors(nl: Netlist, pt: dict, rail_nets: set) -> dict[str, dict]:
+    """Power-stage inductor -> {regulator, carries, buck}: `iout` (touches
+    the output rail), `iin` (input rail to a switch pin), `gnd` (switch pin
+    to ground: inverting buck-boost alone, Zeta input inductor in a pair)."""
+    out = {}
+    by_ref = defaultdict(list)
+    for r in pt["regulators"]:
+        by_ref[r["ref"]].append(r)
+    windings = []
+    for ref, comp in nl.components.items():
+        if kind(ref) != "L" or comp.get("dnp"):
+            continue
+        ends = _two_terminal(nl, ref)
+        if ends:
+            windings.append((ref, ref, ends, False))
+            continue
+        # coupled inductor (two windings, pins 1-2 and 3-4); a common-mode
+        # choke has the same pins but sits in a supply path, not a stage
+        pins = {p.number: p.net for p in nl.pins.get(ref, [])}
+        if set(pins) == {"1", "2", "3", "4"} and not re.search(
+                r"common.?mode|CMC|choke", f"{comp.get('lib_id', '')} {comp.get('value', '')} "
+                f"{comp.get('description', '')}", re.I):
+            windings.append((f"{ref}.1", ref, (pins["1"], pins["2"]), True))
+            windings.append((f"{ref}.2", ref, (pins["3"], pins["4"]), True))
+    for lref, part, ends, coupled in windings:
+        for ic, regs in by_ref.items():
+            if not any(r["topology"] == "switching" for r in regs):
+                continue
+            ic_nets = {p.net for p in nl.pins.get(ic, [])}
+
+            def near(net, ic_nets=ic_nets):   # on an IC pin, or one part away from one
+                if net in ic_nets:
+                    return True
+                return any(set(q.net for q in nl.pins.get(p.ref, [])) & (ic_nets - {net})
+                           for p in nl.nets.get(net, [])
+                           if p.ref != part and kind(p.ref) in ("C", "D"))
+            for r in regs:
+                if r["topology"] != "switching":
+                    continue
+                a, b = ends
+                if r["output_net"] in ends:
+                    other = b if a == r["output_net"] else a
+                    if other not in rail_nets and near(other):
+                        out[lref] = {"regulator": r["name"], "carries": "iout",
+                                     "buck": r["switch_net"] == other, "part": part,
+                                     "coupled": coupled}
+                elif r["input_net"] in ends:
+                    other = b if a == r["input_net"] else a
+                    ch_pins = {p.net for p in nl.pins.get(ic, [])
+                               if re.search(rf"{r['channel'] or ''}$", p.name)}
+                    if other in (ch_pins if r["channel"] else ic_nets):
+                        out.setdefault(lref, {"regulator": r["name"], "carries": "iin",
+                                              "buck": False, "part": part, "coupled": coupled})
+                elif any(is_ground(x) for x in ends):
+                    other = b if is_ground(a) else a
+                    ch_pins = {p.net for p in nl.pins.get(ic, [])
+                               if r["channel"] and p.name.endswith(r["channel"])}
+                    if other in ch_pins:
+                        out.setdefault(lref, {"regulator": r["name"], "carries": "gnd",
+                                              "buck": False, "part": part, "coupled": coupled})
+    return out
+
+
+def _stage_diodes(nl: Netlist, stage: dict, regs: dict) -> dict[str, list[str]]:
+    """Rectifier diodes of each regulator stage: a diode (not zener / TVS /
+    LED) with a pin on a stage inductor's net or the switch node."""
+    out = defaultdict(set)
+    for lref, st in stage.items():
+        part = st.get("part", lref)
+        r = regs.get(st["regulator"]) or {}
+        nets = {p.net for p in nl.pins.get(part, [])} | ({r["switch_net"]} if r.get("switch_net")
+                                                         else set())
+        for n in nets:
+            if is_ground(n):
+                continue
+            for p in nl.nets.get(n, []):
+                c = nl.components.get(p.ref, {})
+                if kind(p.ref) == "D" and not c.get("dnp") and not re.search(
+                        r"zener|TVS|LED|BZX|SMF|SMAJ", f"{c.get('lib_id', '')} {c.get('value', '')}",
+                        re.I):
+                    out[st["regulator"]].add(p.ref)
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def stage_topology(st: list[dict], vin, vout) -> tuple[str, float | None]:
+    """(topology, duty) of one regulator's power stage from its inductors'
+    `carries`, ideal CCM duty. Two inductors: Cuk / SEPIC / Zeta."""
+    if vin is None or vout is None or not vin:
+        return "unknown", None
+    a, b = abs(vin), abs(vout)
+    inv = (vin > 0) != (vout > 0)
+    kinds = sorted(x["carries"] for x in st)
+    if len(st) == 2:
+        return ("cuk" if inv else "sepic/zeta"), b / (a + b)
+    if len(st) != 1:
+        return "unknown", None
+    k = kinds[0]
+    if st[0]["buck"] and not inv and b < a:
+        return "buck", b / a
+    if k == "iin" and not inv and b > a:
+        return "boost", 1 - a / b
+    if k == "gnd" or (inv and k in ("iin", "iout")):
+        return "inverting buck-boost", b / (a + b)
+    return "unknown", None
+
+
+def switch_limit(rec: dict | None) -> tuple | None:
+    """Lowest minimum switch / high-side current limit in the record
+    (IHS_LIMIT, ISW_LIMIT, ISW_LIMIT_<condition> ...)."""
+    best = None
+    for k, sv in ((rec or {}).get("electrical") or {}).items():
+        if re.match(r"(IHS|ISW|ILIM_SW|ISW_LIM)", k.upper()):
+            v = dss.value(sv, "min")
+            if v is not None and (best is None or abs(v) < best[0]):
+                best = (abs(v), sv.get("page"), k)
+    return best
+
+
+def check(nl: Netlist, pt: dict, specs: dict, loads: dict, efficiency: dict | None = None,
+          default_eta: float = 0.85, ambient_c: float | None = None,
+          fsw: dict | None = None, tj_margin_c: float | None = None,
+          profile: str = "commercial", sleep_states: dict | None = None) -> dict:
+    from kicad_claude.adapters import derating as drt
+
+    findings: list[dict] = []
+    prof = drt.profile(profile)
+    if tj_margin_c is None:
+        tj_margin_c = prof["tj_margin_c"]
+    ta = 40.0 if ambient_c is None else float(ambient_c)
+    model = rail_currents(nl, pt, loads, efficiency, default_eta, specs)
+    rails, rio = model["rails"], model["regulators"]
+    volts = {n: v["volts"] for n, v in pt["rail_voltages"].items()}
+    regs = {r["name"]: r for r in pt["regulators"]}
+    nodata: dict[str, str] = {}
+    rows = []
+
+    def therm(ref: str, p_w: float, what: str):
+        rec = specs.get(ref)
+        rth = dss.rated(rec, "thermal", "rth_ja", prefer="typ")
+        tjm = dss.rated(rec, "thermal", "tj_max") or dss.rated(rec, "absolute_max", "TJ")
+        row = {"ref": ref, "what": what, "p_w": round(p_w, 4)}
+        if rth:
+            rth_v, rth_src = rth[0], f"datasheet {_src(rec, rth[1])}"
+        else:
+            pkg = thermal_pkg.classify((nl.components.get(ref) or {}).get("footprint", ""))
+            rth_v, rth_src = (pkg["rth_ja"], thermal_pkg.ASSUMED) if pkg else (None, None)
+            if pkg:
+                row["package"] = pkg["package"]
+        assumed = rth_src == thermal_pkg.ASSUMED
+        if rth_v is not None and tjm:
+            tj = ta + rth_v * p_w
+            row.update(tj_c=round(tj, 1), rth_ja=rth_v, rth_source=rth_src, tj_max=tjm[0])
+            src = f"rth_ja {rth_v:g} C/W {rth_src}, Tj max {tjm[0]:g} C"
+            note = (" rth_ja is a package-typical estimate, not this part's datasheet: "
+                    "extract its thermal data to confirm." if assumed else
+                    " rth_ja is the datasheet's JEDEC board, not this layout.")
+            if tj > tjm[0]:
+                findings.append(_f("warning" if assumed else "error", "RT-TJ", ref,
+                                   f"{what}: {p_w:.3g} W -> Tj {tj:.0f} C at Ta {ta:g} C, "
+                                   f"above Tj max ({src})." + (note if assumed else ""),
+                                   rth_source=rth_src))
+            elif tj > tjm[0] - tj_margin_c:
+                findings.append(_f("warning", "RT-TJ", ref, f"{what}: {p_w:.3g} W -> Tj {tj:.0f} C "
+                                   f"at Ta {ta:g} C, within {tj_margin_c:g} C of Tj max ({src})."
+                                   + note, rth_source=rth_src))
+        elif p_w > 0.05:
+            if rth_v is not None:
+                tj = ta + rth_v * p_w
+                row.update(tj_c=round(tj, 1), rth_ja=rth_v, rth_source=rth_src)
+            nodata[ref] = (f"{what} {p_w:.3g} W, no "
+                           + ("Tj max" if rth_v is not None else "rth_ja / Tj max")
+                           + " extracted")
+        rows.append(row)
+
+    # regulators: output current and dissipation
+    for name, io in rio.items():
+        if io["iout"] and io.get("iin") is None:
+            r = regs.get(name)
+            findings.append(_f("info", "RT-MODEL", name,
+                               f"{name}: input "
+                               f"{(r or {}).get('input_net')} or output voltage unknown, so its "
+                               "input current is not carried upstream; pass rail_voltages for it."))
+    for name, io in rio.items():
+        ref = name.split("/")[0]
+        rec = specs.get(ref)
+        if not rec or not io["iout"]:
+            continue
+        imax = dss.rated(rec, "recommended", "IOUT")
+        lim = dss.rated(rec, "electrical", "ICL", "ILIM", prefer="min")
+        if lim and io["iout"] > lim[0]:
+            findings.append(_f("error", "RT-REG-IOUT", name,
+                               f"Iout {io['iout']:.3g} A above the current limit {lim[2]} "
+                               f"{lim[0]:g} A (min, {_src(rec, lim[1])})."))
+        elif imax and io["iout"] > imax[0]:
+            findings.append(_f("warning", "RT-REG-IOUT", name,
+                               f"Iout {io['iout']:.3g} A above the recommended IOUT "
+                               f"{imax[0]:g} A ({_src(rec, imax[1])})."))
+        elif imax and imax[0] >= REG_OVERSIZE * io["iout"]:
+            findings.append(_f("info", "RT-OVERSPEC", name,
+                               f"Rated IOUT {imax[0]:g} A ({_src(rec, imax[1])}) for "
+                               f"{io['iout']:.3g} A: >= {REG_OVERSIZE:g}x the load - a smaller "
+                               "regulator may do."))
+
+    # power-stage inductors
+    rail_nets = set(volts) | set(rails)
+    stage = _regulator_inductors(nl, pt, rail_nets)
+    fsw = fsw or {}
+    ind = {}
+    by_reg = defaultdict(list)
+    for lref, st in stage.items():
+        by_reg[st["regulator"]].append(lref)
+    for rname, lrefs in sorted(by_reg.items()):
+        io = rio.get(rname)
+        r = regs[rname]
+        if not io:
+            continue
+        f = fsw.get(r["name"]) or fsw.get(r["ref"])
+        if f is None:
+            fs = ((specs.get(r["ref"]) or {}).get("regulator") or {}).get("fsw")
+            f = dss.value(fs) if fs else None
+        vin, vout = io["vin"], io["vout"]
+        iin, iout = io.get("iin"), io["iout"]
+        topo, d = stage_topology([stage[x] for x in lrefs], vin, vout)
+        lrows = {}
+        for lref in lrefs:
+            st = stage[lref]
+            iavg = {"iout": iout, "iin": iin,
+                    "gnd": (iin if len(lrefs) > 1 else
+                            (None if iin is None else iin + iout))}[st["carries"]]
+            if iavg is None:
+                continue
+            lval = parse_value(nl.components[st.get("part", lref)]["value"])
+            ripple = None
+            if f and lval and vin and vout is not None and d is not None:
+                if topo == "buck":
+                    ripple = (abs(vin) - abs(vout)) * d / (lval * f)
+                else:
+                    ripple = abs(vin) * d / (lval * f)
+                if st.get("coupled") and len(lrefs) > 1:
+                    ripple /= 2       # both windings on one core, k ~ 1
+            lrows[lref] = {"regulator": rname, "topology": topo, "carries": st["carries"],
+                           "i_avg": iavg, "i_peak": iavg + (ripple or 0) / 2,
+                           "ripple_pp": ripple, "duty": d, "fsw": f, "mode": None,
+                           **({"coupled": True, "note": "coupled windings (tight coupling "
+                               "assumed): ripple half that of two separate inductors"}
+                              if st.get("coupled") else {})}
+        if not lrows:
+            continue
+        known = [x for x in lrows.values() if x["ripple_pp"] is not None]
+        fccm = ((specs.get(r["ref"]) or {}).get("regulator") or {}).get("light_load") == "fccm"
+        if fccm and known:
+            for x in known:
+                x["mode"] = "CCM (forced PWM: the current goes negative at light load)"
+        elif len(lrows) == 1 and known:
+            x = known[0]
+            if x["ripple_pp"] / 2 > x["i_avg"]:
+                # DCM: the current returns to zero each cycle; Ipk = sqrt(2 Iavg dI_ccm)
+                x["mode"] = "DCM"
+                x["i_peak"] = (2 * x["i_avg"] * x["ripple_pp"]) ** 0.5
+            else:
+                x["mode"] = "CCM"
+        sw_peak = None
+        if not fccm and len(lrows) > 1 and len(known) == len(lrows) and known:
+            # the summed inductor current behaves like one inductor L1 || L2:
+            # average Iin + Iout, ripple dI1 + dI2. DCM when it reaches zero;
+            # then the on-time shrinks by k = sqrt(2 Isum / dIsum) and so does
+            # each winding's ripple; the switch peak is sqrt(2 Isum dIsum).
+            isum = sum(x["i_avg"] for x in known)
+            dsum = sum(x["ripple_pp"] for x in known)
+            if dsum / 2 > isum:
+                k = (2 * isum / dsum) ** 0.5
+                for x in known:
+                    x["mode"] = "DCM"
+                    x["ripple_pp_ccm"] = x["ripple_pp"]
+                    x["ripple_pp"] = x["ripple_pp"] * k
+                    x["i_peak"] = x["i_avg"] + x["ripple_pp"] / 2
+                sw_peak = (2 * isum * dsum) ** 0.5
+            else:
+                for x in known:
+                    x["mode"] = "CCM"
+        ind.update(lrows)
+        if sw_peak is None:
+            sw_peak = sum(x["i_peak"] for x in lrows.values())
+        lim = switch_limit(specs.get(r["ref"]))
+        if lim and known and sw_peak > lim[0]:
+            findings.append(_f("error", "RT-REG-ILIM", rname,
+                               f"Switch peak {sw_peak:.3g} A ({' + '.join(lrows)} peaks, {topo}) "
+                               f"above the switch current limit {lim[2]} {lim[0]:g} A (min, "
+                               f"{_src(specs[r['ref']], lim[1])})."))
+        rio[rname]["switch_peak"] = round(sw_peak, 4) if known else None
+        rio[rname]["stage_topology"] = topo
+        rio[rname]["duty"] = d
+    for lref, comp in nl.components.items():
+        ends = _two_terminal(nl, lref) or ()
+        if (kind(lref) == "L" and not comp.get("dnp") and lref not in ind
+                and lref not in model["links"] and any(
+                    n in {p.net for r in pt["regulators"] if r["topology"] == "switching"
+                          for p in nl.pins.get(r["ref"], [])}
+                    for n in ends if n not in rail_nets and not is_ground(n))):
+            ind[lref] = {"regulator": None, "carries": "not modelled", "i_avg": 0.0,
+                         "i_peak": 0.0, "ripple_pp": None,
+                         "note": "power-stage inductor not attributed to a regulator channel "
+                                 "(e.g. an internal boost stage): current not modelled"}
+    for ref, amps in model["links"].items():
+        if kind(ref) in ("L", "FB") and ref not in ind:
+            ind[ref] = {"regulator": None, "carries": "series", "i_avg": amps, "i_peak": amps,
+                        "ripple_pp": None}
+
+    # root rails up to the connector
+    chains = {}
+    for t in pt["tree"]:
+        n = t["rail"]
+        i = rails.get(n, 0.0)
+        if not i:
+            continue
+        ch = series_chain(nl, n, specs)
+        chains[n] = {"current": i, **ch}
+        for part in ch["parts"]:
+            if part["kind"] in ("inductor", "cmc") and part["ref"] not in ind:
+                ind[part["ref"]] = {"regulator": None, "carries": "series", "i_avg": i,
+                                    "i_peak": i, "ripple_pp": None, "cmc": part["kind"] == "cmc"}
+        dies = defaultdict(int)
+        for part in ch["parts"]:
+            if part["kind"] == "fet":
+                dies[part["ref"]] += 1
+        for ref, ndie in dies.items():
+            rec = specs.get(ref)
+            rds = None
+            for k, sv in ((rec or {}).get("electrical") or {}).items():
+                if k.upper().replace("(", "").replace(")", "").replace("_", "").startswith("RDSON"):
+                    v = dss.value(sv, "max")
+                    if v is not None and (rds is None or v > rds[0]):
+                        rds = (v, sv.get("page"), k)
+            idr = dss.rated(rec, "electrical", "ID_25C", "ID", prefer="max") or \
+                dss.rated(rec, "absolute_max", "ID", prefer="max")
+            if rds:
+                therm(ref, ndie * i * i * rds[0],
+                      f"{ndie} FET die(s) in the {n} path at {i:.3g} A, RDS(on) {rds[0]:g} Ohm "
+                      f"max ({rds[2]}, {_src(rec, rds[1])})")
+            else:
+                nodata[ref] = f"FET in the {n} path at {i:.3g} A, no RDS(on) extracted"
+            if idr and i > idr[0]:
+                findings.append(_f("error", "RT-FET-ID", ref, f"{i:.3g} A above ID {idr[0]:g} A "
+                                   f"({_src(rec, idr[1])})."))
+        for part in ch["parts"]:
+            if part["kind"] != "diode":
+                continue
+            rec = specs.get(part["ref"])
+            ifr = dss.rated(rec, "electrical", "IF_AV", "IF") or dss.rated(rec, "absolute_max",
+                                                                           "IF", "IF_AV")
+            vf = dss.rated(rec, "electrical", "VF", prefer="max")
+            if ifr and i > ifr[0]:
+                findings.append(_f("error", "RT-D-IF", part["ref"], f"{i:.3g} A above IF "
+                                   f"{ifr[0]:g} A ({_src(rec, ifr[1])})."))
+            if vf:
+                therm(part["ref"], vf[0] * i, f"series diode at {i:.3g} A, VF {vf[0]:g} V")
+        for part in ch["parts"]:
+            if part["kind"] == "fuse" and not part["dnp"]:
+                check_fuse(nl, specs, part["ref"], i, n, findings, nodata)
+        for cref, pins in ch["connectors"].items():
+            rec = specs.get(cref)
+            ir = dss.rated(rec, "electrical", "I_rated", "I_contact", prefer="max")
+            per = i / max(1, len(pins))
+            row = {"ref": cref, "rail": n, "current": round(i, 4), "contacts": sorted(pins),
+                   "per_contact": round(per, 4)}
+            chains[n].setdefault("connector_load", []).append(row)
+            tot = dss.rated(rec, "electrical", "I_rated_total", prefer="max")
+            if tot:
+                row["i_rated_total"] = tot[0]
+                if i > tot[0]:
+                    findings.append(_f("error", "RT-CONN-I", cref,
+                                       f"{i:.3g} A over pins {', '.join(sorted(pins))} above the "
+                                       f"collective rating {tot[0]:g} A ({_src(rec, tot[1])})."))
+            if ir:
+                row["i_rated"] = ir[0]
+                if per > ir[0]:
+                    findings.append(_f("error", "RT-CONN-I", cref,
+                                       f"{per:.3g} A per contact ({i:.3g} A over {len(pins)} "
+                                       f"pins {', '.join(sorted(pins))}) above I_rated {ir[0]:g} A "
+                                       f"({_src(rec, ir[1])})."))
+            if not (ir or tot):
+                nodata[cref] = f"{i:.3g} A over {len(pins)} contacts, no I_rated extracted"
+
+    for lref, x in sorted(ind.items()):
+        base = lref.split(".")[0]
+        rec = specs.get(base)
+        comp = nl.components[base]
+        if comp.get("dnp"):
+            x["dnp"] = True
+            continue
+        cmc = x.get("cmc") or (rec or {}).get("category") == "common_mode_choke"
+        if cmc:
+            ir = dss.rated(rec, "electrical", "I_rated", "Irms", prefer="max")
+            if ir:
+                x["i_rated"] = ir[0]
+                if x["i_avg"] > ir[0]:
+                    findings.append(_f("error", "RT-CMC-I", lref,
+                                       f"Common-mode choke at {x['i_avg']:.3g} A above I_rated "
+                                       f"{ir[0]:g} A ({_src(rec, ir[1])})."))
+            elif x["i_avg"]:
+                nodata[lref] = f"choke at {x['i_avg']:.3g} A, no I_rated extracted"
+            continue
+        isat = dss.rated(rec, "electrical", "Isat", prefer="typ")
+        irms = dss.rated(rec, "electrical", "Irms")
+        if isat:
+            x["isat"] = isat[0]
+            if x["i_peak"] > isat[0]:
+                findings.append(_f("error", "RT-L-ISAT", lref,
+                                   f"Peak {x['i_peak']:.3g} A above Isat {isat[0]:g} A "
+                                   f"({_src(rec, isat[1])})."))
+            elif x["i_peak"] > 0.8 * isat[0]:
+                findings.append(_f("warning", "RT-L-ISAT", lref,
+                                   f"Peak {x['i_peak']:.3g} A is {x['i_peak'] / isat[0]:.0%} of Isat "
+                                   f"{isat[0]:g} A ({_src(rec, isat[1])})."))
+        if irms:
+            x["irms"] = irms[0]
+            if x["i_avg"] > irms[0]:
+                findings.append(_f("warning", "RT-L-IRMS", lref,
+                                   f"Average {x['i_avg']:.3g} A above {irms[2]} {irms[0]:g} A "
+                                   f"({_src(rec, irms[1])})."))
+        dcr = dss.rated(rec, "electrical", "DCR", prefer="max")
+        if dcr:
+            x["p_dcr_w"] = round(x["i_avg"] ** 2 * dcr[0], 4)
+        if x["carries"] == "not modelled":
+            continue
+        if not (isat or irms) and x["i_avg"]:
+            nodata[lref] = f"inductor at {x['i_avg']:.3g} A avg, no Isat / Irms extracted"
+        if x["ripple_pp"] is None and x["regulator"]:
+            x["note"] = "average only (topology, L, fsw or a voltage unknown)"
+
+    # IC dissipation: converter loss minus the losses outside the IC that the
+    # spec cache can price (inductor DCR at its RMS current, diode VF x Iavg)
+    stage_diodes = _stage_diodes(nl, stage, regs)
+    per_ic = defaultdict(list)
+    for name, io in rio.items():
+        if io.get("p_loss") is None or not io["iout"]:
+            continue
+        ext, parts, missing = 0.0, [], []
+        if io["topology"].startswith("switching"):
+            for lref, x in ind.items():
+                if x.get("regulator") != name:
+                    continue
+                dcr = dss.rated(specs.get(lref.split(".")[0]), "electrical", "DCR", prefer="typ")
+                if dcr:
+                    irms2 = x["i_avg"] ** 2 + (x.get("ripple_pp") or 0) ** 2 / 12
+                    ext += irms2 * dcr[0]
+                    parts.append(f"{lref} DCR {irms2 * dcr[0] * 1e3:.3g} mW")
+                else:
+                    missing.append(lref)
+            for dref in stage_diodes.get(name, []):
+                vf = dss.rated(specs.get(dref), "electrical", "VF", prefer="typ")
+                d = io.get("duty")
+                i_d = io["iout"] * (1 - d) if io.get("stage_topology") == "buck" and d else io["iout"]
+                if vf:
+                    ext += vf[0] * i_d
+                    parts.append(f"{dref} VF x I {vf[0] * i_d * 1e3:.3g} mW")
+                else:
+                    missing.append(dref)
+        p_ic = max(0.0, io["p_loss"] - ext)
+        io["p_ic"] = p_ic
+        io["p_external"] = ext
+        per_ic[name.split("/")[0]].append((name, io, parts, missing))
+    for ref, items in per_ic.items():    # channels of one IC share its die
+        sw = any(io["topology"].startswith("switching") for _, io, _, _ in items)
+        parts = [x for _, _, ps, _ in items for x in ps]
+        missing = sorted({x for _, _, _, ms in items for x in ms})
+        therm(ref, sum(io["p_ic"] for _, io, _, _ in items),
+              " + ".join(f"{n} ({io['topology']}, Iout {io['iout']:.3g} A)" for n, io, _, _ in items)
+              + ((" - converter loss Pout (1 - eta) / eta"
+                  + (f" minus {', '.join(parts)}" if parts else "")
+                  + (f"; not priced (no DCR / VF extracted): {', '.join(missing)} - their loss "
+                     "is still charged to the IC (upper bound)" if missing else ""))
+                 if sw else ""))
+    leds = check_leds(nl, specs, volts, findings, therm)
+    series_i = {ref: a for ref, a in model["links"].items() if kind(ref) == "R"}
+    for ch in chains.values():
+        for part in ch["parts"]:
+            if part["kind"] == "resistor":
+                series_i[part["ref"]] = series_i.get(part["ref"], 0.0) + ch["current"]
+    dissipation = resistor_dissipation(nl, pt, specs, series_i)
+    dissipation += [{"ref": r["ref"], "p_w": r["p_w"], "method": r["what"]}
+                    for r in rows if r["p_w"] > 0]
+    dissipation.sort(key=lambda d: (-d["p_w"], d["ref"]))
+    check_resistor_power(nl, specs, dissipation, prof["r_power"], profile, findings, nodata)
+    check_overspec_caps(nl, pt, specs, findings)
+    for ref, why in sorted(nodata.items()):
+        findings.append(_f("info", "RT-NODATA", ref, f"{why}: extract its datasheet "
+                           "(get_datasheet_extraction_task) to check it."))
+    order = {"error": 0, "warning": 1, "info": 2}
+    findings.sort(key=lambda f: (order[f["severity"]], f["rule"], f["ref"]))
+
+    def rnd(d):
+        return {k: (round(v, 4) if isinstance(v, float) else v) for k, v in d.items()}
+    return {"assumptions": {"ambient_c": ta, "ambient_source": "caller" if ambient_c is not None
+                            else "default 40 C (pass ambient_c)",
+                            "derating_profile": profile, "tj_margin_c": tj_margin_c,
+                            "efficiency_default": default_eta,
+                            "efficiency_assumed_for": model["assumed_eta"],
+                            "loads": model["loads"], "loads_unresolved": model["loads_unresolved"]},
+            "rail_currents": {n: round(i, 4) for n, i in sorted(rails.items()) if i},
+            "regulators": {k: rnd(v) for k, v in rio.items()},
+            "inductors": {k: rnd(v) for k, v in sorted(ind.items())},
+            "input_paths": chains, "thermal": rows, "leds": leds,
+            "dissipation": dissipation,
+            "power_budget": power_budget(pt, model),
+            "sleep_current": sleep_current(nl, pt, specs, sleep_states, efficiency, default_eta),
+            "findings": findings,
+            "counts": {k: sum(1 for f in findings if f["severity"] == k) for k in order}}
+
+
+def power_budget(pt: dict, model: dict) -> dict:
+    """Per rail: voltage, current (loads plus what it feeds), power; per
+    regulator: input / output current and loss; total input power at the
+    root rails (where a voltage is known)."""
+    volts = {n: v["volts"] for n, v in pt["rail_voltages"].items()}
+    rails = []
+    for n, i in sorted(model["rails"].items()):
+        if not i:
+            continue
+        v = volts.get(n)
+        rails.append({"rail": n, "volts": v, "current_a": round(i, 5),
+                      "load_a": model["loads"].get(n, 0.0),
+                      "power_w": round(abs(v) * i, 5) if v is not None else None})
+    regs = {name: {k: (round(x, 5) if isinstance(x, float) else x) for k, x in io.items()
+                   if k in ("iin", "iout", "vin", "vout", "p_loss", "topology", "eta",
+                            "eta_source")}
+            for name, io in model["regulators"].items() if io.get("iout")}
+    roots = {t["rail"]: model["rails"].get(t["rail"], 0.0) for t in pt["tree"]}
+    unknown = sorted(n for n, i in roots.items() if i and volts.get(n) is None)
+    total = sum(abs(volts[n]) * i for n, i in roots.items() if i and volts.get(n) is not None)
+    return {"rails": rails, "regulators": regs,
+            "input": {n: round(i, 5) for n, i in roots.items() if i},
+            "total_input_w": round(total, 5),
+            "regulator_loss_w": round(sum(r.get("p_loss") or 0.0 for r in regs.values()), 5),
+            **({"input_voltage_unknown": unknown} if unknown else {})}
+
+
+IQ_KEYS = ("IQ", "I_Q", "Iq", "I_GND", "IGND")
+ISHDN_KEYS = ("I_SHDN", "I_shdn", "ISHDN", "ISD", "I_SD", "I_off", "IOFF")
+
+
+def sleep_current(nl: Netlist, pt: dict, specs: dict, sleep_states: dict | None,
+                  efficiency: dict | None = None, default_eta: float = 0.85) -> dict:
+    """Standby draw per rail. `sleep_states` sets transistor switches
+    (`{"Q3": "off"}`, as `switch_overrides`) and regulators (`{"U4": "off"}`:
+    its shutdown current instead of Iq, its output rail at 0 V). Counted:
+    each regulator's Iq / I_shdn from the spec cache (on its input rail),
+    and every resistor current leaving a rail in the sleep DC operating
+    point (dividers, pull-ups held low, bleeders). Carried up the power
+    tree like loads; switcher light-load efficiency is the same default,
+    so the root total is an estimate."""
+    from kicad_claude.adapters import dc_model
+
+    states = {k: str(v).lower() for k, v in (sleep_states or {}).items()}
+    regs = pt["regulators"]
+    off = {r["name"] for r in regs if states.get(r["name"]) == "off" or states.get(r["ref"]) == "off"}
+    dead = set()
+
+    def walk(node, under):
+        if under:
+            dead.add(node["rail"])
+        for rr in node.get("regulators", []):
+            if "output" in rr:
+                walk(rr["output"], under or rr["regulator"] in off)
+        for ch in node.get("linked", []):
+            walk(ch, under)
+    for t in pt["tree"]:
+        walk(t, False)
+    for r in regs:
+        if r["name"] in off and r.get("output_net"):
+            dead.add(r["output_net"])
+    known = {n: ((0.0, "off in sleep") if n in dead else (v["volts"], v["source"]))
+             for n, v in pt["rail_voltages"].items() if v["volts"] is not None or n in dead}
+    for n in dead:
+        known.setdefault(n, (0.0, "off in sleep"))
+    switches = {k: v for k, v in states.items() if k in nl.components
+                and kind(k) in dc_model.SWITCH_KINDS}
+    dc = dc_model.solve(nl, known, specs, switches or None)
+    v_all = {n: v for n, (v, _) in {**dc["volts"], **known}.items()}
+    items, loads, nodata = [], defaultdict(float), []
+    rail_set = set(known)
+    for ref, comp in nl.components.items():
+        if kind(ref) != "R" or comp.get("dnp"):
+            continue
+        r = parse_value(comp.get("value", ""))
+        ends = _two_terminal(nl, ref)
+        if not r or r <= 1.0 or not ends:
+            continue
+        for a, b in (ends, ends[::-1]):
+            if a in rail_set and not is_ground(a) and b not in rail_set:
+                va, vb = _net_v(a, v_all), _net_v(b, v_all)
+                if va is None or vb is None:
+                    continue
+                i = (va - vb) / r if va >= 0 else (vb - va) / r
+                if i > 1e-9:
+                    loads[a] += i
+                    items.append({"ref": ref, "rail": a, "current_a": i,
+                                  "what": f"resistor to {b} ({vb:.3g} V in sleep)"})
+    for r in regs:
+        if r["input_net"] in dead or not r.get("input_net"):
+            continue
+        rec = specs.get(r["ref"])
+        is_off = r["name"] in off
+        q = dss.rated(rec, "electrical", *(ISHDN_KEYS if is_off else IQ_KEYS), prefer="typ") \
+            or dss.rated(rec, "regulator", *(ISHDN_KEYS if is_off else IQ_KEYS), prefer="typ")
+        if r.get("channel") and any(x["ref"] == r["ref"] and x["name"] < r["name"] for x in regs):
+            continue            # one quiescent current per IC
+        if q:
+            loads[r["input_net"]] += q[0]
+            items.append({"ref": r["ref"], "rail": r["input_net"], "current_a": q[0],
+                          "what": f"{'shutdown' if is_off else 'quiescent'} current {q[2]} "
+                                  f"({_src(rec, q[1])})"})
+        else:
+            nodata.append(f"{r['ref']}: no {'I_shdn' if is_off else 'Iq'} extracted")
+    model = rail_currents(nl, pt, dict(loads), efficiency, default_eta, specs)
+    roots = {t["rail"]: model["rails"].get(t["rail"], 0.0) for t in pt["tree"]}
+    items.sort(key=lambda x: (-x["current_a"], x["ref"]))
+    return {"states": states, "rails_off": sorted(dead),
+            "rails": {n: round(i, 9) for n, i in sorted(model["rails"].items()) if i},
+            "input": {n: round(i, 9) for n, i in roots.items() if i},
+            "items": [{**x, "current_a": round(x["current_a"], 9)} for x in items],
+            "nodata": nodata,
+            "note": "Static estimate: active parts' own standby currents are not modelled "
+                    "unless they are regulators with Iq extracted; switchers use the "
+                    "full-load efficiency."}
+
+
+def resistor_dissipation(nl: Netlist, pt: dict, specs: dict, series_i: dict) -> list[dict]:
+    """P of every fitted two-pin resistor: I^2 R for the ones in a rail's
+    series path (`series_i` {ref: A}, shunts and <= 1 Ohm links), else
+    dV^2 / R from the DC operating point (rails plus the resistor-network
+    solve). Rows below 1 uW are left out."""
+    from kicad_claude.adapters import dc_model
+
+    known = {n: (v["volts"], v["source"]) for n, v in pt["rail_voltages"].items()
+             if v["volts"] is not None}
+    dc = {**dc_model.solve(nl, known, specs)["volts"], **known}
+    out = []
+    for ref, comp in nl.components.items():
+        if kind(ref) != "R" or comp.get("dnp"):
+            continue
+        r = parse_value(comp.get("value", ""))
+        ends = _two_terminal(nl, ref)
+        if not r or not ends:
+            continue
+        if ref in series_i:
+            i = series_i[ref]
+            p_w, how = i * i * r, f"I^2 R: {i:.4g} A rail current through {r:g} Ohm"
+        else:
+            va, vb = (_net_v(n, {k: v for k, (v, _) in dc.items()}) for n in ends)
+            if va is None or vb is None:
+                continue
+            p_w = (va - vb) ** 2 / r
+            how = f"DC model: {abs(va - vb):.4g} V across {r:g} Ohm"
+        if p_w >= 1e-6:
+            out.append({"ref": ref, "p_w": round(p_w, 6), "method": how})
+    return out
+
+
+_CURRENT_FIELD = re.compile(r"(\d+(?:\.\d+)?)\s*(m?)A\b", re.I)
+# RT-OVERSPEC (info, a cost / size hint): thresholds are policy, not part data.
+FUSE_OVERSIZE = 5.0     # fuse / PTC rated >= 5x its load protects little
+CAP_OVERSIZE = 4.0      # capacitor rated >= 4x its DC voltage ...
+CAP_OVERSIZE_MIN_V = 50.0   # ... and at least 50 V (a 16 V part on 3.3 V is normal)
+REG_OVERSIZE = 10.0     # regulator IOUT rating >= 10x its load
+
+
+def check_fuse(nl: Netlist, specs: dict, ref: str, i: float, rail: str, findings: list,
+               nodata: dict) -> None:
+    """RT-FUSE: a fuse / PTC's hold (or rated) current against the rail
+    current through it. Load above I_hold / I_rated -> error, I_trip at or
+    below the load -> error, rating > FUSE_OVERSIZE x load -> info."""
+    rec = specs.get(ref)
+    hold = dss.rated(rec, "electrical", "I_hold", "I_rated", prefer="min")
+    trip = dss.rated(rec, "electrical", "I_trip", prefer="max")
+    src = None
+    if hold:
+        rating, src = hold[0], f"{hold[2]} {hold[0]:g} A, {_src(rec, hold[1])}"
+    else:
+        m = _CURRENT_FIELD.search((nl.components[ref].get("fields") or {}).get("Current", ""))
+        if m:
+            rating = float(m.group(1)) * (1e-3 if m.group(2) else 1.0)
+            src = f"Current field {rating:g} A"
+    if trip and trip[0] <= i:
+        findings.append(_f("error", "RT-FUSE", ref, f"Trips at {trip[0]:g} A "
+                           f"({_src(rec, trip[1])}), at or below the {i:.3g} A load on {rail}."))
+    if src is None:
+        if not trip:
+            nodata[ref] = f"fuse at {i:.3g} A on {rail}, no I_hold / I_rated (or Current field)"
+        return
+    if i > rating:
+        findings.append(_f("error", "RT-FUSE", ref, f"{i:.3g} A load on {rail} above its hold / "
+                           f"rated current ({src}): it trips or ages in normal use."))
+    elif rating >= FUSE_OVERSIZE * i:
+        findings.append(_f("info", "RT-OVERSPEC", ref, f"Fuse rated {rating:g} A ({src}) for a "
+                           f"{i:.3g} A load on {rail}: >= {FUSE_OVERSIZE:g}x, little protection "
+                           "for the wiring and parts behind it."))
+
+
+def check_overspec_caps(nl: Netlist, pt: dict, specs: dict, findings: list) -> None:
+    """RT-OVERSPEC for capacitors rated >= CAP_OVERSIZE x their DC voltage
+    (rating >= CAP_OVERSIZE_MIN_V): a smaller, cheaper part would do."""
+    from kicad_claude.adapters.connectivity_review import check_cap_voltage
+
+    volts = {n: (v["volts"], v["source"]) for n, v in pt["rail_voltages"].items()
+             if v["volts"] is not None}
+    for row in check_cap_voltage(nl, [], volts, specs=specs)["checked"]:
+        if row["volts"] > 0 and row["rating"] >= CAP_OVERSIZE_MIN_V and \
+                row["rating"] >= CAP_OVERSIZE * row["volts"]:
+            findings.append(_f("info", "RT-OVERSPEC", row["ref"],
+                               f"{row['value']} rated {row['rating']:g} V ({row['rating_source']})"
+                               f" at {row['volts']:g} V: >= {CAP_OVERSIZE:g}x - a lower-voltage "
+                               "part is smaller and cheaper (mind the DC-bias loss of class-II "
+                               "ceramics)."))
+
+
+_POWER_FIELD = re.compile(r"(\d+(?:\.\d+)?)\s*/\s*(\d+)\s*W|(\d+(?:\.\d+)?)\s*(m?)W\b", re.I)
+
+
+def resistor_rating(comp: dict, rec: dict | None) -> tuple[float, str] | None:
+    """(power rating W, source) from the extracted datasheet (`absolute_max`
+    / `electrical` P, P_rated) or the `Power` symbol field ("0.1W", "1/4W",
+    "100mW"); None otherwise - never from the package size."""
+    ds = dss.rated(rec, "absolute_max", "P", "P_rated") or dss.rated(rec, "electrical",
+                                                                     "P_rated", "P")
+    if ds:
+        return ds[0], f"{rec.get('mpn')} p.{ds[1]}"
+    m = _POWER_FIELD.search((comp.get("fields") or {}).get("Power", ""))
+    if not m:
+        return None
+    if m.group(1):
+        return float(m.group(1)) / float(m.group(2)), "Power field"
+    return float(m.group(3)) * (1e-3 if m.group(4) else 1.0), "Power field"
+
+
+def check_resistor_power(nl: Netlist, specs: dict, dissipation: list, fraction: float,
+                         profile: str, findings: list, nodata: dict) -> None:
+    """RT-R-P: resistor dissipation (from `dissipation`) against its power
+    rating: error above it, warning above `fraction` x rating (profile).
+    A resistor above 0.1 W with no rating is listed in RT-NODATA."""
+    for row in dissipation:
+        ref = row["ref"]
+        if kind(ref) != "R":
+            continue
+        rt = resistor_rating(nl.components[ref], specs.get(ref))
+        if rt is None:
+            if row["p_w"] >= 0.1:
+                nodata[ref] = (f"resistor at {row['p_w']:.3g} W ({row['method']}), no power "
+                               "rating (Power field or extracted datasheet)")
+            continue
+        row["rating_w"], row["rating_source"] = rt
+        if row["p_w"] > rt[0]:
+            findings.append(_f("error", "RT-R-P", ref, f"{row['p_w']:.3g} W above its "
+                               f"{rt[0]:g} W rating ({rt[1]}; {row['method']})."))
+        elif row["p_w"] > fraction * rt[0]:
+            findings.append(_f("warning", "RT-R-P", ref, f"{row['p_w']:.3g} W = "
+                               f"{row['p_w'] / rt[0]:.0%} of its {rt[0]:g} W rating ({rt[1]}), "
+                               f"above the {profile} derating {fraction:.0%} ({row['method']})."))
+
+
+def _net_v(n: str, volts: dict) -> float | None:
+    return 0.0 if is_ground(n) else volts.get(n)
+
+
+def check_leds(nl: Netlist, specs: dict, volts: dict, findings: list, therm) -> list[dict]:
+    """LED strings: walk both ways through two-terminal R / D / CCR parts and
+    FET drain-source (assumed on) to nets of known voltage."""
+    out = []
+    for ref, comp in sorted(nl.components.items()):
+        rec = specs.get(ref) or {}
+        if kind(ref) != "D" or comp.get("dnp"):
+            continue
+        if rec.get("category") != "led" and not LED_RE.search(
+                f"{comp['lib_id']} {comp['value']} {comp['description']}"):
+            continue
+        pins = {p.name.upper(): p.net for p in nl.pins.get(ref, [])}
+        a, k = pins.get("A"), pins.get("K")
+        if not a or not k:
+            continue
+        chain = [ref]
+        r_total, ccr, others, switch = 0.0, None, [], []
+
+        def walk(net, prev):
+            nonlocal r_total, ccr
+            seen = {prev}
+            while _net_v(net, volts) is None:
+                # a supply or connector net of unknown voltage ends the string:
+                # walking on would cross a TVS or a load to ground
+                if any(p.type.split("+")[0] in ("power_in", "power_out")
+                       or kind(p.ref) in ("J", "P", "CN") for p in nl.nets.get(net, [])):
+                    return None
+                # a string node joins two series parts; a third current path
+                # (R, D, Q, IC) is a branch the walk cannot choose
+                carriers = {p.ref for p in nl.nets.get(net, []) if not nl.components.get(
+                    p.ref, {}).get("dnp") and kind(p.ref) in ("R", "D", "Q", "U", "IC")}
+                if len(carriers) > 2:
+                    return None
+                nxt = None
+                for p in nl.nets.get(net, []):
+                    if p.ref in seen or p.ref in chain:
+                        continue
+                    pk = kind(p.ref)
+                    c = nl.components.get(p.ref, {})
+                    if c.get("dnp"):
+                        continue
+                    ends = _two_terminal(nl, p.ref)
+                    if pk == "Q":
+                        dies = [d for d in _fet_dies(nl, p.ref) if net in d]
+                        if dies:
+                            ends = dies[0]
+                            switch.append(p.ref)
+                    elif pk == "R":
+                        v = parse_value(c.get("value", ""))
+                        if v is None:
+                            return None
+                        r_total += v
+                    elif pk == "D":
+                        if (specs.get(p.ref) or {}).get("category") == "current_regulator":
+                            ccr = p.ref
+                        else:
+                            others.append(p.ref)
+                    else:
+                        continue
+                    if not ends or net not in ends:
+                        continue
+                    nxt = ends[1] if ends[0] == net else ends[0]
+                    chain.append(p.ref)
+                    seen.add(p.ref)
+                    break
+                if nxt is None:
+                    return None
+                net = nxt
+            return net
+        top, bot = walk(a, ref), walk(k, ref)
+        row = {"ref": ref, "chain": chain, "series_r": r_total or None, "ccr": ccr,
+               "switch_assumed_on": switch}
+        out.append(row)
+        if top is not None and top == bot:
+            row["status"] = f"string returns to {top}: no supply across it"
+            continue
+        if top is None or bot is None:
+            row["status"] = ("string does not end on nets of known voltage (GPIO-driven, a "
+                             "branch, or an unknown rail)")
+            continue
+        vs = _net_v(top, volts) - _net_v(bot, volts)
+        row.update(top=top, bottom=bot, volts=round(vs, 3))
+        vf = dss.rated(rec, "electrical", "VF", prefer="typ")
+        ifm = dss.rated(rec, "absolute_max", "IF", prefer="max")
+        vf_curve = ((rec.get("curves") or {}).get("VF") if rec else None)
+        if vf_curve and not (vf_curve.get("x_unit") == "A" and vf_curve.get("y_unit") == "V"):
+            vf_curve = None
+        if vf_curve and not vf:
+            vf = (dss.curve_at(vf_curve, vf_curve["points"][0][0]), vf_curve.get("page"), "VF curve")
+        if not vf:
+            row["status"] = "no VF extracted"
+            findings.append(_f("info", "RT-NODATA", ref, "LED without an extracted VF: current "
+                               "not computed (extract its datasheet)."))
+            continue
+        vrest = vs - vf[0]
+        if ccr:
+            crec = specs[ccr]
+            ireg = dss.rated(crec, "electrical", "I_reg", "Ireg", prefer="typ")
+            vmin = dss.rated(crec, "electrical", "V_min", "Vak_min", prefer="max")
+            if not ireg:
+                row["status"] = f"CCR {ccr} without an extracted I_reg"
+                continue
+            i = ireg[0]
+            if vf_curve:
+                vf = (dss.curve_at(vf_curve, i), vf_curve.get("page"), "VF curve")
+                vrest = vs - vf[0]
+                row["vf_at_current"] = round(vf[0], 3)
+            v_ccr = vrest - i * r_total
+            row.update(current=i, current_source=f"{ccr} I_reg {_src(crec, ireg[1])}",
+                       v_ccr=round(v_ccr, 3))
+            if vmin and v_ccr < vmin[0]:
+                findings.append(_f("warning", "RT-LED", ccr,
+                                   f"CCR has {v_ccr:.3g} V across it, below the {vmin[0]:g} V it "
+                                   f"needs to regulate ({_src(crec, vmin[1])}): {ref} runs below "
+                                   f"{i * 1e3:.3g} mA."))
+            therm(ccr, max(0.0, v_ccr) * i, f"CCR for {ref} at {i * 1e3:.3g} mA, {v_ccr:.3g} V across")
+        elif r_total:
+            i = vrest / r_total
+            if vf_curve:
+                # I = (Vs - VF(I)) / R: bisect on I (VF rises with I)
+                lo, hi = 0.0, max(vs / r_total, 1e-9)
+                for _ in range(60):
+                    mid = (lo + hi) / 2
+                    if vs - dss.curve_at(vf_curve, mid) - mid * r_total > 0:
+                        lo = mid
+                    else:
+                        hi = mid
+                i = lo
+                vf = (dss.curve_at(vf_curve, i), vf_curve.get("page"), "VF curve")
+                row["vf_at_current"] = round(vf[0], 3)
+            row.update(current=round(i, 5), current_source=f"({vs:.3g} V - VF {vf[0]:.3g} V) / "
+                       f"{r_total:g} Ohm, VF {_src(rec, vf[1])}"
+                       + (" (IF-VF curve)" if vf_curve else " (single VF value)"))
+        else:
+            findings.append(_f("warning", "RT-LED", ref, f"LED across {vs:.3g} V with no series "
+                               "resistor or current regulator."))
+            continue
+        if others:
+            row["note"] = f"other series diodes {others} (their VF not subtracted)"
+        if ifm and i > ifm[0]:
+            findings.append(_f("error", "RT-LED", ref, f"{i * 1e3:.3g} mA above IF max "
+                               f"{ifm[0] * 1e3:g} mA ({_src(rec, ifm[1])})."))
+        elif i <= 0:
+            findings.append(_f("warning", "RT-LED", ref, f"Supply {vs:.3g} V below VF "
+                               f"{vf[0]:g} V: the LED does not light."))
+    return out

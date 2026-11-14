@@ -24,7 +24,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from kicad_claude.adapters import sch_io
+from kicad_claude.adapters import safe_write, sch_io
 from kicad_claude.adapters.sch_io import find_children, is_call, sym
 from kicad_claude.indexer.kicad_libs import parse_symbol_lib
 
@@ -88,7 +88,7 @@ def update_sym_lib_table(project_dir: Path, lib_name: str) -> Path:
         uri=f"${{KIPRJMOD}}/lib/{lib_name}.kicad_sym",
         descr=f"{lib_name} symbols (kicad-claude)",
     )
-    sch_io.write_file(path, table)
+    safe_write.save_tree(path, table)
     return path
 
 
@@ -101,7 +101,7 @@ def update_fp_lib_table(project_dir: Path, lib_name: str) -> Path:
         uri=f"${{KIPRJMOD}}/lib/{lib_name}.pretty",
         descr=f"{lib_name} footprints (kicad-claude)",
     )
-    sch_io.write_file(path, table)
+    safe_write.save_tree(path, table)
     return path
 
 
@@ -150,7 +150,7 @@ def _merge_symbol_lib(target_path: Path, sources: list[Path]) -> int:
             existing_names.add(name)
             added += 1
 
-    sch_io.write_file(target_path, target)
+    safe_write.save_tree(target_path, target)
     return added
 
 

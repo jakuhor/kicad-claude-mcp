@@ -25,10 +25,15 @@ def load_pro(pro_path: Path) -> dict:
     return json.loads(Path(pro_path).read_text(encoding="utf-8"))
 
 
-def save_pro(pro_path: Path, data: dict) -> None:
-    Path(pro_path).write_text(
+def save_pro(pro_path: Path, data: dict) -> Path | None:
+    """Write `.kicad_pro` through the guarded writer (lock check, backup,
+    re-parse). Returns the backup."""
+    from kicad_claude.adapters import safe_write
+
+    return safe_write.save_text(
+        Path(pro_path),
         json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+        lambda p: json.loads(Path(p).read_text(encoding="utf-8")),
     )
 
 
@@ -93,6 +98,60 @@ FAB_PRESETS: dict[str, dict] = {
             "min_copper_edge_clearance": 0.25,
         },
     },
+    "jlcpcb_4l": {
+        "description": "JLCPCB 4-layer standard (≥0.127 mm, 0.2 mm via drill)",
+        "rules": {
+            "min_clearance": 0.127,
+            "min_track_width": 0.127,
+            "min_via_diameter": 0.4,
+            "min_via_drill": 0.2,
+            "min_through_hole_diameter": 0.2,
+            "min_hole_clearance": 0.2,
+            "min_hole_to_hole": 0.5,
+            "min_silk_clearance": 0.1,
+            "min_text_height": 1.0,
+            "min_text_thickness": 0.15,
+            "min_copper_edge_clearance": 0.3,
+            "allow_blind_buried_vias": False,
+            "allow_microvias": False,
+        },
+    },
+    "aisler_2l": {
+        "description": "AISLER 2-layer (≥0.2 mm track, 0.15 mm clearance, 0.3 mm drill)",
+        "rules": {
+            "min_clearance": 0.15,
+            "min_track_width": 0.2,
+            "min_via_diameter": 0.7,
+            "min_via_drill": 0.3,
+            "min_through_hole_diameter": 0.5,
+            "min_hole_clearance": 0.25,
+            "min_hole_to_hole": 0.3,
+            "min_silk_clearance": 0.125,
+            "min_text_height": 0.8,
+            "min_text_thickness": 0.15,
+            "min_copper_edge_clearance": 0.3,
+            "allow_blind_buried_vias": False,
+            "allow_microvias": False,
+        },
+    },
+    "aisler_4l": {
+        "description": "AISLER 4-layer Precision (≥0.125 mm, 0.25 mm drill)",
+        "rules": {
+            "min_clearance": 0.125,
+            "min_track_width": 0.125,
+            "min_via_diameter": 0.45,
+            "min_via_drill": 0.25,
+            "min_through_hole_diameter": 0.5,
+            "min_hole_clearance": 0.25,
+            "min_hole_to_hole": 0.5,
+            "min_silk_clearance": 0.125,
+            "min_text_height": 0.8,
+            "min_text_thickness": 0.15,
+            "min_copper_edge_clearance": 0.3,
+            "allow_blind_buried_vias": False,
+            "allow_microvias": False,
+        },
+    },
     "pcbway_default": {
         "description": "PCBWay default capabilities (similar to JLCPCB default)",
         "rules": {
@@ -129,6 +188,75 @@ FAB_PRESETS: dict[str, dict] = {
         },
     },
 }
+
+
+PRESET_MODES = ("project", "preset", "stricter")
+
+
+def _stricter(rule: str, a: Any, b: Any) -> Any:
+    """The tighter of two values of one rule.
+
+    `min_*` rules: the larger minimum. `allow_*` flags: False (disallowed) wins.
+    Anything else: keep `a` (the project's value).
+    """
+    if rule.startswith("allow_") and isinstance(a, bool) and isinstance(b, bool):
+        return a and b
+    if rule.startswith("min_") and isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return max(a, b)
+    return a
+
+
+def compare_preset(current: dict, preset_rules: dict) -> list[dict]:
+    """One row per preset rule: project value, preset value, stricter value.
+
+    `conflict` is True when the project sets the rule to a different value.
+    `preset_is` says which way the preset moves it: `looser`, `stricter`,
+    `equal`, `unset_in_project`, or `different` (not orderable).
+    """
+    rows = []
+    for rule, pval in preset_rules.items():
+        if pval is None:
+            continue
+        if rule not in current:
+            rows.append({"rule": rule, "project": None, "preset": pval,
+                         "stricter": pval, "conflict": False,
+                         "preset_is": "unset_in_project"})
+            continue
+        cval = current[rule]
+        strict = _stricter(rule, cval, pval)
+        if cval == pval:
+            way = "equal"
+        elif strict == cval and strict != pval:
+            way = "looser"
+        elif strict == pval and strict != cval:
+            way = "stricter"
+        else:
+            way = "different"
+        rows.append({"rule": rule, "project": cval, "preset": pval,
+                     "stricter": strict, "conflict": cval != pval, "preset_is": way})
+    return rows
+
+
+def resolve_preset(rows: list[dict], mode: str) -> dict:
+    """Rule values to write for a `compare_preset` table under `mode`.
+
+    - `project`:  keep every value the project sets; fill only unset rules.
+    - `preset`:   take the preset's value for every rule it defines.
+    - `stricter`: per rule, the tighter of the two (see `_stricter`).
+    """
+    if mode not in PRESET_MODES:
+        raise ValueError(f"mode must be one of {PRESET_MODES}, got {mode!r}")
+    out = {}
+    for r in rows:
+        if r["project"] is None:
+            out[r["rule"]] = r["preset"]
+        elif mode == "preset":
+            out[r["rule"]] = r["preset"]
+        elif mode == "stricter":
+            out[r["rule"]] = r["stricter"]
+        else:
+            out[r["rule"]] = r["project"]
+    return out
 
 
 # --------------------------------------------------------------------------- #

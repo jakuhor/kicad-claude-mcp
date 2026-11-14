@@ -18,7 +18,7 @@ from string import Template
 def _load_fixture(name: str) -> str:
     """Read a packaged template fixture as text."""
     return (
-        resources.files("kicad_claude.templates").joinpath("blank", name).read_text()
+        resources.files("kicad_claude.templates").joinpath("blank", name).read_text(encoding="utf-8")
     )
 
 
@@ -65,7 +65,7 @@ def write_blank_pcb(target_path: Path) -> Path:
     if target_path.exists():
         raise FileExistsError(f"{target_path} already exists")
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    target_path.write_text(_load_fixture("blank.kicad_pcb"))
+    target_path.write_text(_load_fixture("blank.kicad_pcb"), encoding="utf-8")
     return target_path
 
 
@@ -81,7 +81,7 @@ def write_blank_schematic(target_path: Path) -> Path:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     sch_uuid = str(uuid.uuid4())
     sch_text = Template(_load_fixture("blank.kicad_sch")).substitute(SCH_UUID=sch_uuid)
-    target_path.write_text(sch_text)
+    target_path.write_text(sch_text, encoding="utf-8")
     return target_path
 
 
@@ -106,8 +106,8 @@ def write_blank_project(target_dir: Path, name: str) -> dict[str, Path]:
     sch_text = Template(_load_fixture("blank.kicad_sch")).substitute(SCH_UUID=sch_uuid)
     pcb_text = _load_fixture("blank.kicad_pcb")
 
-    pro_path.write_text(json.dumps(_blank_pro(name), indent=2) + "\n")
-    sch_path.write_text(sch_text)
-    pcb_path.write_text(pcb_text)
+    pro_path.write_text(json.dumps(_blank_pro(name), indent=2) + "\n", encoding="utf-8")
+    sch_path.write_text(sch_text, encoding="utf-8")
+    pcb_path.write_text(pcb_text, encoding="utf-8")
 
     return {"pro": pro_path, "sch": sch_path, "pcb": pcb_path}

@@ -1,4 +1,4 @@
-"""Phase 10 — design rules and net classes.
+"""Design rules and net classes.
 
 Tools (6):
     set_design_rules         — set DRC numerical minimums on the active project
@@ -12,6 +12,7 @@ Tools (6):
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 from kicad_claude import state
 from kicad_claude.adapters import drc_rules, project_settings as ps
@@ -20,7 +21,7 @@ logger = logging.getLogger("kicad-claude.tools.rules")
 
 
 def register(mcp) -> None:
-    """Register Phase 10 design-rules and net-class tools."""
+    """Register the design-rules and net-class tools."""
 
     @mcp.tool()
     def set_design_rules(
@@ -76,24 +77,74 @@ def register(mcp) -> None:
         }
 
     @mcp.tool()
-    def apply_fab_preset(preset: str) -> dict:
-        """Apply a bundled fab preset (e.g. 'jlcpcb_2l_default') to the active project.
+    def apply_fab_preset(preset: str, mode: str = "", dry_run: bool = False) -> dict:
+        """Apply a bundled fab preset (`list_fab_presets`) to the project's design
+        rules. If the project already sets a different value for any rule,
+        nothing is written until `mode` is given; ask the user: `project`
+        (keep, fill unset), `preset` (take the preset's), `stricter` (tighter
+        per rule). `dry_run=True` returns the comparison only.
 
-        Run `list_fab_presets` to see the catalogue.
+        Details:
+
+        A preset can be *looser* than rules the project already sets (e.g.
+        `jlcpcb_4l` 0.127 mm clearance on a board designed to 0.15 mm), and
+        overwriting would silently weaken DRC. So when the project sets any
+        rule to a value different from the preset, nothing is written until
+        the caller picks `mode` — ask the user which they want:
+
+          - `project`  — keep the project's rules; only fill rules it leaves unset.
+          - `preset`   — take the fab preset's value for every rule it defines.
+          - `stricter` — per rule, the tighter of the two (larger `min_*`,
+                         `allow_*` False wins). DRC then proves the board meets
+                         both its own constraints and the fab's.
+
+        Without conflicts (fresh project, or values equal) the preset is
+        applied directly and `mode` is not needed. `dry_run=True` returns the
+        comparison and the resolved values without writing.
+
+        Response: `comparison` — one row per rule with `project`, `preset`,
+        `stricter`, `conflict`, `preset_is` (looser / stricter / equal /
+        unset_in_project); `decision_required` when a mode is needed;
+        `rules_applied` — the values written.
         """
         if preset not in ps.FAB_PRESETS:
             raise KeyError(
                 f"unknown preset {preset!r}. Available: {sorted(ps.FAB_PRESETS)}"
             )
+        if mode and mode not in ps.PRESET_MODES:
+            raise ValueError(f"mode must be one of {list(ps.PRESET_MODES)} or empty, got {mode!r}")
         proj = state.get_active()
         pro = ps.load_pro(proj.pro_path)
-        ps.update_design_rules(pro, **ps.FAB_PRESETS[preset]["rules"])
-        ps.save_pro(proj.pro_path, pro)
-        return {
+        current = dict(ps.get_design_rules(pro))
+        rows = ps.compare_preset(current, ps.FAB_PRESETS[preset]["rules"])
+        conflicts = [r for r in rows if r["conflict"]]
+        result = {
             "preset": preset,
             "description": ps.FAB_PRESETS[preset]["description"],
-            "rules_applied": ps.FAB_PRESETS[preset]["rules"],
+            "comparison": rows,
+            "conflicts": len(conflicts),
+            "preset_looser_on": [r["rule"] for r in conflicts if r["preset_is"] == "looser"],
         }
+        if conflicts and not mode:
+            result.update({
+                "decision_required": True,
+                "written": False,
+                "message": (
+                    f"The project already sets {len(conflicts)} rule(s) differently from "
+                    f"'{preset}'. Ask the user which to follow, then call again with "
+                    "mode='project' (keep project rules), mode='preset' (use the fab "
+                    "preset) or mode='stricter' (stricter value wins per rule)."
+                ),
+            })
+            return result
+        resolved = ps.resolve_preset(rows, mode or "preset")
+        result["mode"] = mode or "preset"  # no conflicts: modes coincide
+        result["rules_applied"] = resolved
+        result["written"] = not dry_run
+        if not dry_run:
+            ps.update_design_rules(pro, **resolved)
+            ps.save_pro(proj.pro_path, pro)
+        return result
 
     @mcp.tool()
     def add_net_class(
@@ -106,12 +157,24 @@ def register(mcp) -> None:
         diff_pair_gap_mm: float | None = None,
         description: str = "",
     ) -> dict:
-        """Create or update a net class. Existing classes get their fields merged.
+        """Create or update a net class (existing fields are merged).
+        `clearance_mm` also applies pad-to-pad inside one footprint, so a wide
+        class clearance flags fine-pitch parts; widen rail spacing with
+        `add_drc_rule` instead.
+
+        Details:
 
         Common patterns:
           - Power: track_width 0.5 mm, clearance 0.25 mm
           - Signal: track_width 0.2 mm, clearance 0.15 mm
           - USB_DP: diff_pair_width 0.15 mm, diff_pair_gap 0.15 mm
+
+        `clearance_mm` also applies pad-to-pad *inside* a single footprint, so
+        0.4 mm on a power class reports a violation on every QFN and SOT-583
+        whose lands sit 0.2–0.3 mm apart. To widen only the spacing between
+        rails, leave the class clearance at the board minimum and add an
+        `add_drc_rule` with a condition such as
+        `A.Type == 'Track' && B.Type == 'Track'`.
         """
         proj = state.get_active()
         pro = ps.load_pro(proj.pro_path)
@@ -139,7 +202,12 @@ def register(mcp) -> None:
         via_drill_mm: float | None = None,
         description: str = "",
     ) -> dict:
-        """Convenience: create a net class tuned for differential pair routing.
+        """Create a net class for differential pairs: `diff_pair_width` and
+        `diff_pair_gap` (what Freerouting reads); other fields optional. Then
+        `assign_net_class` with a pattern covering both members, named `_P/_N`,
+        `+/-` or `DP/DM`.
+
+        Details:
 
         Sets `diff_pair_width` and `diff_pair_gap` (the two fields KiCAD's
         DSN exporter writes into the Specctra file so Freerouting routes
@@ -210,10 +278,16 @@ def register(mcp) -> None:
         opt_value_mm: float | None = None,
         max_value_mm: float | None = None,
         condition: str = "",
-        severity: str = "error",
+        severity: Literal["error", "warning", "info", "ignore"] = "error",
         layer: str = "",
     ) -> dict:
-        """Add a custom rule to the project's `.kicad_dru` file.
+        """Add (or replace, same name) a custom rule in the project's
+        `.kicad_dru`. `constraint_type`: clearance, track_width, via_diameter,
+        hole_size, diff_pair_gap, length, skew, disallow, ...; `condition`:
+        KiCAD rule expression, e.g. `A.NetClass == 'Power'`. Enforced by
+        `run_drc`.
+
+        Details:
 
         `constraint_type` examples:
           - clearance, hole_clearance, edge_clearance, courtyard_clearance
@@ -252,14 +326,13 @@ def register(mcp) -> None:
         drc_rules.validate_rule(rule)
 
         dru_path = proj.path / f"{proj.name}.kicad_dru"
-        rules = drc_rules.read_rules(dru_path)
-        rules = [r for r in rules if r.get("name") != name]
-        rules.append(rule)
-        drc_rules.write_rules(dru_path, rules)
+        res = drc_rules.set_rule(dru_path, rule)
         return {
             "rule": rule,
             "dru_path": str(dru_path),
-            "total_rules": len(rules),
+            "replaced": res["replaced"],
+            "total_rules": res["total"],
+            "backup": res["backup"],
         }
 
     @mcp.tool()
@@ -280,21 +353,15 @@ def register(mcp) -> None:
         """Remove a custom DRC rule by name."""
         proj = state.get_active()
         dru_path = proj.path / f"{proj.name}.kicad_dru"
-        rules = drc_rules.read_rules(dru_path)
-        before = len(rules)
-        rules = [r for r in rules if r.get("name") != name]
-        if len(rules) == before:
-            raise KeyError(f"no DRC rule named {name!r}")
-        drc_rules.write_rules(dru_path, rules)
-        return {"removed": name, "remaining": len(rules)}
+        res = drc_rules.remove_rule(dru_path, name)
+        return {"removed": name, **res}
 
     @mcp.tool()
     def clear_drc_rules() -> dict:
-        """Remove every custom DRC rule (writes a `.kicad_dru` with only the version header)."""
+        """Remove every custom DRC rule; the version header and comments stay."""
         proj = state.get_active()
         dru_path = proj.path / f"{proj.name}.kicad_dru"
-        drc_rules.write_rules(dru_path, [])
-        return {"dru_path": str(dru_path), "cleared": True}
+        return {"dru_path": str(dru_path), **drc_rules.clear_rules(dru_path)}
 
     @mcp.tool()
     def list_net_classes() -> dict:

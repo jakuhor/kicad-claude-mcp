@@ -1,17 +1,16 @@
 """High-level mutations on a parsed `.kicad_pcb` tree.
 
 Mirrors `sch_editor` but for PCBs. Same s-expression machinery (`sch_io`),
-same MCP coordinate convention (Y up; the boundary helper flips).
+same coordinate convention: KiCAD-native millimetres, Y DOWN, the numbers the
+PCB editor itself shows. `pcb_to_file_xy` is therefore the identity.
 
-Coordinate convention recap:
-- MCP API: millimetres, Y up.
-- KiCAD file: millimetres, Y down.
-- For PCBs, the page height (from `(paper "A4")`) governs the Y flip;
-  defaults to A4 landscape (210mm) if absent.
+Until issue 2 was fixed, the API used Y up and flipped around the page height.
+That made every coordinate depend on `(paper ...)` and knocked grid points off
+the grid, because 297 mm (A3) is not a multiple of 1.27 mm.
 
-Board origin: `set_board_outline` places the board with its bottom-left
-corner at MCP (`origin_x_mcp`, `origin_y_mcp`) — defaults (10, 10) — so
-the board occupies MCP (10..10+w, 10..10+h).
+Board origin: `set_board_outline` places the board with its TOP-left corner at
+(`origin_x_mcp`, `origin_y_mcp`) — defaults (10, 10) — so the board occupies
+(10..10+w, 10..10+h), extending right and down.
 """
 
 from __future__ import annotations
@@ -25,47 +24,26 @@ from typing import Any
 import sexpdata
 
 import math
-import re
 
-from kicad_claude.adapters import length_tuning, pcb_layers, sch_io
+from kicad_claude.adapters import length_tuning, pcb_geometry, pcb_layers
 from kicad_claude.adapters.sch_io import (
     find_child,
     find_children,
+    get_property,
     head_of,
     is_call,
+    property_name_index,
     sym,
 )
 from kicad_claude.utils.geometry import (
-    DEFAULT_PAGE_HEIGHT_MM,
-    mcp_to_kicad_xy,
+    file_to_pcb_xy,
+    pcb_to_file_xy,
     normalize_rotation,
     round_mm,
 )
+from kicad_claude.utils.kicad_strings import normalize_name
 
 logger = logging.getLogger("kicad-claude.adapters.pcb_editor")
-
-
-# --------------------------------------------------------------------------- #
-# Page-height detection (same as sch_editor — duplicated to keep them decoupled)
-# --------------------------------------------------------------------------- #
-
-
-def page_height_mm(tree: list) -> float:
-    paper = find_child(tree, "paper")
-    if paper and len(paper) >= 2 and isinstance(paper[1], str):
-        sizes = {
-            "A0": 841.0,
-            "A1": 594.0,
-            "A2": 420.0,
-            "A3": 297.0,
-            "A4": 210.0,
-            "A5": 148.0,
-            "USLetter": 215.9,
-            "USLegal": 215.9,
-            "USLedger": 279.4,
-        }
-        return sizes.get(paper[1], DEFAULT_PAGE_HEIGHT_MM)
-    return DEFAULT_PAGE_HEIGHT_MM
 
 
 # --------------------------------------------------------------------------- #
@@ -167,14 +145,37 @@ def iter_footprints(tree: list):
 
 
 def _footprint_property(fp: list, name: str) -> str | None:
-    for prop in find_children(fp, "property"):
-        if len(prop) >= 3 and prop[1] == name and isinstance(prop[2], str):
-            return prop[2]
+    return get_property(fp, name)
+
+
+def get_fp_text(fp: list, kind: str) -> str | None:
+    """Value of a legacy `(fp_text reference|value "X" …)` child, if present.
+
+    KiCAD 7 replaced these with `(property "Reference" …)`, but a `.pretty`
+    library written before that still uses them and KiCAD still loads it.
+    """
+    for node in find_children(fp, "fp_text"):
+        if len(node) > 2 and str(node[1]) == kind and isinstance(node[2], str):
+            return node[2]
     return None
 
 
+def _set_fp_text(children: list, kind: str, value: str) -> bool:
+    """Set every `(fp_text <kind> …)` in `children`. Returns True if any changed."""
+    changed = False
+    for node in children:
+        if is_call(node, "fp_text") and len(node) > 2 and str(node[1]) == kind:
+            node[2] = value
+            changed = True
+    return changed
+
+
 def get_footprint_reference(fp: list) -> str | None:
-    return _footprint_property(fp, "Reference")
+    """The footprint's reference: the property, else the legacy `fp_text`."""
+    ref = _footprint_property(fp, "Reference")
+    if ref is not None:
+        return ref
+    return get_fp_text(fp, "reference")
 
 
 def find_footprint_by_reference(tree: list, reference: str) -> list | None:
@@ -227,30 +228,27 @@ def set_board_outline(
 ) -> dict:
     """Replace the Edge.Cuts outline with a `width × height` rectangle.
 
-    The board's bottom-left corner is placed at MCP (`origin_x_mcp`,
-    `origin_y_mcp`). Returns a summary including the four corner coordinates.
+    Coordinates are KiCAD-native (Y down), so the origin is the board's
+    TOP-left corner and the rectangle extends right and down from it.
+    Returns a summary including both diagonal corners.
     """
-    if shape not in ("rect", "rounded_rect"):
-        raise ValueError(f"shape must be 'rect' or 'rounded_rect' (got {shape!r})")
-    if shape == "rounded_rect":
-        # Rounded corners need 4 lines + 4 arcs; defer until Phase 6+.
-        raise NotImplementedError("rounded_rect outline not yet implemented")
+    if shape != "rect":
+        raise ValueError(f"only 'rect' outlines are supported (got {shape!r})")
 
     remove_board_outline(tree)
-    page_h = page_height_mm(tree)
 
-    # MCP corners (Y up): bottom-left and top-right.
-    bl_mcp = (origin_x_mcp, origin_y_mcp)
-    tr_mcp = (origin_x_mcp + width_mm, origin_y_mcp + height_mm)
+    # Y is down, so the origin is the top-left corner.
+    tl_mcp = (origin_x_mcp, origin_y_mcp)
+    br_mcp = (origin_x_mcp + width_mm, origin_y_mcp + height_mm)
 
-    bl_k = mcp_to_kicad_xy(*bl_mcp, page_h)  # bottom-left in KiCAD coords (Y down)
-    tr_k = mcp_to_kicad_xy(*tr_mcp, page_h)  # top-right in KiCAD coords
+    tl_k = pcb_to_file_xy(*tl_mcp)
+    br_k = pcb_to_file_xy(*br_mcp)
 
     # gr_rect's start/end are diagonal corners; KiCAD doesn't care about the order.
     node = [
         sym("gr_rect"),
-        [sym("start"), round_mm(bl_k[0]), round_mm(bl_k[1])],
-        [sym("end"), round_mm(tr_k[0]), round_mm(tr_k[1])],
+        [sym("start"), round_mm(tl_k[0]), round_mm(tl_k[1])],
+        [sym("end"), round_mm(br_k[0]), round_mm(br_k[1])],
         [sym("stroke"), [sym("width"), 0.15], [sym("type"), sym("solid")]],
         [sym("fill"), sym("no")],
         [sym("layer"), "Edge.Cuts"],
@@ -261,8 +259,8 @@ def set_board_outline(
         "shape": shape,
         "width_mm": width_mm,
         "height_mm": height_mm,
-        "bottom_left_mcp": list(bl_mcp),
-        "top_right_mcp": list(tr_mcp),
+        "top_left_mm": list(tl_mcp),
+        "bottom_right_mm": list(br_mcp),
     }
 
 
@@ -278,6 +276,50 @@ def fetch_footprint_def(mod_path: Path) -> list:
     if not is_call(data, "footprint"):
         raise ValueError(f"not a footprint file: {mod_path}")
     return data
+
+
+def get_footprint_rotation(fp: list) -> int:
+    """The footprint's own `(at x y rot)` angle, 0 when it carries none."""
+    at = find_child(fp, "at")
+    if at is None or len(at) < 4:
+        return 0
+    try:
+        return int(round(float(at[3]))) % 360
+    except (TypeError, ValueError):
+        return 0
+
+
+def rotate_footprint_pads(fp: list, delta_deg: float) -> int:
+    """Add `delta_deg` to every pad's `(at x y [angle])`. Returns pads touched.
+
+    A pad's angle in a `.kicad_pcb` is **absolute**, not relative to the
+    footprint: KiCAD writes `footprint_angle + pad_local_angle`. Rotating only
+    the footprint's own `(at …)` therefore rotates the pad *positions* while
+    leaving the pad *bodies* in their original orientation, which silently
+    shorts neighbouring lands on any fine-pitch part.
+    """
+    delta = float(delta_deg) % 360
+    touched = 0
+    for pad in find_children(fp, "pad"):
+        at = find_child(pad, "at")
+        if at is None:
+            continue
+        current = 0.0
+        if len(at) >= 4:
+            try:
+                current = float(at[3])
+            except (TypeError, ValueError):
+                current = 0.0
+        new = (current + delta) % 360
+        if delta == 0 and len(at) < 4:
+            continue  # nothing to write: an absent angle already means 0
+        new_val = int(new) if float(new).is_integer() else round_mm(new)
+        if len(at) >= 4:
+            at[3] = new_val
+        else:
+            at.append(new_val)
+        touched += 1
+    return touched
 
 
 def _strip_top_fields(fp: list, names: set[str]) -> list:
@@ -307,18 +349,32 @@ def _build_placed_footprint(
 
     # Set Reference / Value properties (preserve their (at), (layer), (effects)).
     for c in core:
-        if is_call(c, "property") and len(c) >= 3:
-            if c[1] == "Reference":
-                c[2] = reference
-            elif c[1] == "Value":
-                c[2] = value
+        if is_call(c, "property"):
+            i = property_name_index(c)
+            if len(c) <= i + 1:
+                continue
+            if c[i] == "Reference":
+                c[i + 1] = reference
+            elif c[i] == "Value":
+                c[i + 1] = value
+
+    # A library footprint in the KiCAD 6 format carries `(fp_text reference
+    # "REF**" …)` instead of a `(property "Reference" …)`. Written unchanged it
+    # lands on the board as an unnamed part that no sync can match, so the
+    # legacy nodes are set too.
+    _set_fp_text(core, "reference", reference)
+    _set_fp_text(core, "value", value)
 
     header: list[Any] = [
         [sym("layer"), layer],
         [sym("uuid"), str(uuid.uuid4())],
         [sym("at"), round_mm(x_k), round_mm(y_k), rotation_deg],
     ]
-    return [sym("footprint"), qualified_lib_id, *header, *core]
+    placed_node = [sym("footprint"), qualified_lib_id, *header, *core]
+    # Pad angles are absolute — see `rotate_footprint_pads`.
+    if rotation_deg:
+        rotate_footprint_pads(placed_node, rotation_deg)
+    return placed_node
 
 
 def add_footprint(
@@ -339,8 +395,7 @@ def add_footprint(
     if layer not in ("F.Cu", "B.Cu"):
         raise ValueError(f"layer must be 'F.Cu' or 'B.Cu' (got {layer!r})")
 
-    page_h = page_height_mm(tree)
-    xk, yk = mcp_to_kicad_xy(x_mm, y_mm, page_h)
+    xk, yk = pcb_to_file_xy(x_mm, y_mm)
     rot = normalize_rotation(rotation)
 
     placed = _build_placed_footprint(
@@ -357,12 +412,115 @@ def add_footprint(
     return placed
 
 
+def set_footprint_property(fp: list, name: str, value: str) -> bool:
+    """Set a footprint's `(property name value)`, adding it hidden if absent.
+
+    Returns True when the file changed. A field KiCAD did not put there —
+    `MPN`, `Manufacturer`, an order code — is metadata for the fab, so a new
+    one is written hidden on `F.Fab`, which is where KiCAD's own update puts
+    the fields it copies from the schematic.
+    """
+    for prop in find_children(fp, "property"):
+        i = property_name_index(prop)
+        if len(prop) > i + 1 and prop[i] == name:
+            if str(prop[i + 1]) == value:
+                return False
+            prop[i + 1] = value
+            return True
+
+    # No property — a KiCAD 6 footprint spells Reference/Value as `fp_text`.
+    # Write there rather than adding a second, conflicting field.
+    legacy = {"Reference": "reference", "Value": "value"}.get(name)
+    if legacy is not None and get_fp_text(fp, legacy) is not None:
+        if get_fp_text(fp, legacy) == value:
+            return False
+        return _set_fp_text(fp, legacy, value)
+
+    node = [
+        sym("property"),
+        name,
+        value,
+        [sym("at"), 0, 0, 0],
+        [sym("unlocked"), sym("yes")],
+        [sym("layer"), "F.Fab"],
+        [sym("hide"), sym("yes")],
+        [sym("uuid"), str(uuid.uuid4())],
+        [
+            sym("effects"),
+            [sym("font"), [sym("size"), 1.0, 1.0], [sym("thickness"), 0.15]],
+        ],
+    ]
+    last_prop_idx = max(
+        (i for i, c in enumerate(fp) if is_call(c, "property")),
+        default=1,
+    )
+    fp.insert(last_prop_idx + 1, node)
+    return True
+
+
 def remove_footprint(tree: list, reference: str) -> bool:
     for i, child in enumerate(tree):
         if is_call(child, "footprint") and get_footprint_reference(child) == reference:
             tree.pop(i)
             return True
     return False
+
+
+# Board item kinds `remove_board_items` removes, by s-expression head.
+REMOVABLE_KINDS = {"track": "segment", "arc": "arc", "via": "via", "zone": "zone"}
+
+
+def _item_layers(node: list) -> list[str]:
+    layers = find_child(node, "layers") or find_child(node, "layer")
+    return [str(x) for x in layers[1:]] if layers else []
+
+
+def remove_board_items(
+    tree: list,
+    *,
+    item_uuid: str = "",
+    net: str = "",
+    kinds: list[str] | tuple[str, ...] = ("track", "arc", "via"),
+    layer: str = "",
+    dry_run: bool = False,
+) -> list[dict]:
+    """Remove routing items by uuid, or every item of `kinds` on `net`.
+
+    `layer` narrows a net removal to tracks, arcs and zones on that layer;
+    vias are kept then, since they join that layer to others. Returns one
+    `{kind, uuid, net, layers}` per removed item (all matches with `dry_run`).
+    """
+    if not item_uuid and not net:
+        raise ValueError("pass a uuid or a net; removing every item is not supported")
+    unknown = sorted(set(kinds) - set(REMOVABLE_KINDS))
+    if unknown:
+        raise ValueError(f"unknown kind(s) {unknown}; use {sorted(REMOVABLE_KINDS)}")
+    heads = {REMOVABLE_KINDS[k]: k for k in kinds}
+    want_net = normalize_name(net) if net else ""
+    matched: list[tuple[int, dict]] = []
+    for i, node in enumerate(tree):
+        if not isinstance(node, list) or head_of(node) not in (
+                heads if not item_uuid else REMOVABLE_KINDS.values()):
+            continue
+        u = find_child(node, "uuid")
+        uid = str(u[1]) if u and len(u) >= 2 else ""
+        if item_uuid:
+            if uid != item_uuid:
+                continue
+        else:
+            if normalize_name(net_of(node, tree)) != want_net:
+                continue
+            if layer and (head_of(node) == "via" or layer not in _item_layers(node)):
+                continue
+        kind = {v: k for k, v in REMOVABLE_KINDS.items()}[head_of(node)]
+        matched.append((i, {"kind": kind, "uuid": uid, "net": net_of(node, tree),
+                            "layers": _item_layers(node)}))
+    if item_uuid and not matched:
+        raise KeyError(f"no track, arc, via or zone with uuid {item_uuid!r} on this board")
+    if not dry_run:
+        for i, _ in reversed(matched):
+            del tree[i]
+    return [m for _, m in matched]
 
 
 def move_footprint(
@@ -379,8 +537,8 @@ def move_footprint(
     if layer is not None and layer not in ("F.Cu", "B.Cu"):
         raise ValueError(f"layer must be 'F.Cu' or 'B.Cu' (got {layer!r})")
 
-    page_h = page_height_mm(tree)
-    xk, yk = mcp_to_kicad_xy(x_mm, y_mm, page_h)
+    xk, yk = pcb_to_file_xy(x_mm, y_mm)
+    old_rot = get_footprint_rotation(fp)
     at = find_child(fp, "at")
     if at is None:
         # Insert one at the right position (after layer/uuid). Fallback: just append.
@@ -389,12 +547,15 @@ def move_footprint(
     else:
         at[1] = round_mm(xk)
         at[2] = round_mm(yk)
-        if rotation is not None:
-            rot = normalize_rotation(rotation)
-            if len(at) >= 4:
-                at[3] = rot
-            else:
-                at.append(rot)
+    if rotation is not None:
+        rot = normalize_rotation(rotation)
+        if len(at) >= 4:
+            at[3] = rot
+        else:
+            at.append(rot)
+        # Pad angles are absolute, so they must follow the footprint —
+        # otherwise the pad positions rotate and the pad bodies do not.
+        rotate_footprint_pads(fp, rot - old_rot)
 
     if layer is not None:
         layer_node = find_child(fp, "layer")
@@ -408,15 +569,24 @@ def place_footprints_grid(
     columns: int = 5,
     origin_mcp: tuple[float, float] = (15.0, 15.0),
     unplaced_threshold_mm: float = 0.5,
+    only_unplaced: bool = True,
 ) -> dict:
-    """Distribute footprints whose position is within `unplaced_threshold_mm` of (0,0).
+    """Lay footprints out on a grid, sorted by reference.
+
+    `only_unplaced` (the default) moves just the footprints sitting within
+    `unplaced_threshold_mm` of (0, 0) — where KiCAD drops a part it has no
+    position for. Pass False to re-arrange every footprint on the board, which
+    is what `update_pcb_from_schematic` leaves behind: it places new parts in a
+    row below the outline, not at the origin.
 
     Sorted by reference (R1, R2, …, C1, C2, …) so prefix groups stay contiguous.
     """
-    page_h = page_height_mm(tree)
 
     unplaced: list[list] = []
     for fp in iter_footprints(tree):
+        if not only_unplaced:
+            unplaced.append(fp)
+            continue
         at = find_child(fp, "at")
         if at is None:
             unplaced.append(fp)
@@ -434,7 +604,7 @@ def place_footprints_grid(
         row = i // columns
         x_mcp = origin_mcp[0] + col * spacing_mm
         y_mcp = origin_mcp[1] + row * spacing_mm
-        xk, yk = mcp_to_kicad_xy(x_mcp, y_mcp, page_h)
+        xk, yk = pcb_to_file_xy(x_mcp, y_mcp)
         at = find_child(fp, "at")
         if at is None:
             fp.insert(2, [sym("at"), round_mm(xk), round_mm(yk), 0])
@@ -459,18 +629,19 @@ def add_track(
     y2_mm: float,
     width_mm: float = 0.25,
     layer: str = "F.Cu",
-    net: int = 0,
+    net: int | str = 0,
 ) -> list:
-    page_h = page_height_mm(tree)
-    x1k, y1k = mcp_to_kicad_xy(x1_mm, y1_mm, page_h)
-    x2k, y2k = mcp_to_kicad_xy(x2_mm, y2_mm, page_h)
+    """Add a track segment. `net` is a net name, or a legacy integer index."""
+    net_value = net_ref(tree, net)
+    x1k, y1k = pcb_to_file_xy(x1_mm, y1_mm)
+    x2k, y2k = pcb_to_file_xy(x2_mm, y2_mm)
     node = [
         sym("segment"),
         [sym("start"), round_mm(x1k), round_mm(y1k)],
         [sym("end"), round_mm(x2k), round_mm(y2k)],
         [sym("width"), width_mm],
         [sym("layer"), layer],
-        [sym("net"), net],
+        [sym("net"), net_value],
         [sym("uuid"), str(uuid.uuid4())],
     ]
     tree.append(node)
@@ -498,7 +669,6 @@ def add_via_array_along_line(
     """
     if spacing_mm <= 0:
         raise ValueError("spacing_mm must be positive")
-    page_h = page_height_mm(tree)
 
     sx, sy = start_mm
     ex, ey = end_mm
@@ -511,13 +681,7 @@ def add_via_array_along_line(
     # Perpendicular (math CCW)
     px, py = -uy, ux
 
-    # Resolve net by name (if given)
-    net_idx = 0
-    if net_name:
-        idx = find_net_index(tree, net_name)
-        if idx is None:
-            raise KeyError(f"net {net_name!r} not found")
-        net_idx = idx
+    net_value = net_ref(tree, net_name) if net_name else 0
 
     n = max(1, int(length / spacing_mm) + 1)
     new_nodes: list[list] = []
@@ -525,14 +689,14 @@ def add_via_array_along_line(
         t = (i / max(1, n - 1)) * length if n > 1 else 0.0
         cx = sx + ux * t + px * perpendicular_offset_mm
         cy = sy + uy * t + py * perpendicular_offset_mm
-        xk, yk = mcp_to_kicad_xy(cx, cy, page_h)
+        xk, yk = pcb_to_file_xy(cx, cy)
         node = [
             sym("via"),
             [sym("at"), round_mm(xk), round_mm(yk)],
             [sym("size"), round_mm(diameter_mm)],
             [sym("drill"), round_mm(drill_mm)],
             [sym("layers"), "F.Cu", "B.Cu"],
-            [sym("net"), net_idx],
+            [sym("net"), net_value],
             [sym("uuid"), _uuid()],
         ]
         tree.append(node)
@@ -546,18 +710,19 @@ def add_via(
     y_mm: float,
     drill_mm: float = 0.4,
     diameter_mm: float = 0.8,
-    net: int = 0,
+    net: int | str = 0,
     layers: tuple[str, str] = ("F.Cu", "B.Cu"),
 ) -> list:
-    page_h = page_height_mm(tree)
-    xk, yk = mcp_to_kicad_xy(x_mm, y_mm, page_h)
+    """Add a via. `net` is a net name, or a legacy integer index."""
+    net_value = net_ref(tree, net)
+    xk, yk = pcb_to_file_xy(x_mm, y_mm)
     node = [
         sym("via"),
         [sym("at"), round_mm(xk), round_mm(yk)],
         [sym("size"), diameter_mm],
         [sym("drill"), drill_mm],
         [sym("layers"), layers[0], layers[1]],
-        [sym("net"), net],
+        [sym("net"), net_value],
         [sym("uuid"), str(uuid.uuid4())],
     ]
     tree.append(node)
@@ -569,19 +734,179 @@ def add_via(
 # --------------------------------------------------------------------------- #
 
 
-def list_nets(tree: list) -> list[dict]:
-    """Return [{index, name}] for every (net N "name") declaration in the PCB."""
+def read_net_node(node: list) -> tuple[int | None, str]:
+    """Read a `(net ...)` child of `node` as (index, name).
+
+    Three spellings exist in the wild:
+      `(net 3 "GND")` — the table entry and, before KiCAD 10, every pad;
+      `(net "GND")`   — KiCAD 10's pads, zones, tracks and vias;
+      `(net 3)`       — an index-only reference into the table.
+    A missing or unreadable node reads as (None, "").
+    """
+    net_node = find_child(node, "net")
+    if not net_node or len(net_node) < 2:
+        return None, ""
+    first = net_node[1]
+    if isinstance(first, int):
+        name = str(net_node[2]) if len(net_node) > 2 else ""
+        return first, normalize_name(name)
+    return None, normalize_name(str(first))
+
+
+def net_of(node: list, tree: list | None = None) -> str:
+    """The net a pad / zone / track / via belongs to, by name.
+
+    Empty for the unconnected net. A KiCAD 10 zone carries only `(net "GND")`;
+    a zone this server wrote before that carries `(net 0) (net_name "GND")`,
+    so the `net_name` child is read as a fallback. Pass `tree` for a board that
+    still has a net table: its tracks reference nets by index alone, and only
+    the table can name them.
+    """
+    index, name = read_net_node(node)
+    if name:
+        return name
+    net_name_node = find_child(node, "net_name")
+    if net_name_node and len(net_name_node) >= 2 and str(net_name_node[1]):
+        return normalize_name(str(net_name_node[1]))
+    if index:
+        if tree is not None:
+            for entry in _net_table(tree):
+                if entry["index"] == index:
+                    return entry["name"]
+        return f"#{index}"  # index-only reference, no table entry to name it
+    return ""
+
+
+def _net_table(tree: list) -> list[dict]:
+    """The top-level `(net N "name")` declarations, if the board has any.
+
+    KiCAD 10 (board format 20260206) stopped writing this table: pads, zones
+    and tracks name their net directly. Older boards still carry it, and their
+    items reference nets by index, so it is read when present.
+    """
     out: list[dict] = []
-    for n in find_children(tree, "net"):
-        if len(n) >= 3 and isinstance(n[1], int):
-            out.append({"index": int(n[1]), "name": str(n[2])})
+    for n in tree[1:]:
+        if is_call(n, "net") and len(n) >= 3 and isinstance(n[1], int):
+            out.append({"index": int(n[1]), "name": normalize_name(str(n[2]))})
     return out
 
 
+def has_net_table(tree: list) -> bool:
+    """True when the board declares real nets in a top-level table.
+
+    A lone `(net 0 "")` does not count: that is the unconnected-net
+    placeholder, which older templates carry and which KiCAD 10 drops on its
+    first save. Treating it as a table made every write on a fresh project take
+    the index branch and emit the pre-KiCAD-10 spelling.
+    """
+    return any(e["index"] != 0 or e["name"] for e in _net_table(tree))
+
+
+def list_nets(tree: list) -> list[dict]:
+    """Every net on the board as [{index, name}], sorted by name.
+
+    Read from the top-level table when the board has one, and otherwise from
+    the items themselves — a KiCAD 10 board declares its nets nowhere else.
+    `index` is None for a net that has no table entry. The unconnected net
+    (empty name) is not listed.
+
+    Names are decoded for display: a net stored `VBUS{slash}5V` is reported
+    as `VBUS/5V`. The tree keeps the stored form.
+    """
+    by_name: dict[str, int | None] = {}
+    for entry in _net_table(tree):
+        if entry["name"]:
+            by_name.setdefault(entry["name"], entry["index"])
+
+    def _note(node: list) -> None:
+        name = net_of(node)
+        if name:
+            by_name.setdefault(name, None)
+
+    for node in tree[1:]:
+        if is_call(node, "footprint"):
+            for pad in find_children(node, "pad"):
+                _note(pad)
+        elif is_call(node, "zone") or is_call(node, "segment") or is_call(node, "arc") or is_call(node, "via"):
+            _note(node)
+
+    return [{"index": idx, "name": name} for name, idx in sorted(by_name.items())]
+
+
 def find_net_index(tree: list, net_name: str) -> int | None:
-    for n in find_children(tree, "net"):
-        if len(n) >= 3 and n[2] == net_name:
-            return int(n[1])
+    """Index of a net by name, or None when the board has no table entry for it.
+
+    A KiCAD 10 board has no table at all, so this returns None for every net.
+    Use `net_exists` to ask whether a net is on the board, and `net_ref` to get
+    the value to write into a new `(net ...)` node.
+    """
+    wanted = normalize_name(net_name)
+    for entry in _net_table(tree):
+        if entry["name"] == wanted:
+            return entry["index"]
+    return None
+
+
+def net_exists(tree: list, net_name: str) -> bool:
+    """True when `net_name` is used anywhere on the board."""
+    wanted = normalize_name(net_name)
+    return any(n["name"] == wanted for n in list_nets(tree))
+
+
+def net_ref(tree: list, net: int | str | None) -> int | str:
+    """The value to write into a new `(net ...)` node for `net`.
+
+    Accepts a net name (preferred) or a legacy integer index. Returns the
+    board's own spelling: an index on a board that still has a net table, the
+    name on a KiCAD 10 board. `None`, `0` and `""` mean the unconnected net.
+
+    Raises KeyError for a name the board does not know — a track on a net that
+    exists nowhere else is invisible to KiCAD and to every check here.
+    """
+    if net is None or net == "" or net == 0:
+        return 0
+    if isinstance(net, int):
+        return net
+    name = normalize_name(str(net))
+    idx = find_net_index(tree, name)
+    if idx is not None:
+        return idx
+    stored = stored_net_name(tree, name)
+    if stored is None:
+        known = [n["name"] for n in list_nets(tree)]
+        raise KeyError(f"net {net!r} not found on this board; known nets: {known}")
+    return stored
+
+
+def stored_net_name(tree: list, net_name: str) -> str | None:
+    """The board's own (brace-escaped) spelling of a net, or None if unused.
+
+    Names are compared decoded, but the value returned is the raw string from
+    the file: `Net-(U5-NR{slash}SS)`, never `Net-(U5-NR/SS)`. Writing the
+    decoded form would create a different net whose bare `/` reads as a
+    sheet-path separator.
+    """
+    wanted = normalize_name(net_name)
+
+    def _raw(node: list) -> str | None:
+        n = find_child(node, "net")
+        if n and len(n) >= 2:
+            v = n[2] if isinstance(n[1], int) and len(n) > 2 else n[1]
+            if not isinstance(v, int) and normalize_name(str(v)) == wanted:
+                return str(v)
+        nn = find_child(node, "net_name")
+        if nn and len(nn) >= 2 and normalize_name(str(nn[1])) == wanted:
+            return str(nn[1])
+        return None
+
+    for node in tree[1:]:
+        if is_call(node, "footprint"):
+            for pad in find_children(node, "pad"):
+                if (r := _raw(pad)) is not None:
+                    return r
+        elif head_of(node) in ("zone", "segment", "arc", "via"):
+            if (r := _raw(node)) is not None:
+                return r
     return None
 
 
@@ -634,15 +959,19 @@ def compute_trace_length(tree: list, net_name: str) -> dict:
     Returns mm total plus per-layer breakdown. Multi-layer traces are
     counted across all layers; vias add zero length.
     """
-    idx = find_net_index(tree, net_name)
-    if idx is None:
+    wanted = normalize_name(net_name)
+    if not net_exists(tree, wanted):
         raise KeyError(f"unknown net {net_name!r}")
+    idx = find_net_index(tree, wanted)
     total = 0.0
     by_layer: dict[str, float] = {}
     seg_count = 0
     for seg in find_children(tree, "segment"):
-        net = find_child(seg, "net")
-        if not net or int(net[1]) != idx:
+        seg_index, seg_name = read_net_node(seg)
+        if seg_name:
+            if seg_name != wanted:
+                continue
+        elif idx is None or seg_index != idx:
             continue
         start = find_child(seg, "start")
         end = find_child(seg, "end")
@@ -694,27 +1023,21 @@ def add_meander_segments(
         side=side_map[side],
         base_width_mm=base_width_mm,
     )
-    net_idx = 0
-    if net_name:
-        idx = find_net_index(tree, net_name)
-        if idx is None:
-            raise KeyError(f"net {net_name!r} not found; declare it first or omit net_name")
-        net_idx = idx
+    net_value = net_ref(tree, net_name) if net_name else 0
 
-    page_h = page_height_mm(tree)
     new_segments: list[list] = []
     for i in range(len(waypoints) - 1):
         x1m, y1m = waypoints[i]
         x2m, y2m = waypoints[i + 1]
-        x1k, y1k = mcp_to_kicad_xy(x1m, y1m, page_h)
-        x2k, y2k = mcp_to_kicad_xy(x2m, y2m, page_h)
+        x1k, y1k = pcb_to_file_xy(x1m, y1m)
+        x2k, y2k = pcb_to_file_xy(x2m, y2m)
         node = [
             sym("segment"),
             [sym("start"), round_mm(x1k), round_mm(y1k)],
             [sym("end"), round_mm(x2k), round_mm(y2k)],
             [sym("width"), round_mm(width_mm)],
             [sym("layer"), layer],
-            [sym("net"), net_idx],
+            [sym("net"), net_value],
             [sym("uuid"), _uuid()],
         ]
         tree.append(node)
@@ -735,24 +1058,13 @@ def _uuid() -> str:
 def get_board_outline_polygon_kicad(tree: list) -> list[tuple[float, float]] | None:
     """Extract the board outline as KiCAD-coord (x, y) points.
 
-    Currently supports rectangular outlines (`gr_rect` on Edge.Cuts), since
-    that's what `set_board_outline` produces. Returns None if no rectangular
-    Edge.Cuts is found.
+    The outer (largest) closed Edge.Cuts loop: a `gr_rect`, a `gr_poly`, a
+    `gr_circle`, or `gr_line`/`gr_arc` pieces chained end to end (a rounded
+    rectangle). Arcs are flattened to <= 5 degree chords. Returns None when no
+    closed Edge.Cuts loop exists.
     """
-    for node in find_children(tree, "gr_rect"):
-        layer = find_child(node, "layer")
-        if not layer or len(layer) < 2 or layer[1] != "Edge.Cuts":
-            continue
-        start = find_child(node, "start")
-        end = find_child(node, "end")
-        if not (start and end and len(start) >= 3 and len(end) >= 3):
-            continue
-        x1, y1 = float(start[1]), float(start[2])
-        x2, y2 = float(end[1]), float(end[2])
-        # Counter-clockwise from bottom-left in KiCAD's Y-down system, which is
-        # actually clockwise visually. KiCAD doesn't care about winding order.
-        return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
-    return None
+    loops = pcb_geometry.board_outline_loops(tree)
+    return loops[0] if loops else None
 
 
 def add_zone(
@@ -770,7 +1082,7 @@ def add_zone(
 ) -> list:
     """Add a filled copper zone for `net_name` on `layer` covering `polygon_mcp`.
 
-    Polygon points are in MCP coordinates (Y up). The zone is declared as
+    Polygon points are in KiCAD coordinates (Y down). The zone is declared as
     `(fill yes)` so KiCAD's DRC will compute the filled regions on demand
     (refill via `kicad-cli pcb drc --refill-zones` or in the GUI).
 
@@ -780,30 +1092,26 @@ def add_zone(
     if not polygon_mcp or len(polygon_mcp) < 3:
         raise ValueError("polygon needs at least 3 points")
 
-    # Resolve net index by name
-    nets = find_children(tree, "net")
-    net_idx = 0
-    for n in nets:
-        if (
-            len(n) >= 3
-            and isinstance(n[2], str)
-            and n[2] == net_name
-        ):
-            net_idx = int(n[1])
-            break
-    else:
-        # Allocate a new (net N "name") at the top level
-        if net_name:
-            next_idx = max(
-                (int(n[1]) for n in nets if len(n) >= 2),
-                default=-1,
-            ) + 1
+    # Resolve the net the way the board spells nets. On a board with a legacy
+    # table that is an index — allocate an entry when the net has none. On a
+    # KiCAD 10 board it is the name itself; net 0 is the unconnected net, so a
+    # named zone must never be written with index 0.
+    net_nodes: list[list]
+    if net_name:  # a caller may type the decoded name; write the stored one
+        net_name = stored_net_name(tree, net_name) or net_name
+    if net_name and has_net_table(tree):
+        idx = find_net_index(tree, net_name)
+        if idx is None:
+            idx = max((e["index"] for e in _net_table(tree)), default=-1) + 1
             tree.insert(_first_child_index(tree, "footprint", default=len(tree)),
-                        [sym("net"), next_idx, net_name])
-            net_idx = next_idx
+                        [sym("net"), idx, net_name])
+        net_nodes = [[sym("net"), idx], [sym("net_name"), net_name]]
+    elif net_name:
+        net_nodes = [[sym("net"), net_name]]
+    else:
+        net_nodes = [[sym("net"), 0]]
 
-    page_h = page_height_mm(tree)
-    pts_kicad = [mcp_to_kicad_xy(x, y, page_h) for (x, y) in polygon_mcp]
+    pts_kicad = [pcb_to_file_xy(x, y) for (x, y) in polygon_mcp]
     pts_block: list[Any] = [sym("pts")]
     for x, y in pts_kicad:
         pts_block.append([sym("xy"), round_mm(x), round_mm(y)])
@@ -816,8 +1124,7 @@ def add_zone(
 
     zone_node = [
         sym("zone"),
-        [sym("net"), net_idx],
-        [sym("net_name"), net_name],
+        *net_nodes,
         layer_node,
         [sym("uuid"), str(uuid.uuid4())],
         [sym("name"), name or f"{net_name}_{layer}"],
@@ -856,8 +1163,7 @@ def add_ground_plane(
             "no board outline found; call set_board_outline first so the zone "
             "knows what area to fill."
         )
-    page_h = page_height_mm(tree)
-    poly_mcp = [(x, page_h - y) for (x, y) in poly_kicad]
+    poly_mcp = [file_to_pcb_xy(x, y) for (x, y) in poly_kicad]
     return add_zone(
         tree,
         net_name=net_name,
@@ -898,8 +1204,7 @@ def add_silk_text(
     if thickness_mm is None:
         thickness_mm = round_mm(size_mm * 0.15)
     rot = normalize_rotation(rotation)
-    page_h = page_height_mm(tree)
-    xk, yk = mcp_to_kicad_xy(x_mm, y_mm, page_h)
+    xk, yk = pcb_to_file_xy(x_mm, y_mm)
     node = [
         sym("gr_text"),
         text,
@@ -925,7 +1230,6 @@ def add_silk_text(
 
 
 def list_footprints_summary(tree: list) -> list[dict]:
-    page_h = page_height_mm(tree)
     out = []
     for fp in iter_footprints(tree):
         ref = get_footprint_reference(fp)
@@ -936,8 +1240,7 @@ def list_footprints_summary(tree: list) -> list[dict]:
         x_k = float(at[1]) if at and len(at) > 1 else 0.0
         y_k = float(at[2]) if at and len(at) > 2 else 0.0
         rot = float(at[3]) if at and len(at) > 3 else 0.0
-        # KiCAD -> MCP for display
-        x_mcp, y_mcp = x_k, page_h - y_k
+        x_mcp, y_mcp = file_to_pcb_xy(x_k, y_k)
         out.append(
             {
                 "reference": ref or "?",

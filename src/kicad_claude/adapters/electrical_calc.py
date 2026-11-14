@@ -112,21 +112,18 @@ def coplanar_waveguide_impedance(
     if width_mm <= 0 or gap_mm <= 0 or height_mm <= 0:
         raise ValueError("width, gap, height must be positive")
 
+    # Conductor-backed CPW (Ghione & Naldi; Wadell, Transmission Line Design
+    # Handbook, eq. 3.4.3.x): the coplanar grounds and the plane below act in
+    # parallel, so their K-ratios add.
     a = width_mm
     b = width_mm + 2 * gap_mm
     k = a / b
-    k_prime = math.sqrt(1 - k * k)
-
-    # Effective permittivity from the geometry
-    k1 = math.tanh(math.pi * a / (4 * height_mm)) / math.tanh(
-        math.pi * b / (4 * height_mm)
-    )
-    k1_prime = math.sqrt(1 - k1 * k1)
-    er_eff = (
-        1 + er * (_K_K_prime(k1) / _K_K_prime(k))
-    ) / (1 + (_K_K_prime(k1) / _K_K_prime(k)))
-
-    return (60 / math.sqrt(er_eff)) * (1 / _K_K_prime(k))
+    k3 = math.tanh(math.pi * a / (4 * height_mm)) / math.tanh(math.pi * b / (4 * height_mm))
+    r_cpw = _K_K_prime(k)    # K(k)/K(k'): the coplanar part
+    r_gnd = _K_K_prime(k3)   # K(k3)/K(k3'): the backside plane
+    q = r_gnd / r_cpw
+    er_eff = (1 + er * q) / (1 + q)
+    return (60 * math.pi / math.sqrt(er_eff)) / (r_cpw + r_gnd)
 
 
 def _K_K_prime(k: float) -> float:
@@ -153,34 +150,79 @@ def solve_microstrip_width(
     tolerance_ohms: float = 0.1,
     max_iter: int = 50,
 ) -> float:
-    """Bisect for the trace width that achieves `target_impedance_ohms`.
+    """Microstrip width for `target_impedance_ohms` (see `solve_width_for_impedance`)."""
+    return solve_width_for_impedance(
+        "microstrip", target_impedance_ohms, height_mm, er=er, thickness_mm=thickness_mm,
+        tolerance_ohms=tolerance_ohms, max_iter=max_iter)
 
-    Range: 0.05 mm ≤ width ≤ 10 mm. Raises if target is outside achievable band.
+
+IMPEDANCE_KINDS = ("microstrip", "stripline", "differential", "cpwg")
+
+
+def impedance(
+    kind: str,
+    width_mm: float,
+    height_mm: float,
+    *,
+    gap_mm: float | None = None,
+    er: float = 4.5,
+    thickness_mm: float = 0.035,
+) -> float:
+    """Z₀ (Z_diff for `differential`) of one trace geometry, in ohms.
+
+    `height_mm` is the dielectric to the reference plane; for `stripline` the
+    full plane-to-plane distance. `gap_mm`: trace-to-trace gap
+    (`differential`) or trace-to-ground-pour gap (`cpwg`).
     """
-    f = lambda w: microstrip_impedance(w, height_mm, er, thickness_mm) - target_impedance_ohms
+    if kind == "microstrip":
+        return microstrip_impedance(width_mm, height_mm, er=er, thickness_mm=thickness_mm)
+    if kind == "stripline":
+        return stripline_impedance(width_mm, height_mm, er=er, thickness_mm=thickness_mm)
+    if kind in ("differential", "cpwg"):
+        if gap_mm is None or gap_mm <= 0:
+            raise ValueError(f"kind={kind!r} needs a positive gap_mm")
+        fn = differential_microstrip_impedance if kind == "differential" \
+            else coplanar_waveguide_impedance
+        return fn(width_mm, gap_mm, height_mm, er=er, thickness_mm=thickness_mm)
+    raise ValueError(f"kind must be one of {IMPEDANCE_KINDS} (got {kind!r})")
+
+
+def solve_width_for_impedance(
+    kind: str,
+    target_ohms: float,
+    height_mm: float,
+    *,
+    gap_mm: float | None = None,
+    er: float = 4.5,
+    thickness_mm: float = 0.035,
+    tolerance_ohms: float = 0.1,
+    max_iter: int = 60,
+) -> float:
+    """Bisect for the width giving `target_ohms` (Z falls as width grows).
+
+    Range 0.05 – 10 mm; raises when the target is outside that band.
+    """
+    def z(w: float) -> float:
+        return impedance(kind, w, height_mm, gap_mm=gap_mm, er=er, thickness_mm=thickness_mm)
 
     lo, hi = 0.05, 10.0
-    f_lo, f_hi = f(lo), f(hi)
-    if f_lo * f_hi > 0:
-        z_lo = microstrip_impedance(lo, height_mm, er, thickness_mm)
-        z_hi = microstrip_impedance(hi, height_mm, er, thickness_mm)
+    z_lo, z_hi = z(lo), z(hi)
+    if not (z_hi <= target_ohms <= z_lo):
         raise ValueError(
-            f"target {target_impedance_ohms} Ω is outside achievable band "
-            f"[{z_hi:.1f}, {z_lo:.1f}] Ω for h={height_mm}mm, er={er}"
+            f"target {target_ohms} Ω is outside the achievable band "
+            f"[{z_hi:.1f}, {z_lo:.1f}] Ω for {kind}, h={height_mm} mm, er={er}"
         )
-
+    mid = 0.5 * (lo + hi)
     for _ in range(max_iter):
         mid = 0.5 * (lo + hi)
-        f_mid = f(mid)
-        if abs(f_mid) <= tolerance_ohms:
-            return mid
-        if f_lo * f_mid < 0:
-            hi = mid
-            f_hi = f_mid
-        else:
+        z_mid = z(mid)
+        if abs(z_mid - target_ohms) <= tolerance_ohms:
+            break
+        if z_mid > target_ohms:
             lo = mid
-            f_lo = f_mid
-    return 0.5 * (lo + hi)
+        else:
+            hi = mid
+    return mid
 
 
 # --------------------------------------------------------------------------- #

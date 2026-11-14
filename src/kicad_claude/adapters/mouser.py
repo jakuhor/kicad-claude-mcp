@@ -16,6 +16,11 @@ import httpx
 
 logger = logging.getLogger("kicad-claude.adapters.mouser")
 
+from kicad_claude.utils.logging import quiet_http  # noqa: E402
+from kicad_claude.adapters import temp_grade  # noqa: E402
+
+quiet_http()
+
 DEFAULT_BASE = "https://api.mouser.com/api/v2"
 
 
@@ -99,6 +104,24 @@ def search_keyword(query: str, records: int = 10) -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 
+def _parse_price(raw: str) -> float | None:
+    """Parse a localized Mouser price string: "$1,234.56", "0,420 €", "1 234,50 Kč".
+
+    The currency text depends on the account locale, so keep only digits and
+    separators instead of stripping a fixed list of symbols. When both "," and
+    "." appear, the last one is the decimal separator; a lone "," is decimal.
+    """
+    cleaned = "".join(c for c in raw if c.isdigit() or c in ",.").strip(",.")
+    if "," in cleaned and "." in cleaned:
+        thousands = "," if cleaned.rfind(".") > cleaned.rfind(",") else "."
+        cleaned = cleaned.replace(thousands, "")
+    cleaned = cleaned.replace(",", ".")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
 def _summarize_part(p: dict) -> dict:
     # Mouser stock is a string like "5,432". Try to coerce.
     stock_raw = p.get("AvailabilityInStock") or "0"
@@ -112,16 +135,7 @@ def _summarize_part(p: dict) -> dict:
     currency = ""
     if price_breaks:
         first = price_breaks[0]
-        # Mouser returns price as e.g. "0,420 €" with comma decimal in some locales
-        raw = first.get("Price", "") or ""
-        cleaned = raw.replace(",", ".")
-        # Strip currency symbols
-        for sym in ("€", "$", "£", "¥"):
-            cleaned = cleaned.replace(sym, "")
-        try:
-            unit_price = float(cleaned.strip())
-        except ValueError:
-            unit_price = None
+        unit_price = _parse_price(first.get("Price", "") or "")
         currency = first.get("Currency", "")
 
     return {
@@ -135,4 +149,8 @@ def _summarize_part(p: dict) -> dict:
         "datasheet_url": p.get("DataSheetUrl", "") or "",
         "product_url": p.get("ProductDetailUrl", "") or "",
         "lead_time": p.get("LeadTime", ""),
+        "lifecycle": p.get("LifecycleStatus") or "",
+        "suggested_replacement": p.get("SuggestedReplacement") or "",
+        "operating_temp": temp_grade.attr_text(p.get("ProductAttributes") or [],
+                                          "AttributeName", "AttributeValue"),
     }

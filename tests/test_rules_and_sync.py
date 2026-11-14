@@ -1,0 +1,700 @@
+"""Design rules, net classes, annotation, schematic↔PCB sync.
+
+Strategy:
+- Unit tests on pure-Python helpers (project_settings, annotation).
+- @pytest.mark.slow: real kicad-cli + pcbnew Python pipeline:
+    1) divider with R? refs auto-annotates to R1/R2
+    2) JLCPCB preset applied → DRC respects it
+    3) update_pcb_from_schematic propagates nets
+    4) autoroute_pcb actually produces track segments
+"""
+
+from __future__ import annotations
+
+import copy
+
+import json
+from pathlib import Path
+
+import pytest
+
+from kicad_claude import state
+from kicad_claude.adapters import (
+    annotation,
+    project_settings as ps,
+    sch_editor as sch_ed,
+    sch_io,
+)
+from kicad_claude.indexer import kicad_libs
+from kicad_claude.templates.blank import write_blank_project
+from kicad_claude.tools.library import index as lib_tools
+
+
+# ===== Project settings (no kicad-cli) ===================================== #
+
+
+def test_load_save_pro_round_trip(tmp_path: Path):
+    files = write_blank_project(tmp_path / "p", "p")
+    pro = ps.load_pro(files["pro"])
+    pro["meta"]["filename"] = "p.kicad_pro"
+    ps.save_pro(files["pro"], pro)
+    re_loaded = ps.load_pro(files["pro"])
+    assert re_loaded["meta"]["filename"] == "p.kicad_pro"
+
+
+def test_update_design_rules_filters_none(tmp_path: Path):
+    pro = {"board": {"design_settings": {"rules": {}}}}
+    ps.update_design_rules(
+        pro,
+        min_clearance=0.127,
+        min_track_width=None,  # ignored
+        min_via_drill=0.2,
+    )
+    rules = ps.get_design_rules(pro)
+    assert rules == {"min_clearance": 0.127, "min_via_drill": 0.2}
+
+
+def test_fab_presets_have_rules_and_descriptions():
+    for name, preset in ps.FAB_PRESETS.items():
+        assert "rules" in preset
+        assert "description" in preset
+        assert isinstance(preset["rules"], dict)
+        assert preset["rules"]  # not empty
+
+
+def test_add_or_update_net_class_creates_then_updates(tmp_path: Path):
+    pro = {}
+    cls = ps.add_or_update_net_class(
+        pro, "Power", track_width_mm=0.5, clearance_mm=0.25,
+    )
+    assert cls["name"] == "Power"
+    assert cls["track_width"] == 0.5
+    # Update keeps name, modifies fields
+    cls2 = ps.add_or_update_net_class(pro, "Power", track_width_mm=0.6)
+    assert cls2["track_width"] == 0.6
+    assert len(ps.get_net_classes(pro)) == 1
+
+
+def test_assign_pattern_requires_existing_class(tmp_path: Path):
+    pro = {}
+    with pytest.raises(KeyError, match="doesn't exist"):
+        ps.assign_pattern(pro, netclass="Bogus", pattern="+5V")
+    ps.add_or_update_net_class(pro, "Power")
+    entry = ps.assign_pattern(pro, netclass="Power", pattern="+5V")
+    assert entry["pattern"] == "+5V"
+    # Idempotent
+    again = ps.assign_pattern(pro, netclass="Power", pattern="+5V")
+    assert again == entry
+    assert len(ps.get_netclass_patterns(pro)) == 1
+
+
+def test_remove_net_class_drops_dangling_patterns(tmp_path: Path):
+    pro = {}
+    ps.add_or_update_net_class(pro, "Power")
+    ps.assign_pattern(pro, netclass="Power", pattern="+5V")
+    assert len(ps.get_netclass_patterns(pro)) == 1
+    assert ps.remove_net_class(pro, "Power") is True
+    assert len(ps.get_netclass_patterns(pro)) == 0
+
+
+# ===== Annotation (no kicad-cli) =========================================== #
+
+
+def _build_sch_with_unannotated_resistors(tmp_path: Path):
+    """Create a schematic with R?, R?, R? at increasing y-positions."""
+    state.clear_active()
+    files = write_blank_project(tmp_path / "p", "p")
+    state.set_active(tmp_path / "p", "p")
+
+    fixtures = Path(__file__).parent / "fixtures"
+    sch_ed.fetch_symbol_def(fixtures / "MiniLib.kicad_sym", "Resistor")
+    tree = sch_io.parse_file(files["sch"])
+    for i, y in enumerate((140, 100, 60), start=1):
+        defn = sch_ed.fetch_symbol_def(fixtures / "MiniLib.kicad_sym", "Resistor")
+        sch_ed.add_symbol(
+            tree,
+            qualified_lib_id="MiniLib:Resistor",
+            reference="R?",
+            value=f"{i}k",
+            x_mm=100, y_mm=y, rotation=0,
+            sym_def_node=defn,
+            project_name="p",
+        )
+    sch_io.write_file(files["sch"], tree)
+    return files
+
+
+def test_annotate_tree_assigns_sequential_numbers(tmp_path: Path):
+    files = _build_sch_with_unannotated_resistors(tmp_path)
+    tree = sch_io.parse_file(files["sch"])
+    assignments = annotation.annotate_tree(tree)
+    assert len(assignments) == 3
+    new_refs = sorted(a["new"] for a in assignments)
+    assert new_refs == ["R1", "R2", "R3"]
+    state.clear_active()
+
+
+def test_annotate_tree_continues_after_existing(tmp_path: Path):
+    """If R5 is already used, the next unannotated becomes R6."""
+    state.clear_active()
+    files = write_blank_project(tmp_path / "q", "q")
+    state.set_active(tmp_path / "q", "q")
+    fixtures = Path(__file__).parent / "fixtures"
+    tree = sch_io.parse_file(files["sch"])
+    for ref, y in (("R5", 140), ("R?", 100)):
+        defn = sch_ed.fetch_symbol_def(fixtures / "MiniLib.kicad_sym", "Resistor")
+        sch_ed.add_symbol(
+            tree, qualified_lib_id="MiniLib:Resistor",
+            reference=ref, value="1k", x_mm=100, y_mm=y, rotation=0,
+            sym_def_node=defn, project_name="q",
+        )
+    sch_io.write_file(files["sch"], tree)
+    tree = sch_io.parse_file(files["sch"])
+    assignments = annotation.annotate_tree(tree)
+    assert assignments[0]["new"] == "R6"
+    state.clear_active()
+
+
+def test_annotate_does_not_touch_already_annotated(tmp_path: Path):
+    files = _build_sch_with_unannotated_resistors(tmp_path)
+    tree = sch_io.parse_file(files["sch"])
+    annotation.annotate_tree(tree)
+    # Re-running shouldn't re-assign
+    again = annotation.annotate_tree(tree)
+    assert again == []
+    state.clear_active()
+
+
+def test_existing_max_per_prefix(tmp_path: Path):
+    state.clear_active()
+    files = write_blank_project(tmp_path / "x", "x")
+    state.set_active(tmp_path / "x", "x")
+    fixtures = Path(__file__).parent / "fixtures"
+    tree = sch_io.parse_file(files["sch"])
+    for ref in ("R1", "R3", "C2", "U1"):
+        defn = sch_ed.fetch_symbol_def(fixtures / "MiniLib.kicad_sym", "Resistor")
+        sch_ed.add_symbol(
+            tree, qualified_lib_id="MiniLib:Resistor",
+            reference=ref, value="x", x_mm=10, y_mm=10, rotation=0,
+            sym_def_node=defn, project_name="x",
+        )
+    counts = annotation.existing_max_per_prefix(tree)
+    assert counts == {"R": 3, "C": 2, "U": 1}
+    state.clear_active()
+
+
+# ===== Tool layer ========================================================== #
+
+
+def _make_mcp(monkeypatch, tmp_path):
+    from mcp.server.fastmcp import FastMCP
+    fixtures = Path(__file__).parent / "fixtures"
+    import shutil
+    sym_dir = tmp_path / "syms"
+    sym_dir.mkdir()
+    shutil.copy(fixtures / "MiniLib.kicad_sym", sym_dir / "MiniLib.kicad_sym")
+    idx = kicad_libs.build_index(symbol_dirs=[sym_dir], footprint_dirs=[])
+    monkeypatch.setattr(lib_tools, "load_cache", lambda: idx)
+    monkeypatch.setattr(lib_tools, "_index", None)
+
+    mcp = FastMCP("t")
+    from kicad_claude.tools.sch import schematic as sch_tools
+    from kicad_claude.tools import rules as rules_tools
+    from kicad_claude.tools.sch import sync as sync_tools
+    sch_tools.register(mcp)
+    lib_tools.register(mcp)
+    rules_tools.register(mcp)
+    sync_tools.register(mcp)
+    return mcp
+
+
+def _call(mcp, _tool_name, **kw):
+    return mcp._tool_manager.get_tool(_tool_name).fn(**kw)
+
+
+def test_set_design_rules_writes_to_kicad_pro(tmp_path: Path, monkeypatch):
+    state.clear_active()
+    files = write_blank_project(tmp_path / "p", "p")
+    state.set_active(tmp_path / "p", "p")
+
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    res = _call(mcp, "set_design_rules",
+                min_clearance_mm=0.127, min_track_width_mm=0.127)
+    assert res["rules"]["min_clearance"] == 0.127
+    pro = json.loads(files["pro"].read_text())
+    assert pro["board"]["design_settings"]["rules"]["min_clearance"] == 0.127
+    state.clear_active()
+
+
+def test_apply_fab_preset_writes_full_ruleset(tmp_path: Path, monkeypatch):
+    state.clear_active()
+    files = write_blank_project(tmp_path / "p", "p")
+    state.set_active(tmp_path / "p", "p")
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    res = _call(mcp, "apply_fab_preset", preset="jlcpcb_2l_default")
+    assert res["preset"] == "jlcpcb_2l_default"
+    pro = json.loads(files["pro"].read_text())
+    rules = pro["board"]["design_settings"]["rules"]
+    assert rules["min_clearance"] == 0.127
+    assert rules["min_track_width"] == 0.127
+    assert rules["allow_microvias"] is False
+    state.clear_active()
+
+
+def test_apply_fab_preset_unknown_raises(tmp_path: Path, monkeypatch):
+    state.clear_active()
+    write_blank_project(tmp_path / "p", "p")
+    state.set_active(tmp_path / "p", "p")
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    with pytest.raises(KeyError):
+        _call(mcp, "apply_fab_preset", preset="not_a_real_fab")
+    state.clear_active()
+
+
+def test_add_and_assign_net_class(tmp_path: Path, monkeypatch):
+    state.clear_active()
+    write_blank_project(tmp_path / "p", "p")
+    state.set_active(tmp_path / "p", "p")
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    _call(mcp, "add_net_class", name="Power",
+          track_width_mm=0.5, clearance_mm=0.25)
+    _call(mcp, "assign_net_class", net_pattern="+5V", class_name="Power")
+    _call(mcp, "assign_net_class", net_pattern="GND", class_name="Power")
+    listed = _call(mcp, "list_net_classes")
+    power = next(c for c in listed["classes"] if c["name"] == "Power")
+    assert power["track_width"] == 0.5
+    assert sorted(power["patterns"]) == ["+5V", "GND"]
+    state.clear_active()
+
+
+def test_annotate_schematic_tool(tmp_path: Path, monkeypatch):
+    _build_sch_with_unannotated_resistors(tmp_path)
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    res = _call(mcp, "annotate_schematic")
+    assert res["total_assignments"] == 3
+    assigned = [a for s in res["sheets"] for a in s["assignments"]]
+    assert sorted(a["new"] for a in assigned) == ["R1", "R2", "R3"]
+    state.clear_active()
+
+
+# ===== Slow acceptance =============================================== #
+
+
+@pytest.mark.slow
+def test_acceptance_full_flow_routes_real_track(tmp_path: Path):
+    """Divider → annotate → apply rules → update PCB → autoroute → segments exist."""
+    from kicad_claude.utils.kicad_paths import find_kicad_cli
+    if find_kicad_cli() is None:
+        pytest.skip("kicad-cli not available")
+    cached = kicad_libs.load_cache()
+    if cached is None:
+        pytest.skip("library index not built")
+    from kicad_claude.adapters import freerouting
+    if freerouting.find_freerouting_jar() is None:
+        pytest.skip("freerouting.jar not available")
+
+    state.clear_active()
+    lib_tools._index = cached
+
+    files = write_blank_project(tmp_path / "div", "div")
+    state.set_active(tmp_path / "div", "div")
+
+    from mcp.server.fastmcp import FastMCP
+    from kicad_claude.tools import rules
+    from kicad_claude.tools.library import index as library
+    from kicad_claude.tools.pcb import layout as pcb
+    from kicad_claude.tools.pcb import routing as routing
+    from kicad_claude.tools.sch import schematic as schematic
+    from kicad_claude.tools.sch import sync as sync
+    from kicad_claude.tools.core import validation as validation
+    mcp = FastMCP("t")
+    for mod in (library, pcb, routing, rules, schematic, sync, validation):
+        mod.register(mcp)
+
+    def call(name, **kw):
+        return mcp._tool_manager.get_tool(name).fn(**kw)
+
+    # Schematic
+    call("add_power_symbol", net="+5V", x_mm=100, y_mm=160)
+    call("add_symbol", lib_id="Device:R", reference="R?", value="10k",
+         x_mm=100, y_mm=130)
+    call("add_symbol", lib_id="Device:R", reference="R?", value="1k",
+         x_mm=100, y_mm=80)
+    call("add_power_symbol", net="GND", x_mm=100, y_mm=40)
+    call("annotate_schematic")
+    # Wire using pin positions so the netlist resolves cleanly
+    r1p1 = call("get_pin_position", reference="R1", pin="1")["position_mm"]
+    r1p2 = call("get_pin_position", reference="R1", pin="2")["position_mm"]
+    r2p1 = call("get_pin_position", reference="R2", pin="1")["position_mm"]
+    r2p2 = call("get_pin_position", reference="R2", pin="2")["position_mm"]
+    call("add_wire", x1_mm=100, y1_mm=160, x2_mm=r1p1[0], y2_mm=r1p1[1])
+    call("add_wire", x1_mm=r1p2[0], y1_mm=r1p2[1], x2_mm=r2p1[0], y2_mm=r2p1[1])
+    call("add_wire", x1_mm=r2p2[0], y1_mm=r2p2[1], x2_mm=100, y2_mm=40)
+
+    # PCB
+    call("set_board_outline", width_mm=50, height_mm=30)
+    call("apply_fab_preset", preset="jlcpcb_2l_default")
+    call("add_footprint", lib_id="Resistor_SMD:R_0603_1608Metric",
+         reference="R1", value="10k", x_mm=20, y_mm=15)
+    call("add_footprint", lib_id="Resistor_SMD:R_0603_1608Metric",
+         reference="R2", value="1k", x_mm=35, y_mm=15)
+
+    upd = call("update_pcb_from_schematic")
+    assert upd["matched_footprints"] == 2
+    assert upd["pad_assignments_made"] == 4
+
+    ar = call("autoroute_pcb", passes=20, timeout_seconds=60)
+    assert ar["freerouting_returncode"] == 0
+
+    import sexpdata
+    from kicad_claude.adapters.sch_io import find_children
+    pcb_tree = sexpdata.loads(files["pcb"].read_text())
+    segments = find_children(pcb_tree, "segment")
+    # Expect at least one routed segment (R1.pad2 ↔ R2.pad1 mid-node)
+    assert len(segments) >= 1, "Freerouting did not produce any track segments"
+
+    state.clear_active()
+
+
+# ===== Component sync: place, copy fields, delete ========================= #
+
+
+class TestComponentSync:
+    """`update_pcb_from_schematic` used to do the netlist and nothing else.
+
+    These cover the component side, which runs without kicad-cli.
+    """
+
+    @pytest.fixture
+    def project(self, tmp_path: Path):
+        cached = kicad_libs.load_cache()
+        if cached is None:
+            pytest.skip("library index not built")
+        state.clear_active()
+        lib_tools._index = cached
+        write_blank_project(tmp_path / "s", "s")
+        state.set_active(tmp_path / "s", "s")
+        yield tmp_path / "s"
+        state.clear_active()
+
+    def _mcp(self):
+        from mcp.server.fastmcp import FastMCP
+        from kicad_claude.tools.library import index as library
+        from kicad_claude.tools.pcb import layout as pcb
+        from kicad_claude.tools.sch import schematic as schematic
+
+        mcp = FastMCP("t")
+        for mod in (library, pcb, schematic):
+            mod.register(mcp)
+        return mcp
+
+    def _build_schematic(self, mcp):
+        def call(_tool, **kw):
+            return mcp._tool_manager.get_tool(_tool).fn(**kw)
+
+        call("add_symbol", lib_id="Device:R", reference="R1", value="10k",
+             x_mm=100, y_mm=100)
+        call("set_symbol_property", reference="R1", name="Footprint",
+             value="Resistor_SMD:R_0603_1608Metric", create=True)
+        call("set_symbol_property", reference="R1", name="MPN",
+             value="RC0603FR-0710KL", create=True)
+        call("add_symbol", lib_id="Device:C", reference="C1", value="100n",
+             x_mm=120, y_mm=100)
+        call("set_symbol_property", reference="C1", name="Footprint",
+             value="Capacitor_SMD:C_0603_1608Metric", create=True)
+        call("set_board_outline", width_mm=40, height_mm=30)
+
+    def test_missing_footprints_are_placed_from_the_symbol_field(self, project):
+        from kicad_claude.tools.pcb import layout as pcb_tools
+        from kicad_claude.adapters import sch_sync as sc
+
+        mcp = self._mcp()
+        self._build_schematic(mcp)
+
+        pcb_path = project / "s.kicad_pcb"
+        tree = sch_io.parse_file(pcb_path)
+        components = sc.collect_schematic_components([project / "s.kicad_sch"])
+        assert set(components) == {"R1", "C1"}
+
+        res = sc.place_missing_footprints(tree, components,
+                                          pcb_tools._resolve_footprint)
+        placed = {p["reference"] for p in res["placed"]}
+        assert placed == {"R1", "C1"}
+        assert res["no_footprint"] == [] and res["unresolved"] == []
+        # Below the outline, so they never land on top of the board.
+        assert all(p["position_mm"][1] > 40 for p in res["placed"])
+        # Running it again places nothing: the board already has them.
+        assert sc.place_missing_footprints(
+            tree, components, pcb_tools._resolve_footprint)["placed"] == []
+
+    def test_a_symbol_without_a_footprint_field_is_reported(self, project):
+        from kicad_claude.tools.pcb import layout as pcb_tools
+        from kicad_claude.adapters import sch_sync as sc
+
+        mcp = self._mcp()
+        self._build_schematic(mcp)
+        mcp._tool_manager.get_tool("add_symbol").fn(
+            lib_id="Device:R", reference="R9", value="0R", x_mm=140, y_mm=100)
+
+        tree = sch_io.parse_file(project / "s.kicad_pcb")
+        components = sc.collect_schematic_components([project / "s.kicad_sch"])
+        res = sc.place_missing_footprints(tree, components,
+                                          pcb_tools._resolve_footprint)
+        assert res["no_footprint"] == ["R9"]
+        assert {p["reference"] for p in res["placed"]} == {"R1", "C1"}
+
+    def test_an_unknown_footprint_library_does_not_stop_the_others(self, project):
+        from kicad_claude.tools.pcb import layout as pcb_tools
+        from kicad_claude.adapters import sch_sync as sc
+
+        mcp = self._mcp()
+        self._build_schematic(mcp)
+        mcp._tool_manager.get_tool("set_symbol_property").fn(
+            reference="C1", name="Footprint", value="NoSuchLib:NoSuchPart")
+
+        tree = sch_io.parse_file(project / "s.kicad_pcb")
+        components = sc.collect_schematic_components([project / "s.kicad_sch"])
+        res = sc.place_missing_footprints(tree, components,
+                                          pcb_tools._resolve_footprint)
+        assert [p["reference"] for p in res["placed"]] == ["R1"]
+        assert [u["reference"] for u in res["unresolved"]] == ["C1"]
+
+    def test_symbol_fields_land_on_the_footprint(self, project):
+        from kicad_claude.adapters import pcb_editor as ped
+        from kicad_claude.tools.pcb import layout as pcb_tools
+        from kicad_claude.adapters import sch_sync as sc
+
+        mcp = self._mcp()
+        self._build_schematic(mcp)
+
+        tree = sch_io.parse_file(project / "s.kicad_pcb")
+        components = sc.collect_schematic_components([project / "s.kicad_sch"])
+        sc.place_missing_footprints(tree, components, pcb_tools._resolve_footprint)
+        changed = sc.sync_footprint_fields(tree, components)
+
+        r1 = ped.find_footprint_by_reference(tree, "R1")
+        assert ped._footprint_property(r1, "MPN") == "RC0603FR-0710KL"
+        assert ped._footprint_property(r1, "Value") == "10k"
+        assert any(c["reference"] == "R1" and "MPN" in c["fields"] for c in changed)
+        # Idempotent: a second pass has nothing left to write.
+        assert sc.sync_footprint_fields(tree, components) == []
+
+    def test_orphans_are_listed_and_only_removed_on_request(self, project):
+        from kicad_claude.adapters import pcb_editor as ped
+        from kicad_claude.tools.pcb import layout as pcb_tools
+        from kicad_claude.adapters import sch_sync as sc
+
+        mcp = self._mcp()
+        self._build_schematic(mcp)
+        tree = sch_io.parse_file(project / "s.kicad_pcb")
+        components = sc.collect_schematic_components([project / "s.kicad_sch"])
+        sc.place_missing_footprints(tree, components, pcb_tools._resolve_footprint)
+
+        # A mounting hole is on the board and in no schematic — it must stay
+        # unless removal was asked for.
+        del components["C1"]
+        assert sc.list_orphan_footprints(tree, components) == ["C1"]
+        assert ped.find_footprint_by_reference(tree, "C1") is not None
+
+        assert sc.remove_orphan_footprints(tree, components) == ["C1"]
+        assert ped.find_footprint_by_reference(tree, "C1") is None
+
+    def test_power_symbols_are_not_components(self, project):
+        from kicad_claude.adapters import sch_sync as sc
+
+        mcp = self._mcp()
+        self._build_schematic(mcp)
+        mcp._tool_manager.get_tool("add_power_symbol").fn(
+            net="GND", x_mm=100, y_mm=140)
+        components = sc.collect_schematic_components([project / "s.kicad_sch"])
+        assert all(not ref.startswith("#") for ref in components)
+
+
+# ===== Defects report 2026-09-20 =========================================== #
+
+
+def test_jlcpcb_4l_preset_allows_02mm_thermal_vias():
+    """#8 — the stock 4-layer preset rejected 0.2 mm vias in KiCAD footprints."""
+    rules = ps.FAB_PRESETS["jlcpcb_4l"]["rules"]
+    assert rules["min_via_drill"] <= 0.2
+    assert rules["min_through_hole_diameter"] <= 0.2
+    assert rules["min_clearance"] <= 0.127
+    assert rules["min_track_width"] <= 0.127
+
+
+def test_netlist_timeout_scales_with_component_count():
+    """#5 — a fixed 90 s could not cover a 189-part board."""
+    from kicad_claude.tools.sch.sync import _netlist_timeout
+
+    assert _netlist_timeout(5) == 180.0          # floor for a small board
+    assert _netlist_timeout(189) >= 550.0        # the board from the report
+    assert _netlist_timeout(400) > _netlist_timeout(189)
+
+
+def test_timeout_result_says_what_was_completed():
+    from kicad_claude.adapters.kicad_python import KicadPythonError
+    from kicad_claude.tools.sch.sync import _timeout_result
+
+    res = _timeout_result(KicadPythonError("pcbnew script timed out after 90.0s"), 90.0, 189)
+    assert res["timed_out"] is True
+    assert res["stage"] == "netlist"
+    assert "nets" in res["completed"].lower()
+    assert "timeout_seconds" in res
+
+
+def test_aisler_presets_match_the_published_process():
+    """AISLER: 0.2/0.15 mm and 0.3 mm drill on 2L, 0.125 mm and 0.25 mm on 4L."""
+    two = ps.FAB_PRESETS["aisler_2l"]["rules"]
+    assert (two["min_track_width"], two["min_clearance"]) == (0.2, 0.15)
+    assert two["min_via_drill"] == 0.3
+
+    four = ps.FAB_PRESETS["aisler_4l"]["rules"]
+    assert (four["min_track_width"], four["min_clearance"]) == (0.125, 0.125)
+    assert four["min_via_drill"] == 0.25
+
+    for name in ("aisler_2l", "aisler_4l"):
+        assert ps.FAB_PRESETS[name]["rules"]["allow_microvias"] is False
+
+
+# ----- apply_fab_preset: preset vs existing project rules ------------------ #
+
+
+def _project_with_rules(tmp_path, **rules):
+    state.clear_active()
+    files = write_blank_project(tmp_path / "p", "p")
+    pro = json.loads(files["pro"].read_text())
+    pro["board"]["design_settings"]["rules"].update(rules)
+    files["pro"].write_text(json.dumps(pro, indent=2))
+    state.set_active(tmp_path / "p", "p")
+    return files
+
+
+def _rules(files):
+    return json.loads(files["pro"].read_text())["board"]["design_settings"]["rules"]
+
+
+def test_apply_fab_preset_conflict_requires_mode(tmp_path: Path, monkeypatch):
+    files = _project_with_rules(tmp_path, min_clearance=0.15, min_track_width=0.15,
+                                min_hole_to_hole=0.25)
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    before = files["pro"].read_text()
+    res = _call(mcp, "apply_fab_preset", preset="jlcpcb_4l")
+    assert res["decision_required"] is True and res["written"] is False
+    assert sorted(res["preset_looser_on"]) == ["min_clearance", "min_track_width"]
+    row = {r["rule"]: r for r in res["comparison"]}
+    assert row["min_hole_to_hole"]["preset_is"] == "stricter"
+    assert row["min_text_height"]["preset_is"] == "unset_in_project"
+    assert files["pro"].read_text() == before  # nothing written
+    state.clear_active()
+
+
+def test_apply_fab_preset_modes(tmp_path: Path, monkeypatch):
+    files = _project_with_rules(tmp_path, min_clearance=0.15, min_hole_to_hole=0.25,
+                                allow_microvias=True)
+    mcp = _make_mcp(monkeypatch, tmp_path)
+
+    res = _call(mcp, "apply_fab_preset", preset="jlcpcb_4l", mode="stricter", dry_run=True)
+    assert res["written"] is False and res["rules_applied"]["min_clearance"] == 0.15
+    assert _rules(files)["min_clearance"] == 0.15 and "min_text_height" not in _rules(files)
+
+    _call(mcp, "apply_fab_preset", preset="jlcpcb_4l", mode="stricter")
+    r = _rules(files)
+    assert r["min_clearance"] == 0.15          # project stricter, kept
+    assert r["min_hole_to_hole"] == 0.5        # preset stricter, taken
+    assert r["allow_microvias"] is False       # disallow wins
+    assert r["min_text_height"] == 1.0         # unset, filled
+
+    files = _project_with_rules(tmp_path / "b", min_clearance=0.15, min_hole_to_hole=0.25)
+    _call(mcp, "apply_fab_preset", preset="jlcpcb_4l", mode="project")
+    r = _rules(files)
+    assert r["min_clearance"] == 0.15 and r["min_hole_to_hole"] == 0.25
+    assert r["min_text_height"] == 1.0
+
+    files = _project_with_rules(tmp_path / "c", min_clearance=0.15)
+    _call(mcp, "apply_fab_preset", preset="jlcpcb_4l", mode="preset")
+    assert _rules(files)["min_clearance"] == 0.127
+
+    with pytest.raises(ValueError):
+        _call(mcp, "apply_fab_preset", preset="jlcpcb_4l", mode="bogus")
+    state.clear_active()
+
+
+# ===== Annotation per sheet instance (OP-15) ================================ #
+
+
+def _two_instance_symbol(tmp_path: Path, refs=("R?", "R?"), unit=1, value="1k"):
+    """One placed resistor whose sheet the hierarchy uses twice."""
+    state.clear_active()
+    files = write_blank_project(tmp_path / "m", "m")
+    state.set_active(tmp_path / "m", "m")
+    fixtures = Path(__file__).parent / "fixtures"
+    tree = sch_io.parse_file(files["sch"])
+    defn = sch_ed.fetch_symbol_def(fixtures / "MiniLib.kicad_sym", "Resistor")
+    sch_ed.add_symbol(tree, qualified_lib_id="MiniLib:Resistor", reference=refs[0],
+                      value=value, x_mm=100, y_mm=100, rotation=0, sym_def_node=defn,
+                      project_name="m")
+    s = list(sch_ed.iter_instance_symbols(tree))[-1]
+    project = sch_io.find_child(sch_io.find_child(s, "instances"), "project")
+    first = sch_io.find_child(project, "path")
+    second = copy.deepcopy(first)
+    second[1] = first[1] + "/second-instance"
+    sch_io.find_child(second, "reference")[1] = refs[1]
+    project.append(second)
+    if unit != 1:
+        sch_io.find_child(s, "unit")[1] = unit
+    return files, tree
+
+
+def test_reused_sheet_gets_one_reference_per_instance(tmp_path: Path):
+    _files, tree = _two_instance_symbol(tmp_path)
+    out = annotation.annotate_tree(tree)
+    assert sorted(a["new"] for a in out) == ["R1", "R2"]
+    s = list(sch_ed.iter_instance_symbols(tree))[-1]
+    paths = sch_io.find_children(
+        sch_io.find_child(sch_io.find_child(s, "instances"), "project"), "path")
+    assert [sch_io.find_child(p, "reference")[1] for p in paths] == ["R1", "R2"]
+    assert sch_ed.get_symbol_property(s, "Reference") == "R1"  # mirrors the first instance
+    state.clear_active()
+
+
+def test_high_water_counts_every_instance_reference(tmp_path: Path):
+    """R8 lives only in the second instance path; the next new part is R9."""
+    _files, tree = _two_instance_symbol(tmp_path, refs=("R7", "R8"))
+    fixtures = Path(__file__).parent / "fixtures"
+    defn = sch_ed.fetch_symbol_def(fixtures / "MiniLib.kicad_sym", "Resistor")
+    sch_ed.add_symbol(tree, qualified_lib_id="MiniLib:Resistor", reference="R?",
+                      value="2k", x_mm=120, y_mm=100, rotation=0, sym_def_node=defn,
+                      project_name="m")
+    assert annotation.existing_max_per_prefix(tree) == {"R": 8}
+    assert [a["new"] for a in annotation.annotate_tree(tree)] == ["R9"]
+    state.clear_active()
+
+
+def test_units_of_one_part_share_a_number(tmp_path: Path):
+    state.clear_active()
+    files = write_blank_project(tmp_path / "u", "u")
+    state.set_active(tmp_path / "u", "u")
+    fixtures = Path(__file__).parent / "fixtures"
+    tree = sch_io.parse_file(files["sch"])
+    for unit, y in ((1, 60), (2, 100), (1, 140)):
+        defn = sch_ed.fetch_symbol_def(fixtures / "MiniLib.kicad_sym", "Resistor")
+        sch_ed.add_symbol(tree, qualified_lib_id="MiniLib:Resistor", reference="U?",
+                          value="TL072", x_mm=100, y_mm=y, rotation=0, sym_def_node=defn,
+                          project_name="u")
+        sch_io.find_child(list(sch_ed.iter_instance_symbols(tree))[-1], "unit")[1] = unit
+    out = annotation.annotate_tree(tree)
+    assert [(a["new"], a["unit"]) for a in out] == [("U1", 1), ("U1", 2), ("U2", 1)]
+    state.clear_active()
+
+
+def test_annotate_tool_refuses_a_locked_project_before_writing(tmp_path: Path, monkeypatch):
+    files = _build_sch_with_unannotated_resistors(tmp_path)
+    before = files["sch"].read_bytes()
+    (files["sch"].parent / f"~{files['sch'].name}.lck").write_text("{}", encoding="utf-8")
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    from kicad_claude.adapters.safe_write import ProjectLockedError
+
+    with pytest.raises(ProjectLockedError):
+        _call(mcp, "annotate_schematic")
+    assert files["sch"].read_bytes() == before
+    state.clear_active()
