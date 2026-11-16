@@ -198,6 +198,9 @@ def test_autoroute_pcb_tool_end_to_end(tmp_path: Path):
 
     res = call("autoroute_pcb", passes=5, timeout_seconds=60)
     assert res["freerouting_returncode"] == 0
+    after = res["after_import"]
+    assert after is not None and "error" not in after, after
+    assert after["drc_unconnected"] >= 0 and after["missing_links"] >= 0
     assert Path(res["dsn_path"]).is_file()
     assert Path(res["ses_path"]).is_file()
     assert Path(res["pcb_path"]).is_file()
@@ -234,3 +237,52 @@ def test_unversioned_jar_still_wins(tmp_path, monkeypatch):
         str(tmp_path / "src" / "kicad_claude" / "adapters" / "freerouting.py"),
     )
     assert freerouting.find_freerouting_jar() == Path(third_party / "freerouting.jar")
+
+
+# ===== OP-29: pours are planes to Freerouting ============================== #
+
+_POUR_BOARD = """(kicad_pcb (version 20260206) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+  (footprint "T:R" (layer "F.Cu") (uuid "f1") (at 10 10 0)
+    (property "Reference" "R1" (at 0 0 0) (layer "F.SilkS") (uuid "r1"))
+    (pad "1" smd rect (at -1 0) (size 1 1) (layers "F.Cu") (net "GND") (uuid "p1"))
+    (pad "2" smd rect (at 1 0) (size 1 1) (layers "F.Cu") (net "GND") (uuid "p2")))
+  (footprint "T:R" (layer "F.Cu") (uuid "f2") (at 40 10 0)
+    (property "Reference" "R2" (at 0 0 0) (layer "F.SilkS") (uuid "r2"))
+    (pad "1" smd rect (at -1 0) (size 1 1) (layers "F.Cu") (net "GND") (uuid "p3")))
+  (zone (net "GND") (layer "B.Cu") (uuid "z1") (hatch edge 0.5)
+    (fill yes) (polygon (pts (xy 0 0) (xy 20 0) (xy 20 20) (xy 0 20))))
+  (zone (net "") (layer "F.Cu") (uuid "z2") (hatch edge 0.5)
+    (keepout (tracks not_allowed) (vias allowed) (pads allowed) (copperpour allowed) (footprints allowed))
+    (polygon (pts (xy 30 0) (xy 50 0) (xy 50 20) (xy 30 20))))
+)"""
+
+
+def test_pads_beyond_a_pour_are_listed():
+    import sexpdata
+    from kicad_claude.adapters import pcb_netlist
+    tree = sexpdata.loads(_POUR_BOARD)
+    assert [z["net_name"] for z in pcb_netlist.pour_outlines(tree)] == ["GND"]
+    # R1 sits over the B.Cu pour (a via reaches it); R2 is beyond it
+    assert pcb_netlist.pads_outside_pours(tree) == {"GND": ["R2.1"]}
+
+
+def test_dsn_without_pours_drops_pours_and_keeps_keepouts(tmp_path, monkeypatch):
+    import sexpdata
+    from kicad_claude.adapters import sch_io
+    pcb = tmp_path / "b.kicad_pcb"
+    pcb.write_text(_POUR_BOARD, encoding="utf-8")
+    (tmp_path / "b.kicad_pro").write_text("{}", encoding="utf-8")
+    seen = {}
+
+    def fake_export(src, dsn):
+        seen["tree"] = sch_io.parse_file(src)
+        seen["pro"] = Path(src).with_suffix(".kicad_pro").is_file()
+        Path(dsn).write_text("(pcb)", encoding="utf-8")
+        return dsn
+    monkeypatch.setattr(kicad_python, "export_dsn", fake_export)
+    assert routing_tools.export_dsn_without_pours(pcb, tmp_path / "b.dsn") == 1
+    zones = [n for n in seen["tree"] if isinstance(n, list) and n and n[0] == sexpdata.Symbol("zone")]
+    assert len(zones) == 1 and seen["pro"]          # the keepout stays, rules copied
+    assert "z1" in pcb.read_text(encoding="utf-8")  # the board itself is untouched
+

@@ -245,8 +245,10 @@ class TestRefreshApplied:
                 if d["kind"] == "wire_end"
             ]
 
-        # Before: the wire still reaches pin 1, so no wire is orphaned.
-        assert orphaned_wire_ends() == []
+        # Before: the wire still reaches pin 1. Its free far end is dangling
+        # (ERC's unconnected_wire_endpoint), the pin end is not.
+        assert old_pin1 not in orphaned_wire_ends()
+        assert len(orphaned_wire_ends()) == 2
 
         _call(mcp, "refresh_lib_symbols", lib_id="MiniLib:Resistor", dry_run=False)
 

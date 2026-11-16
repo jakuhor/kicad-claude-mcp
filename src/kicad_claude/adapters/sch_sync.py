@@ -40,7 +40,8 @@ def collect_schematic_components(sch_paths: list[Path]) -> dict[str, dict]:
     """Every real symbol of the hierarchy, by reference.
 
     Power symbols (`#PWR`), net ties and other `#`-prefixed references are not
-    parts and never reach the board, so they are left out.
+    parts and never reach the board, so they are left out, as are symbols
+    marked `(on_board no)`.
     """
     out: dict[str, dict] = {}
     for path in sch_paths:
@@ -48,6 +49,8 @@ def collect_schematic_components(sch_paths: list[Path]) -> dict[str, dict]:
         for symbol in sed.iter_instance_symbols(tree):
             ref = sed.get_symbol_property(symbol, "Reference") or ""
             if not ref or ref.startswith("#") or ref.endswith("?"):
+                continue
+            if not _flag(symbol, "on_board", True):  # KiCAD leaves it off the board
                 continue
             props: dict[str, str] = {}
             for prop in sch_io.find_children(symbol, "property"):
@@ -63,9 +66,28 @@ def collect_schematic_components(sch_paths: list[Path]) -> dict[str, dict]:
                 "value": sed.get_symbol_property(symbol, "Value") or "",
                 "footprint": sed.get_symbol_property(symbol, "Footprint") or "",
                 "properties": props,
+                "attrs": _symbol_attrs(symbol),
                 "sheet": path.name,
             }
     return out
+
+
+def _flag(symbol: list, name: str, default: bool) -> bool:
+    node = sch_io.find_child(symbol, name)
+    if not node or len(node) < 2:
+        return default
+    return str(node[1]) == "yes"
+
+
+def _symbol_attrs(symbol: list) -> dict[str, bool]:
+    """The footprint flags KiCAD's update derives from the symbol, and DRC's
+    schematic parity compares: `in_bom no` -> `exclude_from_bom`, `dnp yes`
+    -> `dnp`, `exclude_from_sim yes` -> `exclude_from_sim`."""
+    return {
+        "exclude_from_bom": not _flag(symbol, "in_bom", True),
+        "dnp": _flag(symbol, "dnp", False),
+        "exclude_from_sim": _flag(symbol, "exclude_from_sim", False),
+    }
 
 
 def _placement_origin(tree: list) -> tuple[float, float]:
@@ -141,7 +163,8 @@ def place_missing_footprints(
 
 
 def sync_footprint_fields(tree: list, components: dict[str, dict]) -> list[dict]:
-    """Copy `Value` and the symbol's extra fields onto the matching footprint.
+    """Copy `Value`, the symbol's extra fields and its BOM / DNP / simulation
+    flags onto the matching footprint.
 
     Without this, `kicad-cli pcb drc --schematic-parity` reports one
     `footprint_symbol_field_mismatch` per field per part, and an assembly BOM
@@ -159,6 +182,8 @@ def sync_footprint_fields(tree: list, components: dict[str, dict]) -> list[dict]
         for name, value in sorted(comp["properties"].items()):
             if ped.set_footprint_property(fp, name, value):
                 fields.append(name)
+        if comp.get("attrs"):
+            fields += [f"attr:{a}" for a in ped.set_footprint_attr_flags(fp, comp["attrs"])]
         if fields:
             changed.append({"reference": ref, "fields": fields})
     return changed

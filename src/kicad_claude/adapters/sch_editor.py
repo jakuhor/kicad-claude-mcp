@@ -680,21 +680,71 @@ def add_label(
     y_mm: float,
     orientation: str = "right",
 ) -> list:
-    """Append a (label ...) at a point. orientation ∈ {right, up, left, down}."""
+    """Append a (label ...) at a point. orientation ∈ {right, up, left, down}.
+
+    The text runs away from the anchor in the `orientation` direction. KiCAD
+    writes `justify left bottom` at 0 / 90 degrees and `justify right bottom`
+    at 180 / 270 (all KiCAD 10 demo schematics); `left bottom` at 180 draws
+    the text back over the anchor, i.e. into the symbol the label sits on.
+    """
     xk, yk = sch_to_file_xy(x_mm, y_mm)
-    angle_map = {"right": 0, "up": 90, "left": 180, "down": 270}
-    if orientation not in angle_map:
-        raise ValueError(f"orientation must be one of {list(angle_map)}")
+    if orientation not in _LABEL_ORIENTATIONS:
+        raise ValueError(f"orientation must be one of {list(_LABEL_ORIENTATIONS)}")
+    angle = _LABEL_ORIENTATIONS[orientation]
     node = [
         sym("label"),
         net_name,
-        [sym("at"), round_mm(xk), round_mm(yk), angle_map[orientation]],
+        [sym("at"), round_mm(xk), round_mm(yk), angle],
         [
             sym("effects"),
             [sym("font"), [sym("size"), 1.27, 1.27]],
-            [sym("justify"), sym("left"), sym("bottom")],
+            [sym("justify"), sym(_label_justify(angle)), sym("bottom")],
         ],
         [sym("uuid"), str(uuid.uuid4())],
+    ]
+    tree.append(node)
+    return node
+
+
+def _label_justify(angle: int) -> str:
+    """Horizontal justify KiCAD writes for a label / port at `angle`."""
+    return "right" if angle in (180, 270) else "left"
+
+
+def add_global_label(
+    tree: list,
+    net_name: str,
+    x_mm: float,
+    y_mm: float,
+    orientation: str = "right",
+    shape: str = "bidirectional",
+) -> list:
+    """Append a `(global_label ...)`: a net name shared by every sheet.
+
+    Same form as KiCAD 10 writes: shape, `fields_autoplaced`, justify by
+    angle and the hidden `Intersheetrefs` property.
+    """
+    if orientation not in _LABEL_ORIENTATIONS:
+        raise ValueError(f"orientation must be one of {list(_LABEL_ORIENTATIONS)}")
+    if shape not in _VALID_LABEL_SHAPES:
+        raise ValueError(f"shape must be one of {sorted(_VALID_LABEL_SHAPES)}")
+    xk, yk = (round_mm(v) for v in sch_to_file_xy(x_mm, y_mm))
+    angle = _LABEL_ORIENTATIONS[orientation]
+    justify = _label_justify(angle)
+    node = [
+        sym("global_label"),
+        net_name,
+        [sym("shape"), sym(shape)],
+        [sym("at"), xk, yk, angle],
+        [sym("fields_autoplaced"), sym("yes")],
+        [sym("effects"), [sym("font"), [sym("size"), 1.27, 1.27]], [sym("justify"), sym(justify)]],
+        [sym("uuid"), str(uuid.uuid4())],
+        [
+            sym("property"), "Intersheetrefs", "${INTERSHEET_REFS}",
+            [sym("at"), xk, yk, angle % 180],
+            [sym("effects"), [sym("font"), [sym("size"), 1.27, 1.27]],
+             [sym("justify"), sym(justify)], [sym("hide"), sym("yes")]],
+        ],
     ]
     tree.append(node)
     return node
@@ -986,7 +1036,7 @@ def add_hierarchical_label(
         [
             sym("effects"),
             [sym("font"), [sym("size"), 1.27, 1.27]],
-            [sym("justify"), sym("left")],
+            [sym("justify"), sym(_label_justify(_LABEL_ORIENTATIONS[orientation]))],
         ],
         [sym("uuid"), str(uuid.uuid4())],
     ]
@@ -1024,7 +1074,9 @@ def add_sheet_pin(
         [
             sym("effects"),
             [sym("font"), [sym("size"), 1.27, 1.27]],
-            [sym("justify"), sym("right")],
+            # A sheet pin's text runs into the sheet box: the reverse of a label.
+            [sym("justify"), sym("left" if _label_justify(
+                _LABEL_ORIENTATIONS[orientation]) == "right" else "right")],
         ],
         [sym("uuid"), str(uuid.uuid4())],
     ]
@@ -1099,6 +1151,8 @@ def list_pins_for_symbol(tree: list, reference: str) -> list[dict]:
     if not at or len(at) < 4:
         raise ValueError(f"symbol {reference!r} has malformed (at ...)")
     sx, sy, srot = float(at[1]), float(at[2]), float(at[3])
+    mirror = find_child(s_node, "mirror")
+    mirror_axis = str(mirror[1]) if mirror and len(mirror) > 1 else ""
 
     out = []
     for pin_node, _unit in _iter_pins(sym_def):
@@ -1106,6 +1160,13 @@ def list_pins_for_symbol(tree: list, reference: str) -> list[dict]:
         # KiCAD rotation is CCW. Library coords have Y down; instance rotation
         # is also applied in those coords.
         rx, ry = rotate_xy(lx, ly, srot)
+        angle = (lrot + srot) % 360
+        # Rotate first, then mirror the result: KiCAD composes the mirror
+        # after the rotation (as `sch_netlist.pins_of_instance`).
+        if mirror_axis == "y":
+            rx, angle = -rx, (180 - angle) % 360
+        elif mirror_axis == "x":
+            ry, angle = -ry, (-angle) % 360
         # In KiCAD, pin local Y has the same orientation as schematic Y (both
         # "down"), but rotate_xy uses math convention (Y up). Since both
         # systems are consistent, rotate_xy + add gives the right result.
@@ -1119,10 +1180,30 @@ def list_pins_for_symbol(tree: list, reference: str) -> list[dict]:
                 # Displayed, so decode KiCAD's `{brace}` escapes.
                 "name": normalize_name(name),
                 "position_mm": [round_mm(mcp_x), round_mm(mcp_y)],
-                "angle": (lrot + srot) % 360,
+                "angle": angle,
             }
         )
     return out
+
+
+def set_symbol_mirror(s_node: list, axis: str) -> bool:
+    """Mirror a placed symbol about its `x` or `y` axis; "" removes the mirror.
+
+    KiCAD writes `(mirror x|y)` right after `(at ...)`; pins and graphics are
+    mirrored after the rotation (about the sheet's x / y axis). Returns True when the node changed."""
+    if axis not in ("", "x", "y"):
+        raise ValueError(f"mirror must be 'x', 'y' or '' (got {axis!r})")
+    node = find_child(s_node, "mirror")
+    current = str(node[1]) if node and len(node) > 1 else ""
+    if current == axis:
+        return False
+    if node is not None:
+        s_node.remove(node)
+    if axis:
+        at = find_child(s_node, "at")
+        idx = s_node.index(at) + 1 if at is not None else 2
+        s_node.insert(idx, [sym("mirror"), sym(axis)])
+    return True
 
 
 def get_pin_position(tree: list, reference: str, pin_number: str) -> tuple[float, float]:
@@ -1398,6 +1479,91 @@ def remove_dangling_wires_at(
     return removed
 
 
+def _pin_points(tree: list) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for node in tree[1:]:
+        if head_of(node) == "symbol" and find_child(node, "lib_id") is not None:
+            reference = get_symbol_property(node, "Reference")
+            if not reference:
+                continue
+            try:
+                out.extend((p["position_mm"][0], p["position_mm"][1])
+                           for p in list_pins_for_symbol(tree, reference))
+            except (KeyError, ValueError):
+                continue
+    return out
+
+
+def remove_stub_chains(
+    tree: list,
+    points: list[tuple[float, float]],
+    *,
+    tolerance_mm: float = POINT_TOLERANCE_MM,
+) -> int:
+    """Remove the wire stubs that led only to `points` (pins just removed).
+
+    From each point, a wire is followed while the point it leaves has nothing
+    else on it: no other wire end, pin, label or no-connect, and no wire
+    passing through. A stub bent into an L by a drag is two segments; both
+    go, and the junction at the corner too. The walk stops where the stub
+    meets the rest of the net, so a stub that ended on a real wire leaves
+    that wire alone; a wire that runs on to another pin or a label is a
+    connection and stays. A junction left at that point with fewer than three
+    connections is removed. Returns the wires removed.
+    """
+    from kicad_claude.adapters.sch_netlist import _on_segment  # imports this module
+
+    def has_endpoint_item(pt) -> bool:
+        """A pin, label, sheet pin or no-connect sits at `pt` (wires aside)."""
+        for node in tree[1:]:
+            head = head_of(node)
+            if head in ("label", "global_label", "hierarchical_label", "no_connect"):
+                if any(_same_point(pt, q, tolerance_mm) for q in node_points(node)):
+                    return True
+        return any(_same_point(pt, q, tolerance_mm) for q in _pin_points(tree))
+
+    def wires_at(pt):
+        return [w for w in tree[1:] if is_call(w, "wire") and len(node_points(w)) == 2
+                and any(_same_point(pt, q, tolerance_mm) for q in node_points(w))]
+
+    def other_items_at(pt, skip_wires) -> int:
+        n = 0
+        for node in tree[1:]:
+            if any(node is w for w in skip_wires) or head_of(node) == "junction":
+                continue
+            if is_call(node, "wire") and len(node_points(node)) == 2:
+                a, b = node_points(node)
+                if not (_same_point(pt, a, tolerance_mm) or _same_point(pt, b, tolerance_mm))                         and _on_segment(pt, a, b):
+                    n += 1  # a wire runs through: this is a tee
+                    continue
+        n += sum(1 for q in _connection_points(tree) if _same_point(pt, q, tolerance_mm))
+        n -= sum(1 for w in skip_wires for q in node_points(w) if _same_point(pt, q, tolerance_mm))
+        n -= sum(1 for j in find_children(tree, "junction")
+                 if any(_same_point(pt, q, tolerance_mm) for q in node_points(j)))
+        return n
+
+    removed = 0
+    for start in points:
+        current = start
+        while True:
+            ws = wires_at(current)
+            if len(ws) != 1 or other_items_at(current, ws) > 0:
+                break
+            wire = ws[0]
+            far = next(q for q in node_points(wire) if not _same_point(q, current, tolerance_mm))
+            if has_endpoint_item(far) and len(wires_at(far)) == 1:
+                break  # the only wire to another pin or a label: keep that link
+            tree.remove(wire)
+            remove_junction(tree, current[0], current[1], tolerance_mm=tolerance_mm)
+            removed += 1
+            current = far
+        if removed and find_point_item(tree, "junction", current[0], current[1]) is not None:
+            ends = len(wires_at(current)) + other_items_at(current, [])
+            if ends < 3:
+                remove_junction(tree, current[0], current[1], tolerance_mm=tolerance_mm)
+    return removed
+
+
 def remove_symbol_with_wires(
     tree: list,
     reference: str,
@@ -1408,8 +1574,8 @@ def remove_symbol_with_wires(
     """Remove a symbol, optionally cleaning up what was attached to its pins.
 
     With `remove_connected_wires=True`, no-connect markers and junctions on the
-    symbol's pins go too, plus wire stubs that end on those pins and connect to
-    nothing else.
+    symbol's pins go too, plus the wire stubs that led only to those pins
+    (`remove_stub_chains`: followed through bends to the rest of the net).
 
     Returns {"removed": bool, "wires": int, "junctions": int, "no_connects": int}.
     """
@@ -1435,9 +1601,7 @@ def remove_symbol_with_wires(
             counts["no_connects"] += 1
         if remove_junction(tree, x, y, tolerance_mm=tolerance_mm):
             counts["junctions"] += 1
-    counts["wires"] = remove_dangling_wires_at(
-        tree, pin_points, tolerance_mm=tolerance_mm
-    )
+    counts["wires"] = remove_stub_chains(tree, pin_points, tolerance_mm=tolerance_mm)
     return counts
 
 

@@ -158,6 +158,25 @@ def pin_models(nl: Netlist, specs: dict) -> list[dict]:
     return out
 
 
+# VZ (nominal) of the 1N5221..1N5267 / MMSZ5221..MMSZ5267 series.
+_SERIES_52 = dict(zip(range(5221, 5268), (
+    2.4, 2.5, 2.7, 2.8, 3.0, 3.3, 3.6, 3.9, 4.3, 4.7, 5.1, 5.6, 6.0, 6.2, 6.8, 7.5, 8.2,
+    8.7, 9.1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 24, 25, 27, 28, 30, 33,
+    36, 39, 43, 47, 51, 56, 60, 62, 68, 75)))
+
+
+def _vz_from_part_number(value: str) -> float | None:
+    """VZ from a zener part number: 1N5242B / MMSZ5242B (table), BZX84C12,
+    BZT52C3V3, BZV55-B24 (the voltage code)."""
+    m = re.search(r"(?:1N|MMSZ)(52[2-6]\d)", value, re.I)
+    if m and int(m.group(1)) in _SERIES_52:
+        return float(_SERIES_52[int(m.group(1))])
+    m = re.search(r"BZ[XTV]\d*[A-Z]?\d*-?[ABC](\d+)V?(\d*)", value, re.I)
+    if m:
+        return float(f"{m.group(1)}.{m.group(2)}") if m.group(2) else float(m.group(1))
+    return None
+
+
 def zeners(nl: Netlist, specs: dict) -> list[dict]:
     out = []
     for ref, c in nl.components.items():
@@ -175,11 +194,17 @@ def zeners(nl: Netlist, specs: dict) -> list[dict]:
         if vz_sv:
             vz, src = dss.value(vz_sv, "max"), f"{rec.get('mpn')} VZ max p.{vz_sv.get('page')}"
         else:
+            vz = _vz_from_part_number(c.get("value", ""))
             m = re.match(r"(\d+(?:\.\d+)?)V(\d*)", c.get("value", ""), re.I)
-            if not m:
+            if vz is not None:
+                src = "part-number series (1N52xx / MMSZ52xx / BZX / BZT)"
+            elif m:
+                vz = float(f"{m.group(1)}.{m.group(2)}") if m.group(2) else float(m.group(1))
+                src = "value field"
+            else:
+                out.append({"ref": ref, "anode": a, "cathode": k, "vz": None,
+                            "src": "unknown", "ptot": None})
                 continue
-            vz = float(f"{m.group(1)}.{m.group(2)}") if m.group(2) else float(m.group(1))
-            src = "value field"
         ptot = dss.rated(rec, "absolute_max", "Ptot", "P_tot", "PD")
         out.append({"ref": ref, "anode": a, "cathode": k, "vz": vz, "src": src,
                     "ptot": ptot[0] if ptot else None})
@@ -261,6 +286,39 @@ def solve(nl: Netlist, known: dict, specs: dict | None = None,
             setg(pm["net"], pm["v_out"], f"{pm['ref']}.{pm['pin']} v_out ({pm['src']})")
     pm_by_pin = {(pm["ref"], pm["pin"]): pm for pm in pms}
 
+    # A node a resistor chain ties to a known voltage (a pull-up on an off
+    # FET's drain) is left to the network solve: the body diode is then
+    # reverse biased, and the node does not float to 0 V either.
+    radj: dict[str, set] = defaultdict(set)
+    for ref in nl.components:
+        ps = nl.pins.get(ref, [])
+        if kind(ref) in ("R", "RN") and _fitted(nl, ref) and len(ps) == 2:
+            a, b = uf.find(ps[0].net), uf.find(ps[1].net)
+            if a != b:
+                radj[a].add(b)
+                radj[b].add(a)
+
+    # A rail of unknown voltage (a supply pin sits on it) still pulls up.
+    rails_unknown = {uf.find(p.net) for ps in nl.pins.values() for p in ps
+                     if p.type.split("+")[0] in ("power_in", "power_out")
+                     and not is_ground(p.net) and not is_unconnected(p.net)}
+
+    def pulled_above(g: str, floor: float) -> bool:
+        seen, stack = {g}, [g]
+        while stack:
+            x = stack.pop()
+            for y in radj.get(x, ()):
+                if y in seen:
+                    continue
+                seen.add(y)
+                if y in val:
+                    if val[y][0] > floor + 1e-9:
+                        return True
+                    continue
+                if y in rails_unknown:
+                    return True
+                stack.append(y)
+        return False
     # off switches: the body diode carries the anode side's voltage minus its
     # VSD from the spec cache (else the drop is ignored: an upper bound)
     pol = {r: polarity(nl, r, specs) for r in switches}
@@ -274,7 +332,7 @@ def solve(nl: Netlist, known: dict, specs: dict | None = None,
                 dn, sn = d["main"]
                 an, ca = (dn, sn) if pol[r] == "P" else (sn, dn)
                 ga, gc = uf.find(an), uf.find(ca)
-                if ga in val and gc not in val:
+                if ga in val and gc not in val and not pulled_above(gc, val[ga][0]):
                     vsd = dss.rated(specs.get(r), "electrical", "VSD", "VF_body", "VSD_body",
                                     prefer="typ")
                     if vsd:
@@ -288,7 +346,8 @@ def solve(nl: Netlist, known: dict, specs: dict | None = None,
             continue
         for d in dies.get(r, []):
             for n in d["main"]:
-                setg(n, 0.0, f"{r} off: unsourced side taken as 0 V")
+                if not pulled_above(uf.find(n), 0.0):
+                    setg(n, 0.0, f"{r} off: unsourced side taken as 0 V")
 
     # gate drivers
     drivers = []
@@ -371,6 +430,12 @@ def solve(nl: Netlist, known: dict, specs: dict | None = None,
         if pm.get("r_in"):
             edges.append((g, uf.find(gnd), pm["r_in"], f"{pm['ref']}.{pm['pin']} r_in"))
     zs = zeners(nl, specs)
+    unknown_vz = sorted(z["ref"] for z in zs if z["vz"] is None)
+    if unknown_vz:
+        notes.append(f"zener(s) {', '.join(unknown_vz)} left out: VZ unknown (no spec "
+                     "record, no voltage in the value) - extract the datasheet or put "
+                     "the voltage in the value (\"12V\")")
+    zs = [z for z in zs if z["vz"] is not None]
     clamps_def = [{"kind": "pin", **pm} for pm in pms if "clamp" in pm] + \
                  [{"kind": "zener", **z} for z in zs]
     # Nets the resistor network cannot determine:
@@ -418,6 +483,12 @@ def solve(nl: Netlist, known: dict, specs: dict | None = None,
                     reg_fed.add(x)
     source_like |= reg_vin - reg_fed
     supply_like |= reg_vin & reg_fed
+    # A switcher's output with no VOUT pin (inductor side, FB divider) is held
+    # by the regulator, not by its feedback divider to ground.
+    from kicad_claude.adapters.power_review import analyze as _power_tree
+    for r in _power_tree(nl)["regulators"]:
+        if r.get("output_net") and uf.find(r["output_net"]) not in val:
+            source_like.add(uf.find(r["output_net"]))
 
     def run():
         fixed: dict[str, tuple[float, str]] = {}

@@ -64,11 +64,25 @@ def _search(
                 tiers.append((-99, len(name), lid))
             elif len(q) >= 3 and q in name:
                 tiers.append((-98, len(name), lid))
+    family = False
+    if not tiers and len(q) >= 4:
+        # A part number the libraries lack (SMCJ24A, LMR36520): the longest
+        # prefix that names something is the same series — SMCJ, LMR365.
+        for k in range(len(q) - 1, max(3, len(q) // 2) - 1, -1):
+            prefix = q[:k]
+            hits = [lid for lid in entries
+                    if utils.default_process(lid.split(":", 1)[-1]).startswith(prefix)]
+            if hits:
+                score = 90 - (len(q) - k)
+                tiers = [(-score, len(lid), lid) for lid in hits]
+                family = True
+                break
     tiers.sort()
     out: list[dict[str, Any]] = []
     for neg, _len, lid in tiers[:max_results]:
         entry = dict(entries[lid])
         entry["_score"] = float(-neg)
+        entry["_match"] = "family" if family else "name"
         out.append(entry)
     if len(out) >= max_results:
         return out
@@ -93,6 +107,7 @@ def _search(
             continue
         entry = dict(entries[lib_ids[idx]])
         entry["_score"] = round(min(score, 97.0), 1)
+        entry["_match"] = "text"
         out.append(entry)
         if len(out) >= max_results:
             break

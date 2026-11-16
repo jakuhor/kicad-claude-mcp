@@ -33,7 +33,7 @@ def _kill_tree(pid: int) -> None:
     if os.name == "nt":
         root = os.environ.get("SystemRoot", r"C:\Windows")
         subprocess.run([os.path.join(root, "System32", "taskkill.exe"), "/F", "/T", "/PID",
-                        str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        str(pid)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                        check=False)
     else:
         try:
@@ -137,7 +137,8 @@ class NgspiceBackend(Backend):
             ctrl = (".control\nrun\nset wr_singlescale\nwrdata " + str(data).replace("\\", "/")
                     + " " + " ".join(f"vdb({n})" for n in nodes) + "\n.endc\n")
             cir.write_text(deck.replace(".end\n", ctrl + ".end\n"), encoding="utf-8")
-            r = subprocess.run([self.path, "-b", str(cir)], capture_output=True, text=True,
+            r = subprocess.run([self.path, "-b", str(cir)], stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True,
                                encoding="utf-8", errors="replace", timeout=timeout, check=False)
             if not data.is_file():
                 raise RuntimeError(f"ngspice produced no data: {(r.stderr or r.stdout)[-400:]}")

@@ -322,6 +322,48 @@ def rotate_footprint_pads(fp: list, delta_deg: float) -> int:
     return touched
 
 
+def _frame_point(x: float, y: float, frame: tuple[float, float, float]) -> tuple[float, float]:
+    """A footprint-local point placed in `frame` (x, y, CCW angle, Y down)."""
+    fx, fy, angle = frame
+    r = math.radians(angle)
+    ca, sa = math.cos(r), math.sin(r)
+    return fx + x * ca + y * sa, fy - x * sa + y * ca
+
+
+def _unframe_point(x: float, y: float, frame: tuple[float, float, float]) -> tuple[float, float]:
+    """Inverse of `_frame_point`: a board point back to footprint-local."""
+    fx, fy, angle = frame
+    dx, dy = x - fx, y - fy
+    r = math.radians(angle)
+    ca, sa = math.cos(r), math.sin(r)
+    return dx * ca - dy * sa, dx * sa + dy * ca
+
+
+def move_footprint_zones(fp: list, old: tuple[float, float, float],
+                         new: tuple[float, float, float]) -> int:
+    """Carry a footprint's own zones from frame `old` to frame `new`.
+
+    Unlike pads and graphics, a zone inside a placed footprint is stored in
+    **board** coordinates (KiCAD's `FOOTPRINT::Move` / `Rotate` move it with
+    the part). A library `.kicad_mod` holds it footprint-local, i.e. in frame
+    (0, 0, 0). Left untouched, an antenna keep-out stays at the board origin
+    and DRC reports `lib_footprint_mismatch`. Returns the points moved.
+    """
+    if old == new:
+        return 0
+    moved = 0
+    for zone in find_children(fp, "zone"):
+        for kind in ("polygon", "filled_polygon"):
+            for poly in find_children(zone, kind):
+                pts = find_child(poly, "pts")
+                for xy in find_children(pts, "xy") if pts else []:
+                    lx, ly = _unframe_point(float(xy[1]), float(xy[2]), old)
+                    nx, ny = _frame_point(lx, ly, new)
+                    xy[1], xy[2] = round_mm(nx), round_mm(ny)
+                    moved += 1
+    return moved
+
+
 def _strip_top_fields(fp: list, names: set[str]) -> list:
     """Return children of `fp` (skipping head + name) with given heads removed."""
     return [c for c in fp[2:] if head_of(c) not in names]
@@ -365,15 +407,21 @@ def _build_placed_footprint(
     _set_fp_text(core, "reference", reference)
     _set_fp_text(core, "value", value)
 
+    at_node: list[Any] = [sym("at"), round_mm(x_k), round_mm(y_k)]
+    if rotation_deg:  # KiCAD omits a zero angle
+        at_node.append(rotation_deg)
     header: list[Any] = [
         [sym("layer"), layer],
         [sym("uuid"), str(uuid.uuid4())],
-        [sym("at"), round_mm(x_k), round_mm(y_k), rotation_deg],
+        at_node,
     ]
     placed_node = [sym("footprint"), qualified_lib_id, *header, *core]
     # Pad angles are absolute — see `rotate_footprint_pads`.
     if rotation_deg:
         rotate_footprint_pads(placed_node, rotation_deg)
+    # Footprint zones are stored in board coordinates.
+    move_footprint_zones(placed_node, (0.0, 0.0, 0.0),
+                         (float(round_mm(x_k)), float(round_mm(y_k)), float(rotation_deg)))
     return placed_node
 
 
@@ -458,6 +506,50 @@ def set_footprint_property(fp: list, name: str, value: str) -> bool:
     return True
 
 
+# Footprint `(attr ...)` flags in the order KiCAD writes them
+# (pcb_io_kicad_sexpr.cpp, FormatFootprint).
+_ATTR_ORDER = ("smd", "through_hole", "board_only", "exclude_from_pos_files",
+               "exclude_from_bom", "exclude_from_sim", "allow_missing_courtyard",
+               "dnp", "allow_soldermask_bridges")
+# Where a new `(attr)` goes: before the first of these children.
+_AFTER_ATTR = ("fp_line", "fp_rect", "fp_circle", "fp_arc", "fp_poly", "fp_curve",
+               "fp_text", "fp_text_box", "dimension", "pad", "zone", "group",
+               "embedded_fonts", "model")
+
+
+def set_footprint_attr_flags(fp: list, flags: dict[str, bool]) -> list[str]:
+    """Set or clear footprint attribute flags (`exclude_from_bom`, `dnp`, …).
+
+    Returns the flags that changed. Keeps KiCAD's token order, drops an
+    `(attr)` left empty and adds one where KiCAD puts it when needed.
+    """
+    attr = find_child(fp, "attr")
+    current = [str(t) for t in attr[1:]] if attr else []
+    changed = []
+    for name, on in flags.items():
+        if name not in _ATTR_ORDER:
+            raise ValueError(f"unknown footprint attribute {name!r}")
+        if on and name not in current:
+            current.append(name)
+            changed.append(name)
+        elif not on and name in current:
+            current.remove(name)
+            changed.append(name)
+    if not changed:
+        return []
+    known = [t for t in _ATTR_ORDER if t in current]
+    tokens = known + [t for t in current if t not in _ATTR_ORDER]
+    if attr is not None:
+        if tokens:
+            attr[1:] = [sym(t) for t in tokens]
+        else:
+            fp.remove(attr)
+    elif tokens:
+        idx = next((i for i, c in enumerate(fp) if head_of(c) in _AFTER_ATTR), len(fp))
+        fp.insert(idx, [sym("attr"), *[sym(t) for t in tokens]])
+    return changed
+
+
 def remove_footprint(tree: list, reference: str) -> bool:
     for i, child in enumerate(tree):
         if is_call(child, "footprint") and get_footprint_reference(child) == reference:
@@ -540,6 +632,8 @@ def move_footprint(
     xk, yk = pcb_to_file_xy(x_mm, y_mm)
     old_rot = get_footprint_rotation(fp)
     at = find_child(fp, "at")
+    old_frame = ((float(at[1]), float(at[2]), float(old_rot)) if at is not None and len(at) >= 3
+                 else (0.0, 0.0, float(old_rot)))
     if at is None:
         # Insert one at the right position (after layer/uuid). Fallback: just append.
         at = [sym("at"), round_mm(xk), round_mm(yk)]
@@ -556,6 +650,8 @@ def move_footprint(
         # Pad angles are absolute, so they must follow the footprint —
         # otherwise the pad positions rotate and the pad bodies do not.
         rotate_footprint_pads(fp, rot - old_rot)
+    move_footprint_zones(fp, old_frame, (float(at[1]), float(at[2]),
+                                         float(get_footprint_rotation(fp))))
 
     if layer is not None:
         layer_node = find_child(fp, "layer")
@@ -609,8 +705,11 @@ def place_footprints_grid(
         if at is None:
             fp.insert(2, [sym("at"), round_mm(xk), round_mm(yk), 0])
         else:
+            rot = float(get_footprint_rotation(fp))
+            old_frame = (float(at[1]), float(at[2]), rot)
             at[1] = round_mm(xk)
             at[2] = round_mm(yk)
+            move_footprint_zones(fp, old_frame, (float(at[1]), float(at[2]), rot))
         placed += 1
 
     return {"placed": placed, "spacing_mm": spacing_mm, "columns": columns}
@@ -866,6 +965,12 @@ def net_ref(tree: list, net: int | str | None) -> int | str:
     if net is None or net == "" or net == 0:
         return 0
     if isinstance(net, int):
+        table = {e["index"]: e["name"] for e in _net_table(tree)}
+        if net not in table:
+            known = [n["name"] for n in list_nets(tree)]
+            raise KeyError(
+                f"net index {net} is not in this board's net table (a KiCAD 10 "
+                f"board has none: pass the net name); known nets: {known}")
         return net
     name = normalize_name(str(net))
     idx = find_net_index(tree, name)
@@ -1067,6 +1172,17 @@ def get_board_outline_polygon_kicad(tree: list) -> list[tuple[float, float]] | N
     return loops[0] if loops else None
 
 
+# Zone pad connection as `add_zone` takes it -> the token KiCAD writes after
+# `connect_pads` (pcb_io_kicad_sexpr.cpp: THERMAL is the default, not written).
+PAD_CONNECTIONS = ("thermal", "solid", "thru_hole_only", "none")
+_PAD_CONNECTION_TOKEN = {
+    "thermal": [],
+    "solid": [sym("yes")],
+    "thru_hole_only": [sym("thru_hole_only")],
+    "none": [sym("no")],
+}
+
+
 def add_zone(
     tree: list,
     *,
@@ -1079,8 +1195,14 @@ def add_zone(
     thermal_bridge_mm: float = 0.5,
     name: str = "",
     priority: int = 0,
+    pad_connection: str = "thermal",
 ) -> list:
     """Add a filled copper zone for `net_name` on `layer` covering `polygon_mcp`.
+
+    `pad_connection` is one of PAD_CONNECTIONS: `thermal` (KiCAD's default,
+    not written), `solid`, `thru_hole_only` (thermal on THT pads, solid on
+    SMD), `none`. A higher `priority` zone is filled first and cut out of the
+    lower ones it overlaps.
 
     Polygon points are in KiCAD coordinates (Y down). The zone is declared as
     `(fill yes)` so KiCAD's DRC will compute the filled regions on demand
@@ -1091,6 +1213,10 @@ def add_zone(
     """
     if not polygon_mcp or len(polygon_mcp) < 3:
         raise ValueError("polygon needs at least 3 points")
+    if pad_connection not in PAD_CONNECTIONS:
+        raise ValueError(f"pad_connection must be one of {PAD_CONNECTIONS}")
+    if priority < 0:
+        raise ValueError("priority must be >= 0")
 
     # Resolve the net the way the board spells nets. On a board with a legacy
     # table that is an index — allocate an entry when the net has none. On a
@@ -1130,7 +1256,8 @@ def add_zone(
         [sym("name"), name or f"{net_name}_{layer}"],
         [sym("hatch"), sym("edge"), 0.5],
         [sym("priority"), priority],
-        [sym("connect_pads"), [sym("clearance"), round_mm(fill_clearance_mm)]],
+        [sym("connect_pads"), *_PAD_CONNECTION_TOKEN[pad_connection],
+         [sym("clearance"), round_mm(fill_clearance_mm)]],
         [sym("min_thickness"), round_mm(min_thickness_mm)],
         [sym("filled_areas_thickness"), sym("no")],
         [
@@ -1155,6 +1282,8 @@ def add_ground_plane(
     layer: str = "B.Cu",
     net_name: str = "GND",
     fill_clearance_mm: float = 0.5,
+    pad_connection: str = "thermal",
+    priority: int = 0,
 ) -> list:
     """Convenience: pour a ground plane on `layer` covering the whole board."""
     poly_kicad = get_board_outline_polygon_kicad(tree)
@@ -1171,6 +1300,8 @@ def add_ground_plane(
         polygon_mcp=poly_mcp,
         fill_clearance_mm=fill_clearance_mm,
         name=f"{net_name}_{layer}",
+        pad_connection=pad_connection,
+        priority=priority,
     )
 
 
@@ -1239,7 +1370,8 @@ def list_footprints_summary(tree: list) -> list[dict]:
         at = find_child(fp, "at")
         x_k = float(at[1]) if at and len(at) > 1 else 0.0
         y_k = float(at[2]) if at and len(at) > 2 else 0.0
-        rot = float(at[3]) if at and len(at) > 3 else 0.0
+        # pcbnew writes -180 .. 180 (270 saves as -90); report 0 .. 360
+        rot = (float(at[3]) if at and len(at) > 3 else 0.0) % 360 + 0.0
         x_mcp, y_mcp = file_to_pcb_xy(x_k, y_k)
         out.append(
             {
@@ -1249,6 +1381,49 @@ def list_footprints_summary(tree: list) -> list[dict]:
                 "layer": layer,
                 "position_mm": [round_mm(x_mcp), round_mm(y_mcp)],
                 "rotation": rot,
+                "courtyard_mm": footprint_courtyard_bbox(fp),
             }
         )
     return out
+
+
+_CRTYD_SHAPES = ("fp_line", "fp_rect", "fp_circle", "fp_arc", "fp_poly")
+
+
+def footprint_courtyard_bbox(fp: list) -> list[float] | None:
+    """Board-coordinate box [x1, y1, x2, y2] around the footprint's courtyard
+    (F.CrtYd / B.CrtYd), with its rotation applied; None when it has none.
+
+    Graphics in a placed footprint are footprint-local. A circle counts with
+    its full radius; an arc by its three points (a slight under-estimate on a
+    wide arc).
+    """
+    at = find_child(fp, "at")
+    frame = (float(at[1]) if at and len(at) > 1 else 0.0,
+             float(at[2]) if at and len(at) > 2 else 0.0,
+             float(at[3]) if at and len(at) > 3 else 0.0)
+    local: list[tuple[float, float]] = []
+    for child in fp:
+        if head_of(child) not in _CRTYD_SHAPES:
+            continue
+        layer = find_child(child, "layer")
+        if not layer or str(layer[1]) not in ("F.CrtYd", "B.CrtYd"):
+            continue
+        pts = [(float(n[1]), float(n[2])) for key in ("start", "mid", "end", "center")
+               for n in [find_child(child, key)] if n and len(n) >= 3]
+        poly = find_child(child, "pts")
+        pts += [(float(xy[1]), float(xy[2])) for xy in (find_children(poly, "xy") if poly else [])]
+        c, e = find_child(child, "center"), find_child(child, "end")
+        if head_of(child) == "fp_circle" and c and e:
+            cx, cy, ex, ey = float(c[1]), float(c[2]), float(e[1]), float(e[2])
+            r = math.hypot(ex - cx, ey - cy)
+            pts = [(cx - r, cy - r), (cx + r, cy - r), (cx + r, cy + r), (cx - r, cy + r)]
+        elif head_of(child) == "fp_rect" and len(pts) >= 2:
+            (x1, y1), (x2, y2) = pts[0], pts[-1]
+            pts = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+        local += pts
+    if not local:
+        return None
+    board = [file_to_pcb_xy(*_frame_point(x, y, frame)) for x, y in local]
+    xs, ys = [p[0] for p in board], [p[1] for p in board]
+    return [round_mm(min(xs)), round_mm(min(ys)), round_mm(max(xs)), round_mm(max(ys))]

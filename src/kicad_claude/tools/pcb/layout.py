@@ -25,6 +25,7 @@ from pathlib import Path
 
 
 from kicad_claude import state
+from kicad_claude.arg_types import ZonePadConnection
 from kicad_claude.tools.common import on_board
 from kicad_claude.adapters import pcb_editor as ed
 from kicad_claude.adapters import project_settings as ps
@@ -90,6 +91,8 @@ def register(mcp) -> None:
     def set_layer_count(n: int) -> dict:
         """Reconfigure the active PCB to have `n` copper layers.
 
+        Details:
+
         `n` must be even, 2-32. The `(layers ...)` block and the
         `(setup (stackup ...) ...)` sub-block are regenerated to match.
 
@@ -131,7 +134,9 @@ def register(mcp) -> None:
 
     @on_board
     def list_footprints() -> list[dict]:
-        """List all placed footprints with reference, value, position (MCP), layer."""
+        """Placed footprints: reference, value, lib_id, layer, position_mm,
+        rotation, courtyard_mm [x1, y1, x2, y2] (board coords, rotation
+        applied; null without a courtyard) for placement and spacing."""
         tree, _ = _load_active_pcb()
         return ed.list_footprints_summary(tree)
 
@@ -205,6 +210,8 @@ def register(mcp) -> None:
     def remove_footprint(reference: str) -> dict:
         """Delete a placed footprint from the active PCB.
 
+        Details:
+
         Tracks and vias that were routed to its pads stay where they are —
         KiCAD does the same — so re-run `run_drc` afterwards to see what the
         removal left dangling. To clear out every footprint whose symbol is
@@ -267,6 +274,8 @@ def register(mcp) -> None:
     ) -> dict:
         """Lay footprints out on a regular grid, sorted by reference.
 
+        Details:
+
         By default only the footprints sitting at (0, 0) are moved — where
         KiCAD leaves a part it has no position for. Pass
         `only_unplaced=False` to re-arrange every footprint on the board,
@@ -295,9 +304,18 @@ def register(mcp) -> None:
         y2_mm: float,
         width_mm: float = 0.25,
         layer: str = "F.Cu",
-        net: int = 0,
+        net: str | int = "",
     ) -> dict:
-        """Add a track segment between two points on the given copper layer."""
+        """Add a track segment between two points on a copper layer, on `net`
+        (net name as `list_nets` shows it; "" = no net).
+
+        Details:
+
+        `net` may also be a legacy integer index, accepted only on a board
+        that still has a net table (pre-KiCAD 10). A name the board does not
+        know is refused: a track on a net nothing else carries is invisible
+        to KiCAD. Many segments at once: `edit_board`.
+        """
         tree, path = _load_active_pcb()
         ed.add_track(tree, x1_mm, y1_mm, x2_mm, y2_mm,
                      width_mm=width_mm, layer=layer, net=net)
@@ -321,15 +339,25 @@ def register(mcp) -> None:
         fill_clearance_mm: float = 0.5,
         min_thickness_mm: float = 0.25,
         name: str = "",
+        pad_connection: ZonePadConnection = "thermal",
+        thermal_gap_mm: float = 0.5,
+        thermal_bridge_mm: float = 0.5,
+        priority: int = 0,
     ) -> dict:
-        """Add a copper zone (pour) to `net` on `layer`.
+        """Add a copper zone (pour) to `net` on `layer` ("F.Cu", "*.Cu", …)
+        over `polygon_mm` ([[x, y], …], KiCAD coords, ≥ 3 points).
+        `pad_connection`: thermal / solid (power paths) / thru_hole_only /
+        none. Overlapping pours: the higher `priority` wins. Then
+        `run_drc(refill_zones=True)`.
 
-        `polygon_mm` is a list of `[x_mm, y_mm]` points in KiCAD coords (Y down).
-        At least 3 points required. Layer can be a single copper layer
-        ("F.Cu", "B.Cu", "In1.Cu", …) or "*.Cu" for all signal layers.
+        Details:
 
-        After adding zones, run `run_drc(refill_zones=True)` so KiCAD
-        computes the actual filled regions before validation.
+        `thermal_gap_mm` / `thermal_bridge_mm` set the relief of `thermal`
+        (and of THT pads under `thru_hole_only`). A large SMD power pad on a
+        thermal pour often gets one spoke only: DRC `starved_thermal`, and
+        the pad may stay unconnected — use `solid` there. A zone of higher
+        `priority` is filled first and cut out of lower ones, so a power
+        pour inside a GND pour on the same layer needs the higher priority.
         """
         polygon = [(float(p[0]), float(p[1])) for p in polygon_mm]
         tree, path = _load_active_pcb()
@@ -338,13 +366,19 @@ def register(mcp) -> None:
             net_name=net, layer=layer, polygon_mcp=polygon,
             fill_clearance_mm=fill_clearance_mm,
             min_thickness_mm=min_thickness_mm,
+            thermal_gap_mm=thermal_gap_mm,
+            thermal_bridge_mm=thermal_bridge_mm,
             name=name,
+            priority=priority,
+            pad_connection=pad_connection,
         )
         backup = _save_with_backup(tree, path)
         return {
             "net": net,
             "layer": layer,
             "vertices": len(polygon),
+            "pad_connection": pad_connection,
+            "priority": priority,
             "backup": str(backup) if backup else None,
         }
 
@@ -355,17 +389,21 @@ def register(mcp) -> None:
         layer: str = "B.Cu",
         net: str = "GND",
         fill_clearance_mm: float = 0.5,
+        pad_connection: ZonePadConnection = "thermal",
+        priority: int = 0,
     ) -> dict:
         """Pour a ground plane covering the whole board on `layer`.
 
         Reads the board outline (must exist — call `set_board_outline` first),
         creates a zone polygon matching it, and assigns it to `net`.
-        Defaults: B.Cu / GND (the most common pattern).
+        Defaults: B.Cu / GND (the most common pattern). `pad_connection` and
+        `priority` as in `add_zone`.
         """
         tree, path = _load_active_pcb()
         ed.add_ground_plane(
             tree, layer=layer, net_name=net,
             fill_clearance_mm=fill_clearance_mm,
+            pad_connection=pad_connection, priority=priority,
         )
         backup = _save_with_backup(tree, path)
         return {
@@ -408,6 +446,136 @@ def register(mcp) -> None:
     @mcp.tool()
 
     @on_board
+    def render_board(
+        layers: list[str] | None = None,
+        region_mm: list[float] | None = None,
+        bottom: bool = False,
+        dpi: float = 400,
+        out_path: str = "",
+    ):
+        """2D PNG of the board (kicad-cli plot, KiCAD colours) returned as an
+        image, to check placement, silkscreen and routing by eye. `layers`
+        default F/B.Cu, F/B.SilkS, F.Fab, Edge.Cuts; `region_mm=[x1, y1, x2,
+        y2]` zooms (board coords), else the outline + 1 mm; `bottom=True`
+        mirrors to view from below.
+
+        Details:
+
+        The longest side is capped at 4000 px (dpi lowered to fit). The PNG
+        is written to `out_path`, else `<temp>/kicad-claude-renders/`.
+        """
+        from mcp.server.fastmcp import Image
+        from kicad_claude.adapters import render2d
+        from kicad_claude.tools.common import render_out
+
+        if region_mm is not None and len(region_mm) != 4:
+            raise ValueError("region_mm is [x1, y1, x2, y2]")
+        tree, path = _load_active_pcb()
+        box = None
+        outline = ed.get_board_outline_polygon_kicad(tree)
+        if outline:
+            xs, ys = [p[0] for p in outline], [p[1] for p in outline]
+            box = (min(xs), min(ys), max(xs), max(ys))
+        else:
+            cy = [b for fp in ed.iter_footprints(tree) for b in [ed.footprint_courtyard_bbox(fp)] if b]
+            if cy:
+                box = (min(b[0] for b in cy), min(b[1] for b in cy),
+                       max(b[2] for b in cy), max(b[3] for b in cy))
+        png = render_out(out_path, f"{path.stem}-{'bottom' if bottom else 'top'}")
+        info = render2d.render_board(path, png, layers=layers,
+                                     region_mm=tuple(region_mm) if region_mm else None,
+                                     board_box=box, mirror=bottom, dpi=dpi)
+        return [Image(path=png), info]
+
+    @mcp.tool()
+
+    @on_board
+    def set_footprint_field(
+        references: list[str],
+        field: str = "Reference",
+        visible: bool | None = None,
+        x_mm: float | None = None,
+        y_mm: float | None = None,
+        rotation: float | None = None,
+        size_mm: float | None = None,
+        layer: str | None = None,
+    ) -> dict:
+        """Show / hide, move, rotate, resize or re-layer a placed footprint's
+        field (Reference, Value or a user field) on the board. `x_mm`/`y_mm`
+        are the board position (one reference only), `rotation` the text's
+        board angle. Returns each field after the edit.
+
+        Details:
+
+        `references` takes several parts for a bulk change (`visible`,
+        `size_mm` - thickness scales with it -, `layer`, `rotation`). A
+        position needs exactly one reference. `layer` e.g. F.SilkS / F.Fab.
+        For a whole-board pass use `tidy_footprint_fields`.
+        """
+        from kicad_claude.adapters import pcb_fields
+
+        refs = list(references or [])
+        if not refs:
+            raise ValueError("references is empty")
+        if (x_mm is None) != (y_mm is None):
+            raise ValueError("give both x_mm and y_mm")
+        if x_mm is not None and len(refs) != 1:
+            raise ValueError("a position needs exactly one reference")
+        tree, path = _load_active_pcb()
+        out, changed = [], False
+        for ref in refs:
+            fp = ed.find_footprint_by_reference(tree, ref)
+            if fp is None:
+                raise KeyError(f"no footprint with reference {ref!r} on this board")
+            changed |= pcb_fields.set_field(
+                fp, field, visible=visible,
+                position=(x_mm, y_mm) if x_mm is not None else None,
+                angle=rotation, size=size_mm, layer=layer)
+            out.append({"reference": ref,
+                        **pcb_fields.field_info(fp, pcb_fields.field_node(fp, field))})
+        backup = _save_with_backup(tree, path) if changed else None
+        return {"fields": out, "changed": changed,
+                "backup": str(backup) if backup else None}
+
+    @mcp.tool()
+
+    @on_board
+    def tidy_footprint_fields(
+        references: list[str] | None = None,
+        hide_values: bool = True,
+        size_mm: float | None = None,
+        clearance_mm: float = 0.2,
+        hide_unplaced: bool = False,
+        dry_run: bool = False,
+    ) -> dict:
+        """Keep silkscreen references off copper: move each footprint's
+        Reference (default all) to the first free spot around its courtyard,
+        clear of pads, silk graphics, other references and the board edge,
+        and hide Values that sit on silkscreen. Lists parts with no free spot
+        (`hide_unplaced=True` hides those). Run DRC after.
+
+        Details:
+
+        Spots tried: above, below, right, left, then the four corners, each
+        at `clearance_mm` from the courtyard and then 0.5 / 1.0 mm further.
+        Text is set horizontal. `size_mm` resizes the references first
+        (thickness scales). Text extents are an estimate of KiCAD's stroke
+        font, so confirm with `run_drc` (silk_overlap, silk_over_copper).
+        `dry_run=True` reports without writing.
+        """
+        from kicad_claude.adapters import pcb_fields
+
+        tree, path = _load_active_pcb()
+        result = pcb_fields.tidy_fields(tree, references, hide_values, size_mm,
+                                        clearance_mm, hide_unplaced)
+        changed = any(result[k] for k in ("moved", "values_hidden", "references_hidden"))
+        backup = _save_with_backup(tree, path) if changed and not dry_run else None
+        result.update(dry_run=dry_run, backup=str(backup) if backup else None)
+        return result
+
+    @mcp.tool()
+
+    @on_board
     def add_mounting_hole(
         x_mm: float,
         y_mm: float,
@@ -416,6 +584,8 @@ def register(mcp) -> None:
         reference: str | None = None,
     ) -> dict:
         """Add a mounting hole at (x_mm, y_mm) by drill diameter.
+
+        Details:
 
         Common sizes:
           - 2.2 mm → M2 screw
@@ -500,6 +670,8 @@ def register(mcp) -> None:
     ) -> dict:
         """Add a fiducial marker (for pick-and-place camera registration).
 
+        Details:
+
         `size` ∈ {"0.5mm", "0.75mm", "1mm", "1.5mm"}. Standard PnP machines
         need 3 fiducials per side, ideally near board corners. Layer defines
         which side: F.Cu (top fiducial) or B.Cu (bottom fiducial).
@@ -562,6 +734,8 @@ def register(mcp) -> None:
     def list_diff_pair_candidates() -> dict:
         """Auto-detect differential pairs by net name conventions.
 
+        Details:
+
         Recognizes `_P/_N`, `+/-`, and `DP/DM` (USB-style) suffixes. Only
         returns pairs where BOTH members exist on the PCB. Useful before
         autorouting — pairs detected here will be routed coupled by
@@ -575,6 +749,8 @@ def register(mcp) -> None:
     @on_board
     def list_nets() -> dict:
         """List every net on the PCB, with its table index when it has one.
+
+        Details:
 
         KiCAD 10 (board format `20260206`) stores a net as its **name** on each
         pad, track, via and zone — `(net "GND")` — and writes no top-level net
@@ -595,10 +771,17 @@ def register(mcp) -> None:
         """Missing connections (the ratsnest), longest first, from tracks, vias
         and filled zones; each names the closest pad pair. `summary=True`
         returns only `count` and `by_net`; `max_items` caps the list (0 = all);
-        `net` filters one net. `zones_filled=False` means a zone has no fill:
-        the result is pessimistic, re-run after `run_drc(refill_zones=True)`.
+        `net` filters one net. `islands`: copper reaching no pad. Unfilled
+        zones (`zones_filled=False`): re-run after `run_drc(refill_zones=True)`.
 
         Details:
+
+        Each filled polygon is its own island, so a pour cut in two by tracks
+        shows as a missing link. A pad joins a pour only where the fill
+        overlaps the pad outline: a thermal relief without a spoke does not
+        connect. `islands` lists tracks / vias / pour pieces of a net that
+        reach none of its pads (router stubs); DRC counts each as an
+        unconnected item, so `count + island_count` matches its total.
 
         A `.kicad_pcb` says which net each pad belongs to but not whether copper
         actually joins them. This walks tracks, vias and filled zones to find
@@ -616,12 +799,16 @@ def register(mcp) -> None:
         """
         tree, _ = _load_active_pcb()
         result = pcb_netlist.list_unrouted(tree)
+        result.setdefault("islands", [])
         items = result["unrouted"]
         if net:
             wanted = normalize_name(net)
             items = [i for i in items if normalize_name(i["net"]) == wanted]
             result["net"] = net
             result["count"] = len(items)
+            result["islands"] = [i for i in result["islands"]
+                                 if normalize_name(i["net"]) == wanted]
+        result["island_count"] = len(result["islands"])
 
         by_net: dict[str, int] = {}
         for item in items:
@@ -633,6 +820,7 @@ def register(mcp) -> None:
 
         if summary:
             result["unrouted"] = []
+            result["islands"] = []
             result["omitted"] = len(items)
         elif max_items and len(items) > max_items:
             result["unrouted"] = items[:max_items]
@@ -668,7 +856,8 @@ def register(mcp) -> None:
 
     @on_board
     def list_pads(reference: str = "") -> list[dict]:
-        """Every pad on the board, or only those of one footprint."""
+        """Every pad on the board, or only those of one footprint: position,
+        layers, net, type, shape, size_mm [w, h] (before the pad's rotation)."""
         tree, _ = _load_active_pcb()
         pads = pcb_netlist.list_pads(tree)
         if reference:
@@ -683,6 +872,8 @@ def register(mcp) -> None:
                 "layers": p["layers"],
                 "net": p["net_name"],
                 "type": p["type"],
+                "shape": p.get("shape", ""),
+                "size_mm": p.get("size_mm", []),
             }
             for p in pads
         ]
@@ -816,6 +1007,8 @@ def register(mcp) -> None:
     def add_board(name: str) -> dict:
         """Create an additional `.kicad_pcb` file in the project (multi-board).
 
+        Details:
+
         Useful for projects with several physical boards (main + breakout +
         debugger, for instance). The new board file is registered in the
         project's `boards` list and made the active board.
@@ -875,6 +1068,7 @@ def register(mcp) -> None:
             if not filename.endswith(".kicad_pcb"):
                 filename = f"{filename}.kicad_pcb"
             state.set_active_board(filename)
+        state.remember()
         active_path = state.get_active_board_path()
         return {
             "active_board": state.get_active_board_filename() or "main",
@@ -889,9 +1083,17 @@ def register(mcp) -> None:
         y_mm: float,
         drill_mm: float = 0.4,
         diameter_mm: float = 0.8,
-        net: int = 0,
+        net: str | int = "",
     ) -> dict:
-        """Add a through-hole via from F.Cu to B.Cu."""
+        """Add a through-hole via from F.Cu to B.Cu on `net` (net name as
+        `list_nets` shows it; "" = no net).
+
+        Details:
+
+        `net` may also be a legacy integer index, accepted only on a board
+        that still has a net table (pre-KiCAD 10). A name the board does not
+        know is refused.
+        """
         tree, path = _load_active_pcb()
         ed.add_via(tree, x_mm, y_mm, drill_mm=drill_mm, diameter_mm=diameter_mm, net=net)
         backup = _save_with_backup(tree, path)

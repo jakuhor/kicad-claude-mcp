@@ -163,10 +163,19 @@ def test_list_libraries_returns_per_lib_counts(synthetic_index, monkeypatch):
 def test_search_symbol_tool_returns_ranked_matches(synthetic_index, monkeypatch):
     mcp = _make_mcp_with_lib_tools(monkeypatch, synthetic_index)
     _call(mcp, "index_libraries")
-    res = _call(mcp, "search_symbol", query="esp32-s3")
+    res = _call(mcp, "search_symbol", query="esp32-s3")["hits"]
     assert res
     assert res[0]["lib_id"] == "MiniLib:ESP32_Demo"
     assert "_score" in res[0]
+
+
+def test_search_symbol_says_when_nothing_matches_by_name(synthetic_index, monkeypatch):
+    mcp = _make_mcp_with_lib_tools(monkeypatch, synthetic_index)
+    _call(mcp, "index_libraries")
+    assert "note" not in _call(mcp, "search_symbol", query="esp32")
+    res = _call(mcp, "search_symbol", query="SMCJ24A")
+    assert "note" in res and "SMCJ24A" in res["note"]
+    assert all(h["_match"] == "text" for h in res["hits"])
 
 
 def test_get_symbol_details_includes_pins(synthetic_index, monkeypatch):
@@ -266,20 +275,20 @@ class TestSearchBraceDecoding:
 
     def test_symbol_description_and_keywords_are_decoded(self, monkeypatch):
         mcp = self._mcp(monkeypatch)
-        hit = _call(mcp, "search_symbol", query="bridge rectifier")[0]
+        hit = _call(mcp, "search_symbol", query="bridge rectifier")["hits"][0]
         assert hit["description"] == "Bridge rectifier, AC/DC input"
         assert hit["keywords"] == "diode bridge ac/dc"
 
     def test_symbol_identity_is_left_alone(self, monkeypatch):
         """lib_id goes straight back into add_symbol — decoding it breaks lookup."""
         mcp = self._mcp(monkeypatch)
-        hit = _call(mcp, "search_symbol", query="bridge rectifier")[0]
+        hit = _call(mcp, "search_symbol", query="bridge rectifier")["hits"][0]
         assert hit["lib_id"] == "MiniLib:Bridge{slash}Rect"
         assert hit["name"] == "Bridge{slash}Rect"
 
     def test_footprint_description_and_tags_are_decoded(self, monkeypatch):
         mcp = self._mcp(monkeypatch)
-        hit = _call(mcp, "search_footprint", query="big pad")[0]
+        hit = _call(mcp, "search_footprint", query="big pad")["hits"][0]
         assert hit["description"] == "Big pad, 2/1 aspect"
         assert hit["tags"] == "pad big 2/1"
         assert hit["lib_id"] == "MiniFP:Pad{slash}Big"
@@ -301,7 +310,7 @@ class TestSearchBraceDecoding:
         mcp = FastMCP("test")
         lib_tools.register(mcp)
 
-        hits = _call(mcp, "search_symbol", query="resistor")
+        hits = _call(mcp, "search_symbol", query="resistor")["hits"]
         assert hits
         for hit in hits:
             assert "{" not in hit["lib_id"]
@@ -509,3 +518,36 @@ def test_search_exact_name_ranks_first(synthetic_index):
     assert results[1]["lib_id"] == "MiniLib:Resistor_Wide"  # prefix tier
     ids = [r["lib_id"] for r in results]
     assert len(ids) == len(set(ids))
+
+
+def test_get_symbol_details_groups_repeated_pins():
+    from kicad_claude.tools.library.index import _group_pins
+
+    pins = [{"number": "1", "name": "GND", "type": "power_in"},
+            {"number": "2", "name": "GND", "type": "passive"},
+            {"number": "3", "name": "3V3", "type": "power_in"},
+            {"number": "11", "name": "GND", "type": "passive"},
+            {"number": "14", "name": "GND", "type": "passive"}]
+    assert _group_pins(pins) == [
+        {"number": "1", "name": "GND", "type": "power_in"},
+        {"name": "GND", "type": "passive", "numbers": ["2", "11", "14"]},
+        {"number": "3", "name": "3V3", "type": "power_in"},
+    ]
+
+
+def test_get_symbol_details_gives_pin_sides_and_keeps_unnamed_pins_apart(
+        synthetic_index, monkeypatch):
+    """OP-25: plan a placement before add_symbol; `""` names are not a group."""
+    mcp = _make_mcp_with_lib_tools(monkeypatch, synthetic_index)
+    _call(mcp, "index_libraries")
+    flat = _call(mcp, "get_symbol_details", lib_id="MiniLib:ESP32_Demo", group_pins=False)
+    assert all(p["side"] in ("left", "right", "top", "bottom") and len(p["at"]) == 2
+               for p in flat["pins"])
+    grouped = lib_tools._group_pins([
+        {"number": "1", "name": "", "type": "passive", "side": "right"},
+        {"number": "2", "name": "", "type": "passive", "side": "right"},
+        {"number": "3", "name": "GND", "type": "power_in", "side": "bottom", "at": [0, -5]},
+        {"number": "4", "name": "GND", "type": "power_in", "side": "bottom", "at": [0, -5]},
+    ])
+    assert [g.get("number") or g.get("numbers") for g in grouped] == ["1", "2", ["3", "4"]]
+    assert "at" not in grouped[2]

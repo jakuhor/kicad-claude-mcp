@@ -332,10 +332,13 @@ RAW_WRITERS_ALLOWED = {
     "adapters/design_diff.py",        # git snapshots into a temp folder
     "adapters/digikey.py",            # OAuth token cache
     "adapters/kicad_python.py",       # pad map handed to KiCAD's Python
+    "adapters/render2d.py",           # PNG renders
     "adapters/spice_auto.py",         # generated SPICE decks
     "adapters/spice_backends.py",     # SPICE decks in a temp / fab folder
     "indexer/kicad_libs.py",          # library index cache
+    "state.py",                       # session memory (active project) in the cache
     "templates/blank.py",             # new project / sheet files, refuses to overwrite
+    "tools/pcb/routing.py",           # pour-less board copy in a temp folder (DSN export)
     "tools/sim.py",                   # SPICE driver deck
     "tools/sourcing/bom.py",          # fab BOM / CPL CSV outputs
 }

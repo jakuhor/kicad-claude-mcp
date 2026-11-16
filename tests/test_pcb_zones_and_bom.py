@@ -342,3 +342,55 @@ def test_acceptance_enrich_bom_live(tmp_path: Path):
         assert "LM358" in out
     finally:
         state.clear_active()
+
+
+@pytest.mark.parametrize("mode, token", [
+    ("thermal", None), ("solid", "yes"), ("thru_hole_only", "thru_hole_only"), ("none", "no")])
+def test_add_zone_pad_connection_spelling(blank_project, mode, token):
+    """OP-19: KiCAD writes FULL as `yes`, NONE as `no`, THERMAL not at all."""
+    tree = sch_io.parse_file(blank_project["pcb"])
+    pcb_ed.add_zone(tree, net_name="GND", layer="F.Cu",
+                    polygon_mcp=[(0, 0), (5, 0), (5, 5)],
+                    pad_connection=mode, priority=2)
+    z = sch_io.find_children(tree, "zone")[0]
+    cp = sch_io.find_child(z, "connect_pads")
+    head = [str(v) for v in cp[1:] if not isinstance(v, list)]
+    assert head == ([] if token is None else [token])
+    assert sch_io.find_child(cp, "clearance") is not None
+    assert sch_io.find_child(z, "priority")[1] == 2
+
+
+def test_add_zone_rejects_bad_pad_connection(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    with pytest.raises(ValueError, match="pad_connection"):
+        pcb_ed.add_zone(tree, net_name="GND", layer="F.Cu",
+                        polygon_mcp=[(0, 0), (5, 0), (5, 5)], pad_connection="full")
+
+
+def test_add_zone_tool_takes_pad_connection_and_priority(blank_project, tmp_path, monkeypatch):
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    res = _call(mcp, "add_zone", net="GND", layer="F.Cu",
+                polygon_mm=[[10, 10], [60, 10], [60, 40]],
+                pad_connection="solid", priority=1)
+    assert res["pad_connection"] == "solid" and res["priority"] == 1
+    z = sch_io.find_children(sch_io.parse_file(blank_project["pcb"]), "zone")[0]
+    assert str(sch_io.find_child(z, "connect_pads")[1]) == "yes"
+
+
+@pytest.mark.slow
+def test_solid_zone_round_trips_through_kicad_cli(blank_project, tmp_path):
+    """kicad-cli reads the `connect_pads yes` spelling back unchanged."""
+    import subprocess
+    cli = find_kicad_cli()
+    if cli is None:
+        pytest.skip("kicad-cli not found")
+    tree = sch_io.parse_file(blank_project["pcb"])
+    pcb_ed.set_board_outline(tree, 50, 30)
+    pcb_ed.add_zone(tree, net_name="GND", layer="F.Cu",
+                    polygon_mcp=[(12, 12), (40, 12), (40, 30)],
+                    pad_connection="solid", priority=3)
+    sch_io.write_file(blank_project["pcb"], tree)
+    subprocess.run([str(cli), "pcb", "upgrade", "--force", str(blank_project["pcb"])],
+                   check=True, capture_output=True, stdin=subprocess.DEVNULL)
+    text = Path(blank_project["pcb"]).read_text(encoding="utf-8")
+    assert "(connect_pads yes" in text and "(priority 3)" in text

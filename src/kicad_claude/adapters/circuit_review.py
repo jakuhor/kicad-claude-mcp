@@ -21,7 +21,8 @@ Groups and rules:
            PW-REVPOL (connector supply reaching ICs with no series diode,
            drain-upstream FET or ideal-diode IC), PW-INRUSH (hot-plug peak
            into the input capacitance, USB VBUS > 10 uF, soft-start charge
-           current);
+           current); SW-* (high-side load switch, the data line leaving with
+           its rail, fuse selectivity: `switch_review`);
   analog   AU-BIAS (op-amp input with no DC path), AU-HPF (coupling cap +
            bias resistor corner vs the audio band), AU-BLEED (output
            coupling cap to a connector with no bleed resistor), AU-UNUSED
@@ -440,8 +441,8 @@ USB_VBUS_MAX_C = 10e-6   # USB 2.0 spec 7.2.4.1: at most 10 uF across VBUS at at
 
 def _downstream(nl: Netlist, net: str) -> tuple[set, list]:
     """Nets fed from `net` through series parts up to the first regulator:
-    <= 1 Ohm R, L, ferrite, fuse, jumper, diode, FET channel. Returns (nets,
-    fuse refs on the way)."""
+    <= 1 Ohm R, L, ferrite, fuse, jumper, diode (anode to cathode only), FET
+    channel. Returns (nets, fuse refs on the way)."""
     from kicad_claude.adapters.dc_model import switch_dies
 
     seen, frontier, fuses = {net}, [net], []
@@ -457,6 +458,10 @@ def _downstream(nl: Netlist, net: str) -> tuple[set, list]:
                         k == "R" and (parse_value(nl.components[ref]["value"]) or 1e9) <= 1.0):
                     if k == "D" and is_clamp(nl, ref, {}):
                         continue
+                    if k == "D":
+                        ends = _diode_ends(nl, ref)
+                        if ends and ends[0] != n:
+                            continue  # reverse biased from this side: no charge flows
                     outs = [other_end(nl, ref, n)]
                     if k in ("F", "FU"):
                         fuses.append(ref)
@@ -574,6 +579,25 @@ def check_inrush(nl: Netlist, findings: list, specs: dict, volts: dict, pt: dict
     return {"entries": entries, "regulator_outputs": regs_out}
 
 
+_SUPPLY_NET_RE = re.compile(r"\+.*|-\d.*|VBUS.*|VIN.*|VCC.*|VDD.*|VBAT.*|PWR.*|V\d+V\d*|"
+                            r"\d+V\d*.*", re.I)
+
+
+def _supply_net(nl: Netlist, net: str) -> bool:
+    """A rail by name (+3V3, VIN, 24V_IN, ...) or one fuse / ferrite / inductor
+    away from one (a jack's pin before its input fuse)."""
+    def named(n: str) -> bool:
+        return bool(_SUPPLY_NET_RE.fullmatch(n.rsplit("/", 1)[-1]))
+    if named(net):
+        return True
+    for p in nl.nets.get(net, []):
+        if kind(p.ref) in ("F", "FU", "FB", "L") and len(nl.pins.get(p.ref, [])) == 2:
+            other = other_end(nl, p.ref, net)
+            if other and named(other):
+                return True
+    return False
+
+
 def check_esd_audit(nl: Netlist, findings: list, specs: dict, internal: set) -> list[dict]:
     """Every external connector's signal nets (not supply, not ground)."""
     out = []
@@ -583,7 +607,8 @@ def check_esd_audit(nl: Netlist, findings: list, specs: dict, internal: set) -> 
             continue
         sig = sorted({p.net for p in nl.pins.get(j, []) if not is_ground(p.net)
                       and not is_unconnected(p.net)
-                      and not re.fullmatch(r"VBUS|VIN|V\+|VCC|PWR|SHIELD|\+?\d+V\d*", pn(p))})
+                      and not re.fullmatch(r"VBUS|VIN|V\+|VCC|PWR|SHIELD|\+?\d+V\d*", pn(p))
+                      and not _supply_net(nl, p.net)})
         if not sig:
             continue
         bare = [n for n in sig if not clamped(nl, n, specs)]
@@ -1429,6 +1454,11 @@ def analyze(nl: Netlist, pt: dict, specs: dict | None = None, groups: tuple = GR
         res["sequencing"] = check_sequencing(nl, findings, pt)
         res["reset"] = check_reset(nl, findings)
         res["feedback"] = check_feedback(nl, findings, pt, specs, fb_z_max)
+        from kicad_claude.adapters import switch_review
+        res["load_switches"] = switch_review.check_load_switches(nl, findings, specs, volts)
+        res["switched_data"] = switch_review.check_data_enables(nl, findings, specs,
+                                                                res["load_switches"])
+        res["fuse_selectivity"] = switch_review.check_fuse_selectivity(nl, findings, specs)
     if "analog" in groups:
         res["opamps"] = check_audio(nl, findings, specs, audio_f_low_hz)
         res["converters"] = check_converters(nl, findings, specs)

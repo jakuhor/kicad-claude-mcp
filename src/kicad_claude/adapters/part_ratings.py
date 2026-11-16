@@ -66,6 +66,9 @@ from kicad_claude.adapters.power_review import (
 LED_RE = re.compile(r"\bLED\b|LED_|_LED", re.I)
 
 
+GENERIC_TJ_MAX = 125.0  # C: commercial silicon; used only when no Tj max is extracted
+
+
 def _f(sev: str, rule: str, ref: str, msg: str, **kw) -> dict:
     return {"severity": sev, "rule": rule, "ref": ref, "message": msg, **kw}
 
@@ -190,6 +193,32 @@ def rail_currents(nl: Netlist, pt: dict, loads: dict, efficiency: dict | None = 
         rio[r["name"]] = rec
         return rec["iin"] or 0.0
 
+    # A load on a net the power tree does not hold (behind a load switch, an
+    # output fuse) is carried through its series path to the nearest rail;
+    # the parts on that path are checked at that current.
+    tree_rails: set[str] = set()
+
+    def walk(node: dict) -> None:
+        tree_rails.add(node["rail"])
+        for rr in node["regulators"]:
+            if "output" in rr:
+                walk(rr["output"])
+        for ch in node["linked"]:
+            walk(ch)
+    for t in pt["tree"]:
+        walk(t)
+    switched, stranded = [], []
+    for n, amps in list(load.items()):
+        if n in tree_rails or not tree_rails:
+            continue
+        path = _path_to(nl, n, tree_rails, specs or {})
+        del load[n]
+        if path is None:
+            stranded.append(n)
+            continue
+        load[path["to"]] += amps
+        switched.append({"net": n, "current": amps, **path})
+
     roots = list(pt["tree"])
     for t in roots:
         node_i(t)
@@ -211,6 +240,7 @@ def rail_currents(nl: Netlist, pt: dict, loads: dict, efficiency: dict | None = 
                     "iin": extra, "p_loss": abs(vn) * rails[n] * (1 - eta) / eta,
                     "topology": "switching (internal stage)"})
     return {"rails": rails, "regulators": rio, "links": links, "loads": dict(load),
+            "switched_loads": switched, "loads_stranded": stranded,
             "loads_unresolved": unresolved, "assumed_eta": sorted(set(assumed)),
             "default_eta": default_eta,
             "internal_roots": [k.split(":", 1)[1] for k in rio if ":" in k]}
@@ -230,6 +260,7 @@ def _fet_dies(nl: Netlist, ref: str) -> list[tuple[str, str]]:
 
 
 POWER_PIN_RE = re.compile(r"VBUS|VIN|VCC|VDD|PWR|POWER|^V\+|^\+|^\d+V", re.I)
+POWER_PART_RE = re.compile(r"barrel|DC.?jack|power.?jack|DC power", re.I)
 
 
 def _power_entry(nl: Netlist, net: str) -> dict[str, list[str]]:
@@ -240,8 +271,14 @@ def _power_entry(nl: Netlist, net: str) -> dict[str, list[str]]:
     for p in nl.nets.get(net, []):
         if kind(p.ref) in ("J", "P", "CN"):
             by[p.ref].append(p)
+
+    def power_part(ref: str) -> bool:  # a barrel jack's pins carry no names
+        c = nl.components.get(ref, {})
+        return bool(POWER_PART_RE.search(f"{c.get('lib_id', '')} {c.get('value', '')} "
+                                         f"{c.get('description', '')}"))
     return {r: [p.number for p in ps] for r, ps in by.items()
-            if len(ps) >= 2 or any(POWER_PIN_RE.search(p.name or "") for p in ps)}
+            if len(ps) >= 2 or any(POWER_PIN_RE.search(p.name or "") for p in ps)
+            or power_part(r)}
 
 
 def _hops(nl: Netlist, ref: str, specs: dict) -> tuple[str, list[tuple[str, str]]]:
@@ -269,6 +306,36 @@ def _hops(nl: Netlist, ref: str, specs: dict) -> tuple[str, list[tuple[str, str]
         ends = _two_terminal(nl, ref)
         return "diode", [ends] if ends else []
     return "", []
+
+
+def _path_to(nl: Netlist, start: str, targets: set, specs: dict) -> dict | None:
+    """Shortest series path (the hops `series_chain` takes) from `start` to
+    any net in `targets`: {"to": net, "parts": [{ref, kind, from, to, dnp}]}."""
+    prev: dict[str, tuple[str, str, str] | None] = {start: None}
+    frontier = [start]
+    while frontier:
+        nxt = []
+        for n in frontier:
+            for p in nl.nets.get(n, []):
+                pk, hops = _hops(nl, p.ref, specs)
+                for a, c in hops:
+                    if n not in (a, c) or is_ground(a) or is_ground(c):
+                        continue
+                    o = c if a == n else a
+                    if o in prev or is_unconnected(o):
+                        continue
+                    prev[o] = (n, p.ref, pk)
+                    if o in targets:
+                        parts, m = [], o
+                        while prev[m]:
+                            q, ref, kd = prev[m]
+                            parts.append({"ref": ref, "kind": kd, "from": m, "to": q,
+                                          "dnp": nl.components.get(ref, {}).get("dnp", False)})
+                            m = q
+                        return {"to": o, "parts": parts[::-1]}
+                    nxt.append(o)
+        frontier = nxt
+    return None
 
 
 def series_chain(nl: Netlist, start: str, specs: dict) -> dict:
@@ -439,7 +506,10 @@ def switch_limit(rec: dict | None) -> tuple | None:
 def check(nl: Netlist, pt: dict, specs: dict, loads: dict, efficiency: dict | None = None,
           default_eta: float = 0.85, ambient_c: float | None = None,
           fsw: dict | None = None, tj_margin_c: float | None = None,
-          profile: str = "commercial", sleep_states: dict | None = None) -> dict:
+          profile: str = "commercial", sleep_states: dict | None = None,
+          rth_ja: dict | None = None) -> dict:
+    """`rth_ja`: caller's junction-to-ambient C/W per ref; it wins over the
+    extracted datasheet and the package-typical value (`rth_source: caller`)."""
     from kicad_claude.adapters import derating as drt
 
     findings: list[dict] = []
@@ -459,7 +529,9 @@ def check(nl: Netlist, pt: dict, specs: dict, loads: dict, efficiency: dict | No
         rth = dss.rated(rec, "thermal", "rth_ja", prefer="typ")
         tjm = dss.rated(rec, "thermal", "tj_max") or dss.rated(rec, "absolute_max", "TJ")
         row = {"ref": ref, "what": what, "p_w": round(p_w, 4)}
-        if rth:
+        if ref in (rth_ja or {}):
+            rth_v, rth_src = float(rth_ja[ref]), "caller"
+        elif rth:
             rth_v, rth_src = rth[0], f"datasheet {_src(rec, rth[1])}"
         else:
             pkg = thermal_pkg.classify((nl.components.get(ref) or {}).get("footprint", ""))
@@ -473,6 +545,7 @@ def check(nl: Netlist, pt: dict, specs: dict, loads: dict, efficiency: dict | No
             src = f"rth_ja {rth_v:g} C/W {rth_src}, Tj max {tjm[0]:g} C"
             note = (" rth_ja is a package-typical estimate, not this part's datasheet: "
                     "extract its thermal data to confirm." if assumed else
+                    "" if rth_src == "caller" else
                     " rth_ja is the datasheet's JEDEC board, not this layout.")
             if tj > tjm[0]:
                 findings.append(_f("warning" if assumed else "error", "RT-TJ", ref,
@@ -487,6 +560,13 @@ def check(nl: Netlist, pt: dict, specs: dict, loads: dict, efficiency: dict | No
             if rth_v is not None:
                 tj = ta + rth_v * p_w
                 row.update(tj_c=round(tj, 1), rth_ja=rth_v, rth_source=rth_src)
+                if tj > GENERIC_TJ_MAX:
+                    # No Tj max on file, but past any common silicon limit.
+                    findings.append(_f("warning", "RT-TJ", ref,
+                                       f"{what}: {p_w:.3g} W -> Tj {tj:.0f} C at Ta {ta:g} C "
+                                       f"(rth_ja {rth_v:g} C/W {rth_src}), above "
+                                       f"{GENERIC_TJ_MAX:g} C, the usual Tj max; no Tj max "
+                                       "extracted for this part.", rth_source=rth_src))
             nodata[ref] = (f"{what} {p_w:.3g} W, no "
                            + ("Tj max" if rth_v is not None else "rth_ja / Tj max")
                            + " extracted")
@@ -626,21 +706,13 @@ def check(nl: Netlist, pt: dict, specs: dict, loads: dict, efficiency: dict | No
             ind[ref] = {"regulator": None, "carries": "series", "i_avg": amps, "i_peak": amps,
                         "ripple_pp": None}
 
-    # root rails up to the connector
-    chains = {}
-    for t in pt["tree"]:
-        n = t["rail"]
-        i = rails.get(n, 0.0)
-        if not i:
-            continue
-        ch = series_chain(nl, n, specs)
-        chains[n] = {"current": i, **ch}
-        for part in ch["parts"]:
+    def check_parts(n: str, i: float, parts: list) -> None:
+        for part in parts:
             if part["kind"] in ("inductor", "cmc") and part["ref"] not in ind:
                 ind[part["ref"]] = {"regulator": None, "carries": "series", "i_avg": i,
                                     "i_peak": i, "ripple_pp": None, "cmc": part["kind"] == "cmc"}
         dies = defaultdict(int)
-        for part in ch["parts"]:
+        for part in parts:
             if part["kind"] == "fet":
                 dies[part["ref"]] += 1
         for ref, ndie in dies.items():
@@ -662,7 +734,7 @@ def check(nl: Netlist, pt: dict, specs: dict, loads: dict, efficiency: dict | No
             if idr and i > idr[0]:
                 findings.append(_f("error", "RT-FET-ID", ref, f"{i:.3g} A above ID {idr[0]:g} A "
                                    f"({_src(rec, idr[1])})."))
-        for part in ch["parts"]:
+        for part in parts:
             if part["kind"] != "diode":
                 continue
             rec = specs.get(part["ref"])
@@ -674,9 +746,20 @@ def check(nl: Netlist, pt: dict, specs: dict, loads: dict, efficiency: dict | No
                                    f"{ifr[0]:g} A ({_src(rec, ifr[1])})."))
             if vf:
                 therm(part["ref"], vf[0] * i, f"series diode at {i:.3g} A, VF {vf[0]:g} V")
-        for part in ch["parts"]:
+        for part in parts:
             if part["kind"] == "fuse" and not part["dnp"]:
                 check_fuse(nl, specs, part["ref"], i, n, findings, nodata)
+
+    # root rails up to the connector
+    chains = {}
+    for t in pt["tree"]:
+        n = t["rail"]
+        i = rails.get(n, 0.0)
+        if not i:
+            continue
+        ch = series_chain(nl, n, specs)
+        chains[n] = {"current": i, **ch}
+        check_parts(n, i, ch["parts"])
         for cref, pins in ch["connectors"].items():
             rec = specs.get(cref)
             ir = dss.rated(rec, "electrical", "I_rated", "I_contact", prefer="max")
@@ -700,6 +783,12 @@ def check(nl: Netlist, pt: dict, specs: dict, loads: dict, efficiency: dict | No
                                        f"({_src(rec, ir[1])})."))
             if not (ir or tot):
                 nodata[cref] = f"{i:.3g} A over {len(pins)} contacts, no I_rated extracted"
+
+    for sw in model["switched_loads"]:
+        check_parts(sw["net"], sw["current"], sw["parts"])
+    for n in model["loads_stranded"]:
+        findings.append(_f("info", "RT-LOAD-PATH", n, f"Load on {n} reaches no rail of the "
+                           "power tree through series parts: its current is not modelled."))
 
     for lref, x in sorted(ind.items()):
         base = lref.split(".")[0]
@@ -814,13 +903,15 @@ def check(nl: Netlist, pt: dict, specs: dict, loads: dict, efficiency: dict | No
     return {"assumptions": {"ambient_c": ta, "ambient_source": "caller" if ambient_c is not None
                             else "default 40 C (pass ambient_c)",
                             "derating_profile": profile, "tj_margin_c": tj_margin_c,
+                            "rth_ja_caller": dict(rth_ja or {}),
                             "efficiency_default": default_eta,
                             "efficiency_assumed_for": model["assumed_eta"],
                             "loads": model["loads"], "loads_unresolved": model["loads_unresolved"]},
             "rail_currents": {n: round(i, 4) for n, i in sorted(rails.items()) if i},
             "regulators": {k: rnd(v) for k, v in rio.items()},
             "inductors": {k: rnd(v) for k, v in sorted(ind.items())},
-            "input_paths": chains, "thermal": rows, "leds": leds,
+            "input_paths": chains, "switched_loads": model["switched_loads"],
+            "thermal": rows, "leds": leds,
             "dissipation": dissipation,
             "power_budget": power_budget(pt, model),
             "sleep_current": sleep_current(nl, pt, specs, sleep_states, efficiency, default_eta),

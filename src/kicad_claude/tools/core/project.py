@@ -128,6 +128,7 @@ def register(mcp) -> None:
         target = Path(path).expanduser().resolve()
         files = write_blank_project(target, name)
         proj = state.set_active(target, name)
+        state.remember()
         logger.info("created project %s at %s", name, target)
         return {
             "path": str(target),
@@ -142,6 +143,7 @@ def register(mcp) -> None:
         """Make an existing project active. Path: its directory or any project file."""
         directory, name = _resolve_project_dir_and_name(project_path)
         proj = state.set_active(directory, name)
+        state.remember()
         logger.info("active project: %s at %s", name, directory)
         return {"active": True, **_summarize(proj)}
 

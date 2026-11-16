@@ -157,6 +157,43 @@ def _summary(index: dict[str, Any], from_cache: bool) -> dict[str, Any]:
 READABLE_FIELDS = ("description", "keywords", "tags", "datasheet", "default_footprint")
 
 
+def _group_pins(pins: list[dict]) -> list[dict]:
+    """Merge pins with the same name, type, shape and side into one entry
+    carrying `numbers`, in first-seen order; a lone pin keeps `number`.
+    Unnamed pins (`""`, `~`) are never merged: they are different pins.
+    A grouped entry drops `at` (one position per pin)."""
+    groups: dict[tuple, dict] = {}
+    for pin in pins:
+        if pin.get("name") in ("", "~", None):
+            groups[("#", len(groups))] = dict(pin)
+            continue
+        key = (pin.get("name"), pin.get("type"), pin.get("shape"), pin.get("side"))
+        g = groups.get(key)
+        if g is None:
+            groups[key] = dict(pin)
+        else:
+            if "numbers" not in g:
+                g["numbers"] = [g.pop("number")]
+                g.pop("at", None)
+            g["numbers"].append(pin.get("number"))
+    return list(groups.values())
+
+
+def _search_result(query: str, hits: list[dict], kind: str) -> dict:
+    """Wrap search hits; say so plainly when none matched by name."""
+    out: dict = {"hits": hits}
+    if not any(h.get("_match") in ("name", "family") for h in hits):
+        out["note"] = (
+            f"no {kind} is named like {query!r}: " +
+            ("the hits match description words only and are often unrelated. "
+             if hits else "nothing matched. ") +
+            ("Use a generic symbol (Device:D_TVS, Device:D_Zener, "
+             "Transistor_FET:Q_PMOS_SGD, ...) with the part number as Value, "
+             "or create_symbol." if kind == "symbol" else
+             "Search the package name (SOT-23-5, SOIC-8, ...) or create_footprint."))
+    return out
+
+
 def _decode_readable(entry: dict) -> dict:
     """Return `entry` with its prose fields brace-decoded, identity untouched."""
     out = dict(entry)
@@ -244,33 +281,51 @@ def register(mcp) -> None:
         }
 
     @mcp.tool()
-    def search_symbol(query: str, max_results: int = 10) -> list[dict]:
-        """Fuzzy search across indexed symbols by lib_id, description, keywords.
+    def search_symbol(query: str, max_results: int = 10) -> dict:
+        """Fuzzy search across indexed symbols: `{"hits": [...]}`, each with
+        `_score` and `_match` (name / family / text); `note` when no hit
+        matches by name or family.
 
-        Returns up to `max_results` ranked matches. Each entry includes
-        `_score` (0–100) so the caller can judge match confidence.
+        Details:
+
+        Searches lib_id, description and keywords. `_match`: "name" (the
+        query is in the symbol name), "family" (only a shorter prefix
+        matched: same series, not that part) or "text" (description words;
+        often unrelated). `_score` is 0-100.
         """
         idx = _ensure_index()
-        return [
+        return _search_result(query, [
             _decode_readable(e)
             for e in search_symbols(query, idx, max_results=max_results)
-        ]
+        ], "symbol")
 
     @mcp.tool()
-    def search_footprint(query: str, max_results: int = 10) -> list[dict]:
-        """Fuzzy search across indexed footprints by lib_id, description, tags."""
+    def search_footprint(query: str, max_results: int = 10) -> dict:
+        """Fuzzy search across indexed footprints by lib_id, description,
+        tags: `{"hits": [...]}` with `_score` / `_match` as `search_symbol`,
+        and `note` when no hit is a name or family match."""
         idx = _ensure_index()
-        return [
+        return _search_result(query, [
             _decode_readable(e)
             for e in search_footprints(query, idx, max_results=max_results)
-        ]
+        ], "footprint")
 
     @mcp.tool()
-    def get_symbol_details(lib_id: str) -> dict:
-        """Return full metadata and pin list for a symbol by `lib_id`.
+    def get_symbol_details(lib_id: str, group_pins: bool = True) -> dict:
+        """Metadata and pins of a symbol by `lib_id`, each with the body
+        `side` it sits on (plan placement before `add_symbol`). Pins sharing
+        name, type, shape and side are one entry with `numbers`;
+        `group_pins=False` lists each pin with its library `at` [x, y].
+
+        Details:
 
         Re-parses the source `.kicad_sym` to extract pins (number, name,
-        electrical type, shape) — the index only stores pin counts.
+        electrical type, shape, side, library position) — the index only
+        stores pin counts. `pin_count` stays the number of pins, grouped or
+        not. `shape` is omitted when "line". `side` is for the symbol as
+        drawn in the library (rotation 0, no mirror); `at` is in library
+        coordinates, Y up, relative to the symbol origin. Unnamed pins are
+        never grouped.
         """
         idx = _ensure_index()
         meta = idx["symbols"].get(lib_id)
@@ -289,4 +344,9 @@ def register(mcp) -> None:
             if isinstance(pin.get("name"), str) else pin
             for pin in pins
         ]
+        for pin in pins:
+            if pin.get("shape") == "line":
+                del pin["shape"]
+        if group_pins:
+            pins = _group_pins(pins)
         return {**_decode_readable(meta), "pins": pins}

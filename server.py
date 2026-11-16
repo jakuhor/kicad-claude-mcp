@@ -33,6 +33,14 @@ def ping() -> str:
 
 toolset_manager = toolsets.install(mcp)
 
+# The active project survives a restart (`/mcp` reconnect), per working dir.
+from kicad_claude import state  # noqa: E402
+from kicad_claude.utils.kicad_paths import cache_dir  # noqa: E402
+
+state.enable_session(cache_dir() / "session.json")
+if (restored := state.restore()) is not None:
+    logger.info("restored active project %s", restored.name)
+
 # Unknown keyword arguments must fail loudly, not be dropped (defect 2).
 install_strict_args(mcp)
 

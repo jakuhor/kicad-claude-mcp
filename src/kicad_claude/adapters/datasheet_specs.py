@@ -77,6 +77,9 @@ Conventional keys the analyzers read (use these names):
   - fuse / PTC: electrical.I_hold (PTC: largest current that never
     trips), I_trip (PTC: smallest current that always trips), I_rated
     (fuse); absolute_max.V;
+    I2t (melting I²t, unit "A2s") for fuse selectivity;
+  - mosfet: absolute_max.VGS (V_GSS), VDS, ID; electrical.RDS_on (its
+    conditions name the gate drive, "VGS = -10 V"), VGS_th;
   - every part with a die: thermal.rth_ja, thermal.tj_max; psi_jb (or
     rth_jb) when the thermal table gives it (board temperature next to it);
   - opamp: electrical.GBW, SR, Aol (dB or V/V; with GBW it gives the
@@ -114,7 +117,7 @@ from kicad_claude.adapters import datasheet_index as dsi
 SCHEMA_VERSION = 1
 SPECS_DIR = "specs"
 UNITS = {"V", "A", "W", "Hz", "s", "Ohm", "F", "H", "C", "C/W", "%", "dB", "V/s",
-         "A/s", "V/V", "A/V", "ppm/C", "", "bit", "B", "J", "Wb", "T", "m", "g"}
+         "A/s", "V/V", "A/V", "ppm/C", "", "bit", "B", "J", "Wb", "T", "m", "g", "A2s"}
 CATEGORIES = ("regulator_switching", "regulator_linear", "voltage_reference",
               "opamp", "comparator", "adc", "dac", "codec", "mcu", "interface",
               "pd_controller", "load_switch", "mosfet", "bjt", "diode", "tvs",

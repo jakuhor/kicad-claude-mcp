@@ -22,10 +22,14 @@ DESCRIPTION_MAX = 500
 MENU_DESCRIPTION_MAX = 1300  # load_toolset: one line per set
 TOOL_MAX = 1600
 SET_BUDGET = {  # ~5-10 % above the sizes after the v2.0 merges (2026-11-11)
-    "core": 5000, "sch": 22500, "pcb": 18700, "rules": 5500, "library": 4000,
+    # sch +3500: OP-18 edit_schematic, set_page, autoplace_fields,
+    # check_schematic_readability, label_type / drag / rotation / compact
+    # (measured 25211, + 3 %)
+    "core": 5000, "sch": 26000, "pcb": 18700, "rules": 5500, "library": 4000,
     # review +505: OP-17 A7 derating_profile x2, A3 i2c_mode / i2c_bus_capacitance_pf,
     # A5 source_ohm / inrush_limit_a (measured +481, + 5 %)
-    "review": 9805,
+    # OP-30: review_part_ratings vref / rth_ja (measured 9928, + 0.2 %)
+    "review": 9950,
     "emc_si": 8940,  # +1140: OP-17 B3 analyze_board_thermal (measured 1085, + 5 %)
     "sim": 2800, "datasheets": 3300,
     "sourcing": 5800, "fab": 2600,
@@ -282,6 +286,8 @@ def test_argument_literals_match_the_adapters():
     from kicad_claude.adapters import derating
     assert get_args(at.DeratingProfile) == derating.PROFILE_NAMES
     assert get_args(at.Source) == sourcing.SOURCE_NAMES
+    from kicad_claude.adapters import pcb_editor
+    assert get_args(at.ZonePadConnection) == pcb_editor.PAD_CONNECTIONS
 
 
 def test_list_arguments_are_lists(everything):

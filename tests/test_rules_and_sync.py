@@ -267,6 +267,34 @@ def test_add_and_assign_net_class(tmp_path: Path, monkeypatch):
     state.clear_active()
 
 
+_QFN_PADS = """(kicad_pcb
+  (footprint "T:U" (layer "F.Cu") (at 20 20)
+    (property "Reference" "U1" (at 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at -0.5 0) (size 0.5 0.8) (layers "F.Cu") (net "VIN"))
+    (pad "2" smd rect (at 0.2 0) (size 0.5 0.8) (layers "F.Cu") (net "GND")))
+)"""
+
+
+def test_net_class_reports_footprints_tighter_than_its_clearance(tmp_path: Path, monkeypatch):
+    """OP-22: U1's own lands are 0.2 mm apart; a 0.25 mm class on VIN flags it."""
+    import sexpdata
+    state.clear_active()
+    files = write_blank_project(tmp_path / "p", "p")
+    state.set_active(tmp_path / "p", "p")
+    tree = sch_io.parse_file(files["pcb"])
+    tree.extend(sexpdata.loads(_QFN_PADS)[1:])
+    sch_io.write_file(files["pcb"], tree)
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    res = _call(mcp, "add_net_class", name="Power", clearance_mm=0.25)
+    assert "tight_footprints" not in res          # no nets assigned yet
+    res = _call(mcp, "assign_net_class", net_pattern="VIN", class_name="Power")
+    assert res["tight_footprints"] == [
+        {"ref": "U1", "pads": ["1", "2"], "nets": ["VIN", "GND"], "gap_mm": 0.2}]
+    res = _call(mcp, "add_net_class", name="Power", clearance_mm=0.2)
+    assert "tight_footprints" not in res
+    state.clear_active()
+
+
 def test_annotate_schematic_tool(tmp_path: Path, monkeypatch):
     _build_sch_with_unannotated_resistors(tmp_path)
     mcp = _make_mcp(monkeypatch, tmp_path)
@@ -477,6 +505,32 @@ class TestComponentSync:
         assert ped._footprint_property(r1, "Value") == "10k"
         assert any(c["reference"] == "R1" and "MPN" in c["fields"] for c in changed)
         # Idempotent: a second pass has nothing left to write.
+        assert sc.sync_footprint_fields(tree, components) == []
+
+    def test_bom_dnp_and_board_flags_follow_the_symbol(self, project):
+        """OP-21: KiCAD's update copies in_bom / dnp / exclude_from_sim onto the
+        footprint `attr` (DRC parity compares them) and skips on_board=no."""
+        from kicad_claude.adapters import pcb_editor as ped
+        from kicad_claude.tools.pcb import layout as pcb_tools
+        from kicad_claude.adapters import sch_sync as sc
+
+        mcp = self._mcp()
+        self._build_schematic(mcp)
+
+        def call(_tool, **kw):
+            return mcp._tool_manager.get_tool(_tool).fn(**kw)
+
+        call("set_symbol_flags", reference="R1", in_bom=False, dnp=True)
+        call("set_symbol_flags", reference="C1", on_board=False)
+        tree = sch_io.parse_file(project / "s.kicad_pcb")
+        components = sc.collect_schematic_components([project / "s.kicad_sch"])
+        assert set(components) == {"R1"}
+        sc.place_missing_footprints(tree, components, pcb_tools._resolve_footprint)
+        changed = sc.sync_footprint_fields(tree, components)
+        r1 = ped.find_footprint_by_reference(tree, "R1")
+        assert [str(t) for t in sch_io.find_child(r1, "attr")[1:]] == [
+            "smd", "exclude_from_bom", "dnp"]
+        assert "attr:dnp" in changed[0]["fields"]
         assert sc.sync_footprint_fields(tree, components) == []
 
     def test_orphans_are_listed_and_only_removed_on_request(self, project):

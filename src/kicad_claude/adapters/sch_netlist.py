@@ -175,12 +175,14 @@ def pins_of_instance(tree: list, s_node: list) -> list[dict]:
                 continue
         lx, ly, _ = ed._pin_local_at(pin_node)
 
-        # Library coords are Y down, like the sheet. Mirror first, then rotate.
-        if mirror_axis == "y":
-            lx = -lx
-        elif mirror_axis == "x":
-            ly = -ly
+        # Rotate, then mirror the rotated vector: KiCAD composes the mirror
+        # after the rotation (SCH_SYMBOL::SetOrientation), which matters at
+        # 90 / 270.
         rx, ry = ed.rotate_xy(lx, ly, srot)
+        if mirror_axis == "y":
+            rx = -rx
+        elif mirror_axis == "x":
+            ry = -ry
         px, py = sx + rx, sy - ry
 
         number, name = ed._pin_id(pin_node)
@@ -284,7 +286,12 @@ def build_sheet_graph(tree: list) -> dict:
         ref = ed.get_symbol_property(s_node, "Reference") or "?"
         is_power = _is_power_symbol(tree, s_node)
         value = ed.get_symbol_property(s_node, "Value") or ""
-        for pin in pins_of_instance(tree, s_node):
+        instance_pins = pins_of_instance(tree, s_node)
+        ref_unit = ref + _unit_suffix(tree, s_node)
+        name_count: dict[str, int] = {}
+        for pin in instance_pins:
+            name_count[pin["name"]] = name_count.get(pin["name"], 0) + 1
+        for pin in instance_pins:
             p = pin["point"]
             uf.add(p)
             # No mid-wire union: KiCAD connects a pin only at a wire endpoint
@@ -295,6 +302,10 @@ def build_sheet_graph(tree: list) -> dict:
                     "pin": pin["number"],
                     "pin_name": pin["name"],
                     "power": is_power,
+                    # Internal, for naming and dangling checks; not reported.
+                    "_type": pin.get("type", ""),
+                    "_dup_name": name_count[pin["name"]] > 1,
+                    "_ref_unit": ref_unit,
                 }
             )
             # Global power port: power symbol + power_in pin (KiCAD's
@@ -367,19 +378,43 @@ def build_sheet_graph(tree: list) -> dict:
 def _generated_name(members: list[dict], connected: bool) -> str:
     """KiCAD's fallback name for an unlabelled net.
 
-    KiCAD writes `Net-(R1-Pad1)` for a real net and `unconnected-(P8-Pad1)` for
-    a pin that reaches nothing else. The tag is the pin's name, or `Pad<number>`
-    when the name carries nothing extra — empty, `~`, or just the pin number
-    repeated.
+    KiCAD's `SCH_PIN::GetDefaultNetName`: `<prefix>-(<ref>[-<name>][-Pad<n>])`.
+    The name is left out when it carries nothing (empty, `~`, the number
+    repeated). `-Pad<n>` is added when there is no name, when the pin is
+    unconnected, or when the part has several pins of that name — so
+    `unconnected-(U5-NC-Pad4)` and `unconnected-(U5-NC-Pad7)` stay two nets.
     """
     if not members:
         return "unconnected"
     first = sorted(members, key=lambda m: (m["ref"], m["pin"]))[0]
     name = first["pin_name"]
     meaningful = name not in ("", "~") and name != first["pin"]
-    tag = name if meaningful else f"Pad{first['pin']}"
+    tag = name if meaningful else ""
+    if not meaningful or not connected or first.get("_dup_name"):
+        tag = f"{tag}-Pad{first['pin']}" if tag else f"Pad{first['pin']}"
     prefix = "Net" if connected else "unconnected"
-    return f"{prefix}-({first['ref']}-{tag})"
+    # A named pin repeats across units: KiCAD writes the unit letter then.
+    ref = first.get("_ref_unit", first["ref"]) if meaningful else first["ref"]
+    return f"{prefix}-({ref}-{tag})"
+
+
+def _unit_suffix(tree: list, s_node: list) -> str:
+    """KiCAD's unit letter (A, B, …, Z, AA, …) of a multi-unit part, else ""."""
+    lib_id = find_child(s_node, "lib_id")
+    lib = ed.find_lib_symbol_def(tree, str(lib_id[1])) if lib_id and len(lib_id) > 1 else None
+    if lib is None:
+        return ""
+    units = {u for c in find_children(lib, "symbol") if len(c) > 1
+             and (u := _unit_of(str(c[1]))) not in (None, 0)}
+    if len(units) < 2:
+        return ""
+    unit_node = find_child(s_node, "unit")
+    n = int(unit_node[1]) if unit_node and len(unit_node) > 1 else 1
+    letters = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        letters = chr(ord("A") + r) + letters
+    return letters
 
 
 def build_sheet_nets(tree: list, path: Path | None = None) -> SheetNets:
@@ -460,7 +495,14 @@ def _name_for(data: dict) -> str:
         return sorted(p["name"] for p in data["sheet_ports"])[0]
     # One pin and nothing else: KiCAD calls that unconnected, and still lists it.
     real = [p for p in data["pins"] if not p["power"]]
-    return _generated_name(data["pins"], connected=len(real) > 1)
+    connected = len(real) > 1
+    if not real:
+        return _generated_name(data["pins"], connected=connected)
+    # KiCAD's `compareDrivers` among pins: a name holding "-Pad" (a pin with
+    # no useful name) loses, then the smaller name wins — so a named IC pin
+    # beats a capacitor's pad: `Net-(U1-VCC)`, not `Net-(C6-Pad1)`.
+    names = [_generated_name([p], connected=connected) for p in real]
+    return min(names, key=lambda n: ("-Pad" in n, n))
 
 
 def _find_dangling(graph: dict, members: dict, path: Path | None) -> list[dict]:
@@ -482,6 +524,8 @@ def _find_dangling(graph: dict, members: dict, path: Path | None) -> list[dict]:
                 out.append({"kind": "wire_end", "position_mm": list(p), "sheet": sheet})
         elif attached == 1 and len(data.get("pins", [])) == 1:
             pin = data["pins"][0]
+            if pin.get("_type") == "no_connect":
+                continue  # a no-connect pin is meant to stay open; ERC agrees
             out.append(
                 {
                     "kind": "pin",
@@ -491,6 +535,23 @@ def _find_dangling(graph: dict, members: dict, path: Path | None) -> list[dict]:
                     "sheet": sheet,
                 }
             )
+
+    # A wire end with nothing on it, on a wire whose other end is connected.
+    # ERC's `unconnected_wire_endpoint`: the group test above only catches a
+    # wire that carries nothing at all.
+    reported = {tuple(i["position_mm"]) for i in out if i["kind"] == "wire_end"}
+    segments = graph["segments"]
+    for idx, (start, end, _node) in enumerate(segments):
+        for e in (start, end):
+            if e in reported:
+                continue
+            if e in graph["pins"] or e in graph["labels"] or e in graph["sheet_ports"]                     or e in graph["no_connects"]:
+                continue
+            if any(j != idx and (e in (s2, e2) or _on_segment(e, s2, e2))
+                   for j, (s2, e2, _n) in enumerate(segments)):
+                continue
+            reported.add(e)
+            out.append({"kind": "wire_end", "position_mm": list(e), "sheet": sheet})
     return out
 
 

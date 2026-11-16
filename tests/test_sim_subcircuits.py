@@ -264,6 +264,17 @@ def test_opamp_vendor_model(tmp_path):
     assert "vendor: OPTEST" in next(f["message"] for f in r["findings"] if f["ref"] == "U1")
 
 
+def test_subckt_without_ends_is_named(tmp_path):
+    lib = tmp_path / "MMSZ5242B.spice.txt"
+    lib.write_text(".SUBCKT MMSZ5242B 1 2\nD1 1 2 DZ\n.MODEL DZ D(BV=12)\n")
+    with pytest.raises(ValueError, match="has no .ends"):
+        sa.parse_subckt(str(lib))
+    lib.write_text(".SUBCKT A 1 2\nR1 1 2 1\n.SUBCKT B 1 2\nR1 1 2 1\n.ENDS\n")
+    with pytest.raises(ValueError, match="before the next .subckt"):
+        sa.parse_subckt(str(lib), "A")
+    assert sa.parse_subckt(str(lib), "B") == ("B", ["1", "2"])
+
+
 def test_opamp_model_roles_and_errors(tmp_path):
     lib = tmp_path / "x.lib"
     lib.write_text(".subckt A 1 2 3 4 5\n+ PARAMS: X=1\nR1 1 2 1\n.ends\n")

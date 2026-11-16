@@ -222,3 +222,14 @@ def on_sheet(fn):
 def on_board(fn):
     """Give a board-level tool an optional `board` ("main" or a .kicad_pcb file)."""
     return _with_extra_arg(fn, "board", _board)
+
+
+def render_out(out_path: str, stem: str) -> Path:
+    """Where a PNG render goes: `out_path`, else the system temp dir."""
+    import tempfile
+    if out_path:
+        p = Path(out_path).expanduser().resolve()
+    else:
+        p = Path(tempfile.gettempdir()) / "kicad-claude-renders" / f"{stem}.png"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p

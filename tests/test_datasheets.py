@@ -642,3 +642,19 @@ def test_extraction_quality():
     cap = {"mpn": "C1", "category": "capacitor", "electrical": {"C": sv(typ=1e-6, unit="F")},
            "absolute_max": {"V": sv(max=50, unit="V")}}
     assert "pins" not in dss.quality(cap)["parts"]          # passives: no pin table needed
+
+
+def test_aes_encrypted_pdf_is_read(tmp_path, monkeypatch):
+    """OP-36: Panasonic / JST datasheets are AES-encrypted with an empty user
+    password; pypdf needs `cryptography` (pypdf[crypto]) to open them."""
+    import pypdf
+
+    monkeypatch.setattr(dsi, "cache_dir", lambda: tmp_path / "cache")
+    w = pypdf.PdfWriter()
+    w.add_blank_page(width=200, height=200)
+    w.encrypt(user_password="", owner_password="owner", algorithm="AES-256")
+    pdf = tmp_path / "enc.pdf"
+    with open(pdf, "wb") as f:
+        w.write(f)
+    assert pypdf.PdfReader(str(pdf)).is_encrypted
+    assert dsi.pdf_pages(pdf) == [""]          # read, not the [] of a failure

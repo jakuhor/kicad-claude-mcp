@@ -440,3 +440,34 @@ def test_pwr_flag_never_names_a_net(blank_project, tmp_path):
     names = [n for n, e in netlist.build_sheet_nets(tree).nets.items()
              if any(pin["ref"] == "R1" for pin in e["pins"])]
     assert "GND" in names and "PWR_FLAG" not in names
+
+
+# ===== OP-26: generated names follow KiCAD's driver choice ================= #
+
+
+def test_generated_name_prefers_a_named_pin_over_a_pad():
+    members = [
+        {"ref": "C6", "pin": "1", "pin_name": "", "power": False},
+        {"ref": "U1", "pin": "6", "pin_name": "VCC", "power": False},
+    ]
+    data = {"labels": [], "sheet_ports": [], "pins": members}
+    assert netlist._name_for(data) == "Net-(U1-VCC)"
+
+
+@pytest.mark.slow
+def test_every_net_name_matches_kicad_cli(tmp_path):
+    """All names, the `Net-(...)` ones included (multi-unit U1A / U1B)."""
+    import re
+    cli = find_kicad_cli()
+    if cli is None:
+        pytest.skip("kicad-cli not found")
+    out = tmp_path / "n.net"
+    subprocess.run([str(cli), "sch", "export", "netlist", "--format", "kicadsexpr",
+                    "-o", str(out), str(KICAD10_FIXTURE)],
+                   capture_output=True, check=True, stdin=subprocess.DEVNULL)
+    text = out.read_text(encoding="utf-8")
+    theirs = {m.lstrip("/") for m in re.findall(
+        r'\(net\s+\(code "?\d+"?\)\s+\(name "([^"]*)"', text[text.index("(nets"):])}
+    ours = {n.lstrip("/") for n in netlist.build_sheet_nets(
+        sch_io.parse_file(KICAD10_FIXTURE), KICAD10_FIXTURE).nets}
+    assert ours == theirs

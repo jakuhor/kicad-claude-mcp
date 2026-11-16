@@ -570,3 +570,214 @@ def test_remove_board_items_refuses_without_target(blank_project, tmp_path, monk
         _call(mcp, "remove_board_items", uuid="nope")
     with pytest.raises(ValueError, match="unknown kind"):
         _call(mcp, "remove_board_items", net="GND", kinds=["pad"])
+
+
+def test_add_track_and_via_take_a_net_name(blank_project, tmp_path, monkeypatch):
+    """OP-18: the tools pass a net name through; KiCAD 10 stores it by name."""
+    _routed_board(blank_project["pcb"])
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    _call(mcp, "add_track", x1_mm=30, y1_mm=10, x2_mm=40, y2_mm=10, net="GND")
+    _call(mcp, "add_via", x_mm=40, y_mm=10, net="GND")
+    tree = sch_io.parse_file(blank_project["pcb"])
+    assert [ed.net_of(s) for s in sch_io.find_children(tree, "segment")].count("GND") == 3
+    assert [ed.net_of(v) for v in sch_io.find_children(tree, "via")] == ["GND", "GND"]
+    seg = sch_io.find_children(tree, "segment")[-1]
+    assert sch_io.find_child(seg, "net")[1] == "GND"
+
+
+def test_add_track_refuses_unknown_net_and_index_on_kicad10(blank_project, tmp_path, monkeypatch):
+    _routed_board(blank_project["pcb"])
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    with pytest.raises(KeyError, match="not found"):
+        _call(mcp, "add_track", x1_mm=0, y1_mm=0, x2_mm=1, y2_mm=0, net="NOPE")
+    with pytest.raises(KeyError, match="pass the net name"):
+        _call(mcp, "add_via", x_mm=1, y_mm=1, net=3)
+    tree = sch_io.parse_file(blank_project["pcb"])
+    assert len(sch_io.find_children(tree, "segment")) == 3
+
+
+# ===== OP-21: footprint zones live in board coordinates ==================== #
+
+_FP_WITH_ZONE = """(footprint "Z"
+  (layer "F.Cu")
+  (property "Reference" "REF**" (at 0 0) (layer "F.SilkS"))
+  (property "Value" "Z" (at 0 1) (layer "F.Fab"))
+  (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu"))
+  (zone (layers "F.Cu" "B.Cu") (uuid "z1") (name "keepout")
+    (keepout (tracks not_allowed) (vias not_allowed) (pads not_allowed)
+             (copperpour not_allowed) (footprints allowed))
+    (polygon (pts (xy 1 -2) (xy 3 -2) (xy 3 2) (xy 1 2))))
+)"""
+
+
+def _zone_pts(fp):
+    zone = sch_io.find_child(fp, "zone")
+    pts = sch_io.find_child(sch_io.find_child(zone, "polygon"), "pts")
+    return [(float(p[1]), float(p[2])) for p in sch_io.find_children(pts, "xy")]
+
+
+def test_footprint_zone_follows_place_and_move(blank_project):
+    tree = sch_io.parse_file(blank_project["pcb"])
+    fp_def = sexpdata.loads(_FP_WITH_ZONE)
+    fp = ed.add_footprint(tree, qualified_lib_id="T:Z", reference="U1", value="z",
+                          x_mm=40, y_mm=30, fp_def_node=fp_def)
+    assert _zone_pts(fp)[0] == (41.0, 28.0)
+    assert sch_io.find_child(fp, "at")[1:] == [40, 30]  # KiCAD omits angle 0
+    ed.move_footprint(tree, "U1", 10, 10)
+    assert _zone_pts(fp)[0] == (11.0, 8.0)
+    # 90 deg CCW on a Y-down axis: local (1, -2) -> (-2, -1)
+    ed.move_footprint(tree, "U1", 10, 10, rotation=90)
+    assert _zone_pts(fp)[0] == pytest.approx((8.0, 9.0))
+    ed.place_footprints_grid(tree, only_unplaced=False, origin_mcp=(50, 50))
+    assert _zone_pts(fp)[0] == pytest.approx((48.0, 49.0))
+    # The library copy itself stays footprint-local.
+    assert sch_io.find_children(sch_io.find_child(sch_io.find_child(
+        sch_io.find_child(fp_def, "zone"), "polygon"), "pts"), "xy")[0][1:] == [1, -2]
+
+
+def test_set_footprint_attr_flags_keeps_kicad_order(blank_project):
+    fp = sexpdata.loads('(footprint "X" (layer "F.Cu") (attr smd exclude_from_bom) (pad "1" smd rect))')
+    assert ed.set_footprint_attr_flags(fp, {"exclude_from_bom": False, "dnp": True}) == [
+        "exclude_from_bom", "dnp"]
+    assert [str(t) for t in sch_io.find_child(fp, "attr")[1:]] == ["smd", "dnp"]
+    assert ed.set_footprint_attr_flags(fp, {"dnp": True}) == []
+    fp2 = sexpdata.loads('(footprint "X" (layer "F.Cu") (property "Reference" "R") (pad "1" smd rect))')
+    ed.set_footprint_attr_flags(fp2, {"exclude_from_bom": True})
+    heads = [str(c[0]) for c in fp2[2:]]
+    assert heads == ["layer", "property", "attr", "pad"]
+    ed.set_footprint_attr_flags(fp2, {"exclude_from_bom": False})
+    assert sch_io.find_child(fp2, "attr") is None
+
+
+@pytest.mark.slow
+def test_acceptance_footprint_with_keepout_matches_library(tmp_path):
+    """ESP32-C6-MINI-1 carries an antenna keep-out zone: no lib mismatch."""
+    import json
+    cli = find_kicad_cli()
+    mod = Path(r"C:\Program Files\KiCad\10.0\share\kicad\footprints\RF_Module.pretty"
+               r"\ESP32-C6-MINI-1.kicad_mod")
+    if cli is None or not mod.is_file():
+        pytest.skip("kicad-cli / RF_Module library not found")
+    files = write_blank_project(tmp_path / "k", "k")
+    tree = sch_io.parse_file(files["pcb"])
+    ed.set_board_outline(tree, 80, 80)
+    ed.add_footprint(tree, qualified_lib_id="RF_Module:ESP32-C6-MINI-1", reference="U1",
+                     value="x", x_mm=40, y_mm=40, fp_def_node=ed.fetch_footprint_def(mod))
+    ed.move_footprint(tree, "U1", 45, 42, rotation=90)
+    sch_io.write_file(files["pcb"], tree)
+    rep = tmp_path / "drc.json"
+    subprocess.run([str(cli), "pcb", "drc", "--format", "json", "-o", str(rep), str(files["pcb"])],
+                   stdin=subprocess.DEVNULL, capture_output=True, check=False)
+    kinds = [v["type"] for v in json.loads(rep.read_text(encoding="utf-8"))["violations"]]
+    assert "lib_footprint_mismatch" not in kinds
+
+
+# ===== OP-22: edit_board, courtyard and pad size =========================== #
+
+def _mcp_with_batch(monkeypatch, tmp_path):
+    from kicad_claude.tools.pcb import batch as batch_tools
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    batch_tools.register(mcp)
+    return mcp
+
+
+def _two_resistors(mcp):
+    _call(mcp, "add_footprint", lib_id="MiniFP:Mini_R_0603", reference="R1",
+          value="1k", x_mm=20, y_mm=20)
+    _call(mcp, "add_footprint", lib_id="MiniFP:Mini_R_0603", reference="R2",
+          value="1k", x_mm=40, y_mm=20)
+
+
+def test_edit_board_moves_and_routes_in_one_write(blank_project, tmp_path, monkeypatch):
+    mcp = _mcp_with_batch(monkeypatch, tmp_path)
+    _two_resistors(mcp)
+    _routed_board(blank_project["pcb"])   # nets GND / VCC exist on the board
+    res = _call(mcp, "edit_board", ops=[
+        {"op": "move", "ref": "R2", "x_mm": 30, "y_mm": 25, "rotation": 90},
+        {"op": "track", "from": [20, 20], "points": [[25, 20]], "to": [25, 25],
+         "net": "GND", "width_mm": 0.4},
+        {"op": "via", "x_mm": 25, "y_mm": 25, "net": "GND"},
+        {"op": "zone", "net": "VCC", "layer": "B.Cu",
+         "polygon_mm": [[10, 10], [50, 10], [50, 40]], "pad_connection": "solid", "priority": 1},
+        {"op": "remove", "net": "VCC", "kinds": ["track"]},
+    ])
+    assert res["applied"] == {"move": 1, "track": 1, "via": 1, "zone": 1, "remove": 1}
+    assert res["notes"] == [{"i": 4, "removed": 1}]
+    tree = sch_io.parse_file(blank_project["pcb"])
+    fps = {f["reference"]: f for f in ed.list_footprints_summary(tree)}
+    assert fps["R2"]["position_mm"] == [30, 25] and fps["R2"]["rotation"] == 90
+    segs = [s for s in sch_io.find_children(tree, "segment") if ed.net_of(s) == "GND"]
+    assert len(segs) == 4  # 2 from the fixture + 2 new
+    assert [ed.net_of(v) for v in sch_io.find_children(tree, "via")] == ["GND", "GND"]
+    assert [ed.net_of(s) for s in sch_io.find_children(tree, "segment")].count("VCC") == 0
+
+
+def test_edit_board_is_all_or_nothing(blank_project, tmp_path, monkeypatch):
+    mcp = _mcp_with_batch(monkeypatch, tmp_path)
+    _two_resistors(mcp)
+    before = blank_project["pcb"].read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match=r"op 1 \(track\).*nothing written"):
+        _call(mcp, "edit_board", ops=[
+            {"op": "move", "ref": "R1", "x_mm": 5, "y_mm": 5},
+            {"op": "track", "from": "R1.1", "to": "R9.1"},
+        ])
+    assert blank_project["pcb"].read_text(encoding="utf-8") == before
+    dry = _call(mcp, "edit_board", ops=[{"op": "move", "ref": "R1", "x_mm": 5, "y_mm": 5}],
+                dry_run=True)
+    assert dry["dry_run"] and blank_project["pcb"].read_text(encoding="utf-8") == before
+
+
+_R_DEF = """(footprint "R" (layer "F.Cu")
+  (property "Reference" "REF**" (at 0 -1.4) (layer "F.SilkS"))
+  (property "Value" "R" (at 0 1.4) (layer "F.Fab"))
+  (fp_rect (start -1.5 -0.75) (end 1.5 0.75) (layer "F.CrtYd"))
+  (pad "1" smd rect (at -0.8 0) (size 0.8 0.9) (layers "F.Cu"))
+  (pad "2" smd rect (at 0.8 0) (size 0.8 0.9) (layers "F.Cu"))
+)"""
+
+
+def _pads_on_sig(path):
+    tree = sch_io.parse_file(path)
+    for ref, x in (("R1", 20), ("R2", 40)):
+        ed.add_footprint(tree, qualified_lib_id="T:R", reference=ref, value="1k",
+                         x_mm=x, y_mm=20, fp_def_node=sexpdata.loads(_R_DEF))
+    for fp in ed.iter_footprints(tree):
+        for pad in sch_io.find_children(fp, "pad"):
+            pad.append([sexpdata.Symbol("net"), "SIG"])
+    sch_io.write_file(path, tree)
+
+
+def test_edit_board_track_between_pads_takes_their_net(blank_project, tmp_path, monkeypatch):
+    mcp = _mcp_with_batch(monkeypatch, tmp_path)
+    _pads_on_sig(blank_project["pcb"])
+    res = _call(mcp, "edit_board", ops=[
+        {"op": "track", "from": "R1.2", "to": "R2.1"},
+        {"op": "via", "at": "R2.2"}])
+    assert res["notes"] == [{"i": 0, "net": "SIG"}]
+    tree = sch_io.parse_file(blank_project["pcb"])
+    seg = sch_io.find_children(tree, "segment")[0]
+    assert ed.net_of(seg) == "SIG"
+    assert [float(v) for v in sch_io.find_child(seg, "start")[1:]] == [20.8, 20.0]
+    assert ed.net_of(sch_io.find_children(tree, "via")[0]) == "SIG"
+
+
+def test_list_footprints_courtyard_and_list_pads_size(blank_project, tmp_path, monkeypatch):
+    mcp = _make_mcp(monkeypatch, tmp_path)
+    _pads_on_sig(blank_project["pcb"])
+    fp = {f["reference"]: f for f in _call(mcp, "list_footprints")}["R1"]
+    assert fp["courtyard_mm"] == [18.5, 19.25, 21.5, 20.75]
+    pads = _call(mcp, "list_pads", reference="R1")
+    assert [p["size_mm"] for p in pads] == [[0.8, 0.9], [0.8, 0.9]]
+    assert pads[0]["shape"] == "rect"
+    _call(mcp, "move_footprint", reference="R1", x_mm=20, y_mm=20, rotation=90)
+    fp = {f["reference"]: f for f in _call(mcp, "list_footprints")}["R1"]
+    assert fp["courtyard_mm"] == [19.25, 18.5, 20.75, 21.5]
+
+
+def test_courtyard_bbox_rotates_with_the_footprint():
+    fp = sexpdata.loads('(footprint "X" (layer "F.Cu") (at 10 10 90)'
+                        ' (fp_rect (start -2 -1) (end 2 1) (layer "F.CrtYd")))')
+    assert ed.footprint_courtyard_bbox(fp) == [9, 8, 11, 12]
+    fp = sexpdata.loads('(footprint "X" (layer "F.Cu") (at 0 0)'
+                        ' (fp_circle (center 1 1) (end 2 1) (layer "F.CrtYd")))')
+    assert ed.footprint_courtyard_bbox(fp) == [0, 0, 2, 2]

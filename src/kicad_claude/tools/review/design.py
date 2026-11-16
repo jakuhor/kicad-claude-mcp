@@ -124,6 +124,15 @@ def register(mcp) -> None:
             self-enable (PW-SEQ-*), reset
             nets (PW-RESET), FB divider impedance (PW-FB-Z, above
             `fb_z_max_ohm`) and FB bias current error (PW-FB-IB, spec cache);
+            high-side P-FET load switches (`load_switches`: gate pull-up,
+            V_GS zener, driver and its command net, reset hold, Miller cap;
+            V_GS on / off from the DC model at the rail voltages:
+            SW-OFF-DEFAULT, SW-RESET, SW-VGS-ON vs the RDS(on) rating,
+            SW-VGS-MAX, SW-ZENER, SW-SOFTSTART), data lines leaving on the
+            switched connector (`switched_data`: SW-BACKPOWER, SW-OE,
+            SW-OE-DEFAULT, SW-DATA-PULL) and fuse selectivity
+            (`fuse_selectivity`: SW-FUSE-SEL, melting I2t from the spec
+            cache); run at the lowest input voltage too (`rail_voltages`);
           - `analog`: op-amp inputs with no DC path (AU-BIAS), input coupling
             high-pass corner vs `audio_f_low_hz` (AU-HPF), output coupling cap
             to a connector without a bleed resistor (AU-BLEED), unused
@@ -196,13 +205,15 @@ def register(mcp) -> None:
         tj_margin_c: float | None = None,
         derating_profile: DeratingProfile = "commercial",
         sleep_states: dict[str, str] | None = None,
+        vref: dict[str, float] | None = None,
+        rth_ja: dict[str, float] | None = None,
         netlist_path: str = "",
     ) -> dict:
-        """Check parts against datasheet ratings with a per-rail current model.
-        `loads={"+5VD": 0.5}` (A per net) is carried up the power tree with
-        `efficiency` per regulator (else `default_efficiency`). Checks inductor
-        Isat / Irms, CMC, connector, regulator IOUT / ILIM, Tj (`ambient_c`,
-        default 40 C), FET / diode / LED currents (`RT-*` IDs, each citing the
+        """Check parts against datasheet ratings with a per-rail current model:
+        `loads={"+5VD": 0.5}` (A per net) carried up the power tree
+        (`efficiency` per regulator, `vref` as in analyze_power_tree). Checks
+        inductor, CMC, connector, regulator IOUT / ILIM, Tj (`ambient_c`,
+        `rth_ja` C/W per ref), FET / diode / LED currents (`RT-*`, citing the
         spec page). First-pass estimate.
 
         Details:
@@ -249,6 +260,13 @@ def register(mcp) -> None:
         I^2 R (rail series path, shunts) or dV^2 / R (DC operating point).
         Without an extracted rth_ja, Tj uses the package-typical value
         (`rth_source: package_typical (assumed)`, finding at most a warning).
+        `rth_ja={"U2": 60.3}` (C/W per ref, e.g. from the package's thermal
+        table) wins over both (`rth_source: caller`).
+
+        `vref` as in `analyze_power_tree` (`{"U1": 1.0}`, per channel
+        `{"U2/ch1": 1.25}`): sets an adjustable regulator's Vout when no
+        datasheet Vref is extracted, so its input current reaches the rails
+        upstream instead of an RT-MODEL "output voltage unknown".
 
         First-pass estimate: rth_ja is the datasheet's test board, efficiency
         is a number you supply, ripple is computed for bucks only.
@@ -256,11 +274,11 @@ def register(mcp) -> None:
         from kicad_claude.adapters import part_ratings
 
         nl = power_review.parse_netlist(project_netlist(netlist_path))
-        pt = power_review.analyze(nl, datasheet=datasheet_values(nl),
+        pt = power_review.analyze(nl, vref=vref or {}, datasheet=datasheet_values(nl),
                                   rail_voltages=rail_voltages or {})
         result = part_ratings.check(nl, pt, specs_by_ref(nl), loads or {}, efficiency,
                                     default_efficiency, ambient_c, fsw, tj_margin_c,
-                                    derating_profile, sleep_states)
+                                    derating_profile, sleep_states, rth_ja)
         if not loads:
             result["note"] = ("No loads given: every current is zero except what the "
                               "schematic implies (LED strings). Pass loads={rail: amps}.")
@@ -289,7 +307,7 @@ def register(mcp) -> None:
         `checks` (default all):
           - `power_pins`: each active part's `power_in` pins with the rail
             they sit on and how that rail is sourced (regulator, power_out
-            pin, connector, or a series L / ferrite / R / diode / FET path).
+            pin, connector, or a series L / ferrite / R / diode / fuse / FET path).
             Findings: CR-PWR-NC (unconnected), CR-PWR-UNSRC (no source),
             CR-PWR-DNP (source only through a DNP part), CR-PWR-GND (supply
             pin on ground), CR-GND-RAIL (ground pin on a non-ground net),

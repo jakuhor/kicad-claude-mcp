@@ -129,6 +129,10 @@ def _parse_symbol(node: list, lib_name: str) -> dict[str, Any]:
     }
 
 
+# Library pin angle -> the body side its connection point is on.
+_PIN_SIDE = {0: "left", 90: "bottom", 180: "right", 270: "top"}
+
+
 def _extract_pins(node: list) -> list[dict[str, Any]]:
     """Recursively gather pin metadata from a `(symbol ...)` node.
 
@@ -146,20 +150,28 @@ def _extract_pins(node: list) -> list[dict[str, Any]]:
                 shape = str(child[2])
             number = ""
             pname = ""
+            at = None
             for sub in child[3:]:
                 hs = _head(sub)
                 if hs == "name" and len(sub) >= 2 and isinstance(sub[1], str):
                     pname = sub[1]
                 elif hs == "number" and len(sub) >= 2 and isinstance(sub[1], str):
                     number = sub[1]
-            pins.append(
-                {
-                    "number": number,
-                    "name": pname,
-                    "type": etype,
-                    "shape": shape,
-                }
-            )
+                elif hs == "at" and len(sub) >= 3:
+                    at = sub
+            pin = {
+                "number": number,
+                "name": pname,
+                "type": etype,
+                "shape": shape,
+            }
+            if at is not None:
+                angle = int(round(float(at[3]))) % 360 if len(at) > 3 else 0
+                # The pin runs from its connection point toward the body at
+                # `angle`, so the point sits on the opposite side (lib Y up).
+                pin["side"] = _PIN_SIDE.get(angle, "")
+                pin["at"] = [float(at[1]), float(at[2])]
+            pins.append(pin)
         elif h == "symbol":
             pins.extend(_extract_pins(child))
     return pins

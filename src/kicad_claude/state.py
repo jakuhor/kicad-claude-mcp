@@ -7,6 +7,9 @@ project at a time.
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -179,3 +182,63 @@ def using_board(filename: str | None):
         yield
     finally:
         _active_board = previous
+
+
+# --------------------------------------------------------------------------- #
+# Session memory: the active project survives a server restart (OP-34)
+# --------------------------------------------------------------------------- #
+
+_session_file: Path | None = None   # set by server.py only; tests never write
+
+
+def enable_session(path: Path) -> None:
+    """Remember the active project in `path`, keyed by the working directory."""
+    global _session_file
+    _session_file = Path(path)
+
+
+def _session_key() -> str:
+    return str(Path(os.getcwd()).resolve())
+
+
+def remember() -> None:
+    """Store the active project / sheet / board for this working directory.
+    Called by the tools that change them on purpose, not by `using_*`."""
+    if _session_file is None:
+        return
+    try:
+        data = json.loads(_session_file.read_text(encoding="utf-8")) if _session_file.is_file() else {}
+    except (OSError, ValueError):
+        data = {}
+    if _active is None:
+        data.pop(_session_key(), None)
+    else:
+        data[_session_key()] = {"path": str(_active.path), "name": _active.name,
+                                "sheet": _active_sheet, "board": _active_board}
+    try:
+        _session_file.parent.mkdir(parents=True, exist_ok=True)
+        _session_file.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    except OSError as e:
+        logging.getLogger("kicad-claude.state").warning("session not saved: %s", e)
+
+
+def restore() -> ActiveProject | None:
+    """Reactivate what `remember` stored for this working directory, when its
+    files still exist. Returns the project, or None."""
+    global _active_sheet, _active_board
+    if _session_file is None or not _session_file.is_file():
+        return None
+    try:
+        rec = json.loads(_session_file.read_text(encoding="utf-8")).get(_session_key())
+        if not rec:
+            return None
+        proj = set_active(rec["path"], rec["name"])
+    except (OSError, ValueError, KeyError, FileNotFoundError) as e:
+        logging.getLogger("kicad-claude.state").info("session not restored: %s", e)
+        return None
+    for setter, value in ((set_active_sheet, rec.get("sheet")), (set_active_board, rec.get("board"))):
+        try:
+            setter(value)
+        except (OSError, ValueError):
+            pass
+    return proj

@@ -30,7 +30,8 @@ TABLES = ("sym-lib-table", "fp-lib-table")
 
 
 def _git(repo: Path, *args: str) -> str:
-    r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
+    r = subprocess.run(["git", "-C", str(repo), *args], stdin=subprocess.DEVNULL,
+                       capture_output=True, text=True,
                        encoding="utf-8", errors="replace", check=False)
     if r.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {r.stderr.strip()[:300]}")
@@ -49,7 +50,7 @@ def snapshot_git(project_dir: Path, ref: str, dest: Path) -> Path:
         if p.parent.as_posix() != rel or not (p.suffix in PROJECT_FILES or p.name in TABLES):
             continue
         data = subprocess.run(["git", "-C", str(top), "show", f"{ref}:{name}"],
-                              capture_output=True, check=False)
+                              stdin=subprocess.DEVNULL, capture_output=True, check=False)
         if data.returncode == 0:
             (dest / p.name).write_bytes(data.stdout)
             n += 1

@@ -20,6 +20,33 @@ from kicad_claude.adapters import drc_rules, project_settings as ps
 logger = logging.getLogger("kicad-claude.tools.rules")
 
 
+def _class_pad_conflicts(pro: dict, class_name: str) -> list[dict]:
+    """Footprints whose own pad spacing is below the class clearance, on the
+    nets the class's patterns match on the active board (empty when there is
+    no board, no clearance, or no match)."""
+    import fnmatch
+
+    from kicad_claude.adapters import pcb_editor, pcb_netlist, sch_io
+
+    cls = ps.find_net_class(pro, class_name) or {}
+    clearance = cls.get("clearance")
+    patterns = [e.get("pattern", "") for e in ps.get_netclass_patterns(pro)
+                if e.get("netclass") == class_name]
+    if not clearance or not patterns:
+        return []
+    try:
+        tree = sch_io.parse_file(state.get_active_board_path())
+    except Exception:  # no board yet: nothing to compare against
+        return []
+    names = [n["name"] for n in pcb_editor.list_nets(tree)]
+    nets = {n for n in names
+            if any(fnmatch.fnmatchcase(n, p) or fnmatch.fnmatchcase(n.lstrip("/"), p.lstrip("/"))
+                   for p in patterns)}
+    if not nets:
+        return []
+    return pcb_netlist.tight_pad_gaps(tree, nets, float(clearance))[:10]
+
+
 def register(mcp) -> None:
     """Register the design-rules and net-class tools."""
 
@@ -159,7 +186,8 @@ def register(mcp) -> None:
     ) -> dict:
         """Create or update a net class (existing fields are merged).
         `clearance_mm` also applies pad-to-pad inside one footprint, so a wide
-        class clearance flags fine-pitch parts; widen rail spacing with
+        class clearance flags fine-pitch parts (`tight_footprints` lists them
+        for the class's assigned nets); widen rail spacing with
         `add_drc_rule` instead.
 
         Details:
@@ -189,7 +217,11 @@ def register(mcp) -> None:
             description=description,
         )
         ps.save_pro(proj.pro_path, pro)
-        return {"net_class": cls}
+        out: dict = {"net_class": cls}
+        tight = _class_pad_conflicts(pro, name)
+        if tight:
+            out["tight_footprints"] = tight
+        return out
 
     @mcp.tool()
     def add_diff_pair_class(
@@ -266,7 +298,11 @@ def register(mcp) -> None:
         pro = ps.load_pro(proj.pro_path)
         entry = ps.assign_pattern(pro, netclass=class_name, pattern=net_pattern)
         ps.save_pro(proj.pro_path, pro)
-        return {"assignment": entry}
+        out: dict = {"assignment": entry}
+        tight = _class_pad_conflicts(pro, class_name)
+        if tight:
+            out["tight_footprints"] = tight
+        return out
 
     # ----- Custom DRC rules (.kicad_dru) -------------------------------- #
 

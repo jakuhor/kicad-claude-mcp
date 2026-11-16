@@ -29,10 +29,11 @@ from kicad_claude.tools.common import on_sheet
 from kicad_claude.adapters import sch_editor as ed
 from kicad_claude.adapters import safe_write
 from kicad_claude.adapters import sch_io
+from kicad_claude.adapters import sch_layout as layout
 from kicad_claude.adapters import sch_netlist as netlist
 from kicad_claude.templates.blank import write_blank_schematic
 from kicad_claude.tools.library import index as lib_tools
-from kicad_claude.utils.geometry import round_mm, snap_xy
+from kicad_claude.utils.geometry import normalize_rotation, round_mm, snap_xy
 from kicad_claude.utils.kicad_strings import normalize_name
 
 logger = logging.getLogger("kicad-claude.tools.sch.schematic")
@@ -133,6 +134,46 @@ def _next_virtual_reference(tree: list, prefix: str = "#PWR") -> str:
     return ed.next_virtual_reference(refs, prefix)
 
 
+def _power_choice(tree: list, net: str, base_symbol: str = "") -> tuple[str, bool, list[str]]:
+    """Library symbol for a power port of `net`: (lib_id, custom, warnings).
+
+    `power:{net}` when the library has it, else `base_symbol`, else
+    `power:GND` for a ground-like name and `power:VCC` otherwise, with the
+    Value overridden. The PWR_FLAG reminder comes once per custom net: only
+    when the sheet has no port of that net yet.
+    """
+    from kicad_claude.adapters.pcb_geometry import is_ground_net
+
+    idx = lib_tools._ensure_index()
+    if base_symbol:
+        candidate = base_symbol if ":" in base_symbol else f"power:{base_symbol}"
+    elif f"power:{net}" in idx["symbols"]:
+        candidate = f"power:{net}"
+    else:
+        candidate = "power:GND" if is_ground_net(net) else "power:VCC"
+    if candidate not in idx["symbols"]:
+        power_names = sorted(
+            k.split(":", 1)[1] for k in idx["symbols"] if k.startswith("power:")
+        )
+        raise KeyError(
+            f"power symbol {candidate!r} not in the library index; "
+            f"available: {power_names[:20]}{'...' if len(power_names) > 20 else ''}"
+        )
+    custom = candidate != f"power:{net}"
+    warnings: list[str] = []
+    seen = any(
+        (ed.get_symbol_property(s, "Reference") or "").startswith("#PWR")
+        and ed.get_symbol_property(s, "Value") == net
+        for s in ed.iter_instance_symbols(tree)
+    )
+    if custom and net != "PWR_FLAG" and not seen:
+        warnings.append(
+            f"net {net!r} is drawn with {candidate!r} (Value overridden). Unless a "
+            f"power-output pin drives it, add add_power_symbol(net=\"PWR_FLAG\") on it."
+        )
+    return candidate, custom, warnings
+
+
 def _fresh_lib_def(qualified_lib_id: str) -> list:
     """Read a symbol definition straight from the library file on disk."""
     lib_path, sym_name, _meta = _resolve_lib_symbol(qualified_lib_id)
@@ -226,6 +267,9 @@ def register(mcp) -> None:
                 ed.add_symbol_property(node, name, str(val))
             else:
                 ed.set_symbol_property(node, name, str(val))
+        if normalize_rotation(rotation):
+            # Library offsets turned with the body land on pins and wires.
+            layout.autoplace_fields(tree, node)
         junctions = ed.junction_mid_wire_pins(tree, node)
         backup = _save_with_backup(tree, path)
         logger.info(
@@ -438,19 +482,31 @@ def register(mcp) -> None:
         y_mm: float,
         orientation: Literal["right", "up", "left", "down"] = "right",
         snap_to_grid: bool = True,
+        label_type: Literal["local", "global"] = "local",
+        shape: Literal["input", "output", "bidirectional", "tri_state", "passive"] = "bidirectional",
     ) -> dict:
-        """Add a net label at a point. orientation ∈ {right, up, left, down}.
+        """Add a net label at a point; its text runs in `orientation` (use
+        "left" on a left-facing pin). `label_type="global"` joins the net on
+        every sheet (`shape` applies to global only). To label a pin by
+        reference use `edit_schematic` op `connect`.
 
-        `net` is the label text.
+        Details:
+
+        A local label names the net on its sheet only; a global label merges
+        nets of the same name across the hierarchy, as KiCAD does.
         """
         x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
         tree, path = _load_active_schematic()
-        ed.add_label(tree, net, x_mm, y_mm, orientation)
+        if label_type == "global":
+            ed.add_global_label(tree, net, x_mm, y_mm, orientation, shape)
+        else:
+            ed.add_label(tree, net, x_mm, y_mm, orientation)
         backup = _save_with_backup(tree, path)
         return {
             "net": net,
             "position_mm": [x_mm, y_mm],
             "orientation": orientation,
+            **({"label_type": "global", "shape": shape} if label_type == "global" else {}),
             "backup": str(backup) if backup else None,
         }
 
@@ -463,12 +519,14 @@ def register(mcp) -> None:
         y_mm: float,
         snap_to_grid: bool = True,
         base_symbol: str = "",
+        rotation: float = 0,
     ) -> dict:
         """Place a power port (+5V, GND, ...) for `net`; the `#PWR` / `#FLG`
         reference is auto-assigned. Uses `power:{net}`, else builds the port on
         `base_symbol` (default `power:GND` for ground-like names, `power:VCC`
-        otherwise) with Value = net. A new power net needs a `PWR_FLAG` or a
-        driving pin, or ERC reports `power_pin_not_driven`.
+        otherwise) with Value = net. A new power net needs a driving pin or
+        `add_power_symbol(net="PWR_FLAG")` on it, or ERC reports
+        `power_pin_not_driven`.
 
         Details:
 
@@ -486,33 +544,9 @@ def register(mcp) -> None:
         `power:{net}`. A new power net needs its own `PWR_FLAG` (or a driving
         power-output pin) or ERC reports `power_pin_not_driven`.
         """
-        from kicad_claude.adapters.pcb_geometry import is_ground_net
-
         x_mm, y_mm = _snap(x_mm, y_mm, snap_to_grid)
-        idx = lib_tools._ensure_index()
-        power_names = sorted(
-            k.split(":", 1)[1] for k in idx["symbols"] if k.startswith("power:")
-        )
-        warnings: list[str] = []
-        if base_symbol:
-            candidate = base_symbol if ":" in base_symbol else f"power:{base_symbol}"
-        elif f"power:{net}" in idx["symbols"]:
-            candidate = f"power:{net}"
-        else:
-            candidate = "power:GND" if is_ground_net(net) else "power:VCC"
-        if candidate not in idx["symbols"]:
-            raise KeyError(
-                f"power symbol {candidate!r} not in the library index; "
-                f"available: {power_names[:20]}{'...' if len(power_names) > 20 else ''}"
-            )
-        custom = candidate != f"power:{net}"
-        if custom and net != "PWR_FLAG":
-            warnings.append(
-                f"net {net!r} is drawn with {candidate!r} (Value overridden). "
-                "Add a PWR_FLAG on it unless a power-output pin drives it."
-            )
-
         tree, path = _load_active_schematic()
+        candidate, custom, warnings = _power_choice(tree, net, base_symbol)
         lib_path, sym_name, meta = _resolve_lib_symbol(candidate)
         sym_def = ed.fetch_symbol_def(lib_path, sym_name)
         # The prefix comes from the library part: PWR_FLAG wants #FLG, the
@@ -526,7 +560,7 @@ def register(mcp) -> None:
             value=net,
             x_mm=x_mm,
             y_mm=y_mm,
-            rotation=0,
+            rotation=rotation,
             sym_def_node=sym_def,
             project_name=proj.name,
             instance_path=_instance_path(),
@@ -586,10 +620,26 @@ def register(mcp) -> None:
     @mcp.tool()
 
     @on_sheet
-    def list_pins(reference: str) -> list[dict]:
-        """List pins of a placed symbol with their absolute positions (KiCAD coords)."""
+    def list_pins(reference: str, group_stacked: bool = True) -> list[dict]:
+        """Pins of a placed symbol with absolute positions (KiCAD coords).
+        Pins stacked on one point with one name (a module's GND pins) are
+        one entry with `numbers`; `group_stacked=False` lists each."""
         tree, _ = _load_active_schematic()
-        return ed.list_pins_for_symbol(tree, reference)
+        pins = ed.list_pins_for_symbol(tree, reference)
+        if not group_stacked:
+            return pins
+        out: list[dict] = []
+        seen: dict[tuple, dict] = {}
+        for p in pins:
+            key = (p["name"], tuple(p["position_mm"]), p["angle"])
+            entry = seen.get(key)
+            if entry is None or p["name"] in ("", "~"):
+                entry = dict(p)
+                seen[key] = entry
+                out.append(entry)
+            else:
+                entry.setdefault("numbers", [entry["number"]]).append(p["number"])
+        return out
 
     @mcp.tool()
 
@@ -780,11 +830,13 @@ def register(mcp) -> None:
     @mcp.tool()
 
     @on_sheet
-    def list_sch_nets(scope: Literal["active", "all"] = "active", include_power_pins: bool = False) -> dict:
+    def list_sch_nets(scope: Literal["active", "all"] = "active", include_power_pins: bool = False,
+                      compact: bool = False) -> dict:
         """Every schematic net, rebuilt from wire, label and pin geometry the way
         KiCAD does. `scope`: "active" sheet or "all" (merges global labels,
         power nets and sheet ports). Power-symbol pins are hidden unless
-        `include_power_pins=True`.
+        `include_power_pins=True`. `compact=True`: pins as "REF.PIN", label
+        names once — for checking a netlist.
 
         Details:
 
@@ -814,6 +866,15 @@ def register(mcp) -> None:
             pins = [
                 p for p in entry["pins"] if include_power_pins or not p["power"]
             ]
+            if compact:
+                item = {"name": name, "pins": [f"{p['ref']}.{p['pin']}" for p in pins]}
+                label_names = sorted({lb["name"] for lb in entry["labels"]})
+                if label_names and label_names != [name]:
+                    item["labels"] = label_names
+                if entry["no_connect"]:
+                    item["no_connect"] = True
+                out.append(item)
+                continue
             out.append(
                 {
                     "name": name,
@@ -1043,19 +1104,23 @@ def register(mcp) -> None:
         uuid: str = "",
         rotation: float | None = None,
         snap_to_grid: bool = True,
+        drag: bool = False,
     ) -> dict:
         """Move a symbol (by `reference`) or any item (by `uuid`) to an absolute point.
 
-        `rotation` (0/90/180/270) applies to symbols only; their fields move and
-        turn with them. A wire or bus moves whole: its first point lands on the
-        target. Moving an item off a pin breaks that connection: re-check with
-        `run_erc`.
+        `rotation` (0/90/180/270) applies to symbols only; a new rotation
+        re-autoplaces Reference / Value. `drag=True` (symbols): labels,
+        power ports, no-connects, junctions and wire ends on its pins follow,
+        wires get a bend. Without drag, a move off a pin breaks the connection.
 
         Details:
 
         Items by uuid: wire, bus, label, global_label, hierarchical_label,
         junction, no_connect, text, symbol and sheet. Text uuids come from
-        `list_texts`.
+        `list_texts`. A wire or bus moves whole: its first point lands on the
+        target. With `drag=True` the result lists `dragged` items and
+        `contacts_broken`: pins of other symbols that touched a moved pin
+        directly (those are not dragged).
         """
         if bool(reference) == bool(uuid):
             raise ValueError("pass exactly one of reference or uuid")
@@ -1065,12 +1130,12 @@ def register(mcp) -> None:
             node = ed.find_by_uuid(tree, uuid)
             if node is not None and sch_io.is_call(node, "symbol"):
                 reference = ed.get_symbol_property(node, "Reference") or ""
-            elif rotation is not None:
-                raise ValueError("rotation applies to symbols only")
+            elif rotation is not None or drag:
+                raise ValueError("rotation and drag apply to symbols only")
         if reference:
-            ed.move_symbol(tree, reference, x_mm, y_mm, rotation)
             result = {"kind": "symbol", "reference": reference,
                       "position_mm": [x_mm, y_mm], "rotation": rotation}
+            result.update(layout.move_symbol(tree, reference, x_mm, y_mm, rotation, drag=drag))
         else:
             result = ed.move_item(tree, uuid, x_mm, y_mm)
         backup = _save_with_backup(tree, path)
@@ -1418,6 +1483,7 @@ def register(mcp) -> None:
         proj = state.get_active()
         if not sheet or sheet.lower() == "root":
             state.set_active_sheet(None)
+            state.remember()
             return {"active_sheet": "root", "path": str(proj.sch_path)}
 
         # Accept either filename or sheet_name
@@ -1431,6 +1497,7 @@ def register(mcp) -> None:
                 raise RuntimeError(f"sheet {sheet!r} has no Sheetfile")
 
         state.set_active_sheet(sheet)  # the root's own filename maps to root
+        state.remember()
         return {
             "active_sheet": state.get_active_sheet_filename() or "root",
             "path": str(state.get_active_sheet_path()),

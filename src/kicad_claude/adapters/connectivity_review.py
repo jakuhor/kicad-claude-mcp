@@ -5,7 +5,7 @@ reads:
 
   - IC power pins: every `power_in` pin of an active part, which rail it sits
     on, whether that rail has a source (regulator output, `power_out` pin,
-    connector, or a series L / ferrite / R / diode path from one), supply
+    connector, or a series L / ferrite / R / diode / fuse path from one), supply
     pins tied to ground and ground pins on a non-ground net;
   - decoupling: capacitors from each IC supply net to ground (netlist only —
     physical proximity is the PCB tool `validate_decoupling_caps`);
@@ -46,7 +46,7 @@ from kicad_claude.adapters.power_review import (
 PASSIVE_KINDS = {"R", "C", "L", "FB", "FL", "D", "TP", "J", "P", "CN", "SW",
                  "Y", "X", "F", "H", "MH", "JP", "LED", "RV", "VR", "T", "NT"}
 DRIVER_TYPES = {"output", "power_out", "bidirectional", "tri_state"}
-LINK_KINDS = {"L", "FB", "FL", "R", "D"}
+LINK_KINDS = {"L", "FB", "FL", "R", "D", "F"}  # F: fuse, polyfuse
 GND_PIN_RE = re.compile(r"^(A|D|P|S|E)?GND\d*$|^EP$|^EPAD$|^PAD$|^THERMAL", re.I)
 ADDR_PIN_RE = re.compile(r"^(A\d|ADDR\d*|ADD\d|AD\d|SA\d|ADR\d*|ADDR/\w+)$", re.I)
 _I2C_SPLIT = re.compile(r"[_/\s.-]")
@@ -102,7 +102,7 @@ def _caps_to_ground(nl: Netlist, net: str) -> list[dict]:
 
 def _links(nl: Netlist, net: str, include_dnp: bool) -> list[tuple[str, str]]:
     """(part ref, far net) for every series path out of `net`:
-    two-terminal L / ferrite / R / diode; a transistor's D-S / C-E channel
+    two-terminal L / ferrite / R / diode / fuse; a transistor's D-S / C-E channel
     (a load switch passes supply, per channel on duals: D1-S1); every other
     winding net of a multi-pin choke or transformer."""
     out = []
@@ -218,7 +218,7 @@ def check_power_pins(nl: Netlist, findings: list, sources: dict[str, str]) -> li
                                f"Pin{'s' if len(set(labels)) > 1 else ''} "
                                f"{', '.join(sorted(set(labels)))} on {net}, which has no source: "
                                "no regulator output, power_out pin, connector, or series "
-                               "L / ferrite / R / diode / transistor path from one."
+                               "L / ferrite / R / diode / fuse / transistor path from one."
                                + (f" {', '.join(hint)} looks like the source but its symbol "
                                   "types it power_in: fix the pin type." if hint else "")))
         if len(grounds) > 1:

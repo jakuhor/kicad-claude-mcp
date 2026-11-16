@@ -72,13 +72,13 @@ def kicad_gui_running() -> bool | None:
     try:
         if sys.platform == "win32":
             out = subprocess.run(
-                ["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                ["tasklist", "/FO", "CSV", "/NH"], stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=10, check=False,
             ).stdout.lower()
             names = {line.split(",")[0].strip('"') for line in out.splitlines() if line}
             return any(f"{p}.exe" in names for p in _KICAD_GUI_PROCESSES)
         for p in _KICAD_GUI_PROCESSES:
-            r = subprocess.run(["pgrep", "-x", p], capture_output=True, timeout=10,
+            r = subprocess.run(["pgrep", "-x", p], stdin=subprocess.DEVNULL, capture_output=True, timeout=10,
                                check=False)
             if r.returncode == 0:
                 return True

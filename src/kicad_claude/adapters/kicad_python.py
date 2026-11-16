@@ -90,6 +90,7 @@ def _run_pcbnew_script(script: str, *args: str, timeout: float = 60.0) -> str:
     try:
         r = subprocess.run(
             [str(py), "-c", script, *args],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             timeout=timeout,

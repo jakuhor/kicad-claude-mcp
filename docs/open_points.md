@@ -43,3 +43,34 @@ Kept so they stay visible; each is stated in the tool output.
   cache has them (DC-NODATA lists the gaps).
 - The circuit detectors are pin-name heuristics, validated on KiCAD's demo
   designs and synthetic netlists; a new design style can still trip them.
+
+---
+
+Field test 2026-11-14: JH_LED_control rebuilt from `requirements.md`, first
+schematic only (`source_repo/test_board/mcp_test_issues.md`, all server items
+fixed), then schematic + PCB (`source_repo/test_board_v2/mcp_test_issues.md`).
+Its server items OP-18 … OP-21 and OP-23 … OP-27 are done (README); what is
+left is below.
+
+## OP-28 — Finish the v2 board (acceptance, layout work)
+
+The user does this layout; the server only supplies tools *(decided,
+2026-11-16)*.
+
+`source_repo/test_board_v2/hardware`, state 2026-11-14: ERC 0 / 0, DRC 0
+errors, 0 parity, **12 unconnected** (`list_unrouted` agrees), 92 warnings
+(86 silkscreen). Done: U5 re-placed with its antenna keep-out in place, solid
+power pours, thermal vias in U1 EP and U5 EPAD, autoroute, part ratings with
+`loads={"/LED_24V": 5, "+3V3": 0.4}` (1 warning: U2 Tj 210 °C at the assumed
+250 °C/W; re-run with `vref={"U1": 1.0}, rth_ja={"U2": 60.3}`).
+- Open links sit in the Q2 gate network (Q2_G, D8_A, SW_CTRL, LED_24V) and
+  VIN / GND around U1. `autoroute_pcb(route_pour_nets=True)` on a copy
+  (2026-11-16): DRC 12 -> 1 unconnected (GND, Q2_G), 0 errors; its
+  `pour_guard` names C13.2 (LED_24V) and R18.1 (VIN) as beyond their pours.
+- Still to do: GND stitching, silkscreen per requirements §9.4
+  (`tidy_footprint_fields` on a copy: 89 -> 24 silk warnings; the rest are
+  the 9 references it finds no room for in the same crowded Q2 / Q3 block,
+  plus 3 U5 outline-to-edge), F2 temperature rerating.
+- Checked: test 1 item 28 (`Diode:SMAJ24A` names its cathode `A1`) does not
+  mislead the reviews: TVS pin pairs take names from the datasheet pin table
+  by number, and a TVS is never a power-tree link.

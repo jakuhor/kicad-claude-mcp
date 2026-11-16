@@ -676,11 +676,23 @@ def parse_subckt(lib: str, name: str | None = None) -> tuple[str, list[str]]:
                 lines.append(cur)
             cur = raw
     lines.append(cur)
-    for line in lines:
+    for i, line in enumerate(lines):
         parts = line.split()
         if len(parts) >= 2 and parts[0].lower() == ".subckt" and (
                 name is None or parts[1].lower() == name.lower()):
             nodes = [x for x in parts[2:] if "=" not in x and x.lower() != "params:"]
+            # ngspice fails without naming the cause when a vendor file
+            # (Diodes Inc. MMSZ5242B) leaves the subcircuit open.
+            for rest in lines[i + 1:]:
+                head = (rest.split() or [""])[0].lower()
+                if head == ".ends":
+                    break
+                if head == ".subckt":
+                    raise ValueError(f".subckt {parts[1]} in {lib} has no .ends before the "
+                                     "next .subckt: add `.ends` to the model file")
+            else:
+                raise ValueError(f".subckt {parts[1]} in {lib} has no .ends: add `.ends "
+                                 f"{parts[1]}` at the end of the model file")
             return parts[1], nodes
     raise ValueError(f"no .subckt {name or ''} in {lib}")
 

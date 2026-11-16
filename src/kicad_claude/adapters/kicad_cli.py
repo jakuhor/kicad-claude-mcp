@@ -40,8 +40,8 @@ def _run(args: list[str], *, timeout: float = 120.0, cwd: Path | None = None) ->
     cmd = [str(cli), *args]
     try:
         r = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout, check=False, cwd=str(cwd) if cwd else None,
+            cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=timeout, check=False, cwd=str(cwd) if cwd else None,
         )
     except subprocess.TimeoutExpired as e:
         raise KicadCliError(f"kicad-cli timed out after {timeout}s: {' '.join(cmd[1:4])}…") from e
@@ -127,7 +127,8 @@ def run_erc(
         str(sch_path),
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout, check=False)
     except subprocess.TimeoutExpired as e:
         raise KicadCliError(f"kicad-cli sch erc timed out after {timeout}s") from e
     if r.returncode != 0 or not output_json.is_file():
@@ -238,7 +239,8 @@ def run_drc(
         cmd.insert(-1, "--save-board")
 
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout, check=False)
     except subprocess.TimeoutExpired as e:
         raise KicadCliError(f"kicad-cli pcb drc timed out after {timeout}s") from e
     if r.returncode != 0 or not output_json.is_file():

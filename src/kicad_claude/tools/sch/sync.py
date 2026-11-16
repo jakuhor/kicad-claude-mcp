@@ -33,9 +33,11 @@ def _all_schematic_paths() -> list[Path]:
 def _netlist_timeout(component_count: int) -> float:
     """Timeout for the netlist stage, scaled with the design.
 
-    KiCAD's `pcbnew` netlist update is roughly linear in the number of parts:
-    189 footprints / 90 nets takes two to four minutes, which the old fixed
-    90 s default could never cover.
+    Measured through a stdio session (2026-11-14): 55 footprints in 3 s,
+    KiCAD's cm5_minima demo (~200 symbols, 611 pads) in 18 s. The two to four
+    minutes once seen for 189 footprints was the pcbnew child inheriting the
+    server's stdin (now `subprocess.DEVNULL` everywhere); the generous limit
+    stays as a safety margin for very large boards.
     """
     return max(180.0, 120.0 + 2.5 * component_count)
 
@@ -57,6 +59,15 @@ def _timeout_result(error: Exception, timeout: float, component_count: int) -> d
             f"idempotent, so nothing is duplicated. Try {int(timeout * 2)}."
         ),
     }
+
+
+def _field_summary(changed: list[dict]) -> dict:
+    """{"parts": n, "fields": {name: parts}} from the per-part change list."""
+    per_field: dict[str, int] = {}
+    for entry in changed:
+        for name in entry["fields"]:
+            per_field[name] = per_field.get(name, 0) + 1
+    return {"parts": len(changed), "fields": dict(sorted(per_field.items()))}
 
 
 def register(mcp) -> None:
@@ -86,27 +97,34 @@ def register(mcp) -> None:
         remove_extra: bool = False,
         timeout_seconds: float = 0.0,
         scope: Literal["full", "fields"] = "full",
+        verbose: bool = False,
     ) -> dict:
         """Bring the active PCB in line with the schematic. `scope="full"`
         (default): place missing footprints below the outline
         (`place_missing`), copy fields (`sync_fields`), delete orphans only
-        with `remove_extra`, assign nets via KiCAD's pcbnew (minutes on
-        mid-size boards; `timeout_seconds=0` scales with part count).
+        with `remove_extra`, assign nets via KiCAD's pcbnew (~20 s at 200
+        parts; `timeout_seconds=0` scales with part count).
         `scope="fields"`: field copy only, seconds.
 
         Details:
 
+        Result: `placed_footprints` and `fields_synced` are compact by
+        default (refs placed; parts changed and count per field, BOM / DNP /
+        simulation flags as `attr:<flag>`). `verbose=True` returns the
+        per-part lists (positions, field names per part).
+
         `scope="fields"` does step 2 only: copy Value / MPN / LCSC / … onto the
         footprints in pure Python and save. No footprint placement, no deletion,
-        no netlist export and no pcbnew run, so it takes seconds instead of
-        minutes. Use it after a field-only schematic edit (value swap,
+        no netlist export and no pcbnew run, so it takes about a second. Use it after a field-only schematic edit (value swap,
         sourcing update). `scope="full"` (default) runs every step below.
 
         Process:
         1. Place a footprint for every schematic symbol that has none on the
            board, taken from the symbol's `Footprint` property and dropped in
            a grid just below the board outline (`place_missing`). Arrange them
-           afterwards with `move_footprint` or `place_footprints_grid`.
+           afterwards with `move_footprint` or `place_footprints_grid`. Set the
+           outline first (`set_board_outline`): without one they land on a
+           10 mm grid from (50, 50) mm, where a later outline may cover them.
         2. Copy `Value` and the symbol's other fields (`MPN`, `Manufacturer`,
            …) onto the matching footprint (`sync_fields`). This is what
            `run_drc(schematic_parity=True)` compares, and what an assembly BOM
@@ -119,6 +137,8 @@ def register(mcp) -> None:
            KiCAD's escaped form such as `Net-(U5-NR{slash}SS)`) and use KiCAD's
            Python (`pcbnew`) to add the missing nets and assign every pad's
            net. The board is re-saved only if a net was added or a pad changed.
+           The netlist stays at `fab/<project>-netlist.net`, where the review
+           tools read it.
 
         A symbol with no `Footprint` property is reported in `no_footprint`; a
         footprint lib_id the library index does not know is reported in
@@ -129,8 +149,8 @@ def register(mcp) -> None:
 
         `timeout_seconds` defaults to 0, which means "scale with the board":
         120 s plus 2.5 s per schematic symbol (a 189-part board gets ~590 s).
-        The netlist stage runs KiCAD's own Python on the whole board and takes
-        minutes on a mid-size design. When it does time out, the footprints are
+        The netlist stage runs KiCAD's own Python on the whole board (18 s for
+        a 200-symbol design). When it does time out, the footprints are
         already placed and saved; the response says so in `stage` and
         `timed_out` instead of only raising.
         """
@@ -152,7 +172,7 @@ def register(mcp) -> None:
             out = {
                 "scope": "fields",
                 "pcb_path": str(pcb_path),
-                "fields_synced": fields_changed,
+                "fields_synced": fields_changed if verbose else _field_summary(fields_changed),
                 "missing_in_pcb": missing,
                 "backup": str(backup) if backup else None,
             }
@@ -208,10 +228,11 @@ def register(mcp) -> None:
         result["scope"] = "full"
         result["netlist_path"] = str(netlist_path)
         result["pcb_path"] = str(pcb_path)
-        result["placed_footprints"] = placement["placed"]
+        result["placed_footprints"] = (placement["placed"] if verbose
+                                       else [p["reference"] for p in placement["placed"]])
         result["no_footprint"] = placement["no_footprint"]
         result["unresolved"] = placement["unresolved"]
-        result["fields_synced"] = fields_changed
+        result["fields_synced"] = fields_changed if verbose else _field_summary(fields_changed)
         result["orphan_footprints"] = orphans
         result["orphans_removed"] = bool(remove_extra and orphans)
         if backup:

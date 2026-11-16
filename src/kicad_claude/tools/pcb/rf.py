@@ -42,6 +42,8 @@ def register(mcp) -> None:
     ) -> dict:
         """Place a row of vias along a line. Common uses:
 
+        Details:
+
         - **Ground stitching** along a trace (offset = ±0.5 mm perpendicular)
         - **Plane stitching** (offset = 0 across a region)
         - **EMI fencing** along sensitive nets
@@ -89,6 +91,8 @@ def register(mcp) -> None:
         net: str = "GND",
     ) -> dict:
         """Add two parallel via fences alongside a trace, both connected to GND.
+
+        Details:
 
         For RF / high-speed signals: containment of the field, prevention
         of crosstalk to neighbouring traces. The two via rows are placed
@@ -145,6 +149,8 @@ def register(mcp) -> None:
         net: str | None = None,
     ) -> dict:
         """Add a track at the width that achieves `target_impedance_ohms`.
+
+        Details:
 
         Defaults: 50 Ω microstrip on FR4 with 0.21 mm dielectric (typical
         prepreg in a 4-layer 1.6 mm stackup). Adjust `dielectric_height_mm`

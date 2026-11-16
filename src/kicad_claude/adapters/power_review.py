@@ -110,7 +110,7 @@ def parse_netlist(path: Path) -> Netlist:
             "ref": ref,
             "value": _v(_c(comp, "value")),
             "footprint": _v(_c(comp, "footprint")),
-            "description": _v(_c(comp, "description")),
+            "description": _v(_c(comp, "description")) or _v(_c(ls, "description") if ls else None),
             "datasheet": _v(_c(comp, "datasheet")),
             "lib_id": f"{_v(_c(ls, 'lib'))}:{_v(_c(ls, 'part'))}" if ls else "",
             "fields": fields,
@@ -312,6 +312,23 @@ def _two_terminal(nl: Netlist, ref: str) -> tuple[str, str] | None:
     return pins[0].net, pins[1].net
 
 
+def _diode_anode_cathode(nl: Netlist, ref: str) -> tuple[str, str] | None:
+    """(anode net, cathode net): pin names A / K, else Device:D numbering
+    (1 = K, 2 = A). A zener or TVS (reverse-biased by design) is no link."""
+    comp = nl.components.get(ref, {})
+    text = f"{comp.get('lib_id', '')} {comp.get('value', '')} {comp.get('description', '')}"
+    if re.search(r"zener|tvs|transient|esd|suppressor|BZ[XVT]|MMSZ|SM[ABC]J|P6KE", text, re.I):
+        return None
+    pins = nl.pins.get(ref, [])
+    if len(pins) != 2:
+        return None
+    by = {(p.name or "").upper(): p.net for p in pins}
+    if "A" in by and "K" in by:
+        return by["A"], by["K"]
+    num = {p.number: p.net for p in pins}
+    return (num["2"], num["1"]) if {"1", "2"} <= set(num) else None
+
+
 def _components_between(nl: Netlist, net: str, prefix: str) -> list[dict]:
     """Two-terminal parts of kind `prefix` on `net`: [{ref, value, other_net}]."""
     out = []
@@ -393,6 +410,12 @@ def _pg_state(nl: Netlist, reg_ref: str, pg_net: str | None) -> dict | None:
              if kind(p.ref) not in ("R", "C", "TP")]
     return {"state": "pulled_up" if pullups else "no_pullup", "net": pg_net,
             "pullup": [r["ref"] for r in pullups], "used_by": users}
+
+
+# KiCAD library descriptions of fixed regulators: "Fixed Output 3.3V",
+# "3.3V fixed output", "fixed 5V output".
+_FIXED_OUT_RE = re.compile(r"fixed\s+(?:output\s+)?(\d+(?:\.\d+)?)\s*V\b|"
+                           r"(\d+(?:\.\d+)?)\s*V\s+fixed", re.I)
 
 
 def is_negative_rail(net: str | None) -> bool:
@@ -525,6 +548,12 @@ def analyze(nl: Netlist, vref: dict | None = None,
                     "pins_grounded": sorted(f"{p.name or p.number}({p.number})" for p in grounded),
                     "vref_source": ao["base"][1]}
 
+        if vout is None and not divider and not set_info:
+            fixed = _FIXED_OUT_RE.search(comp.get("description") or "")
+            if fixed:
+                vout = {"value": float(fixed.group(1) or fixed.group(2)), "method": "fixed",
+                        "vref_source": "symbol description"}
+
         rec = {
             "name": name, "ref": ref, "channel": ch or None, "value": comp["value"],
             "lib_id": comp["lib_id"], "topology": topology,
@@ -583,7 +612,7 @@ def analyze(nl: Netlist, vref: dict | None = None,
     for lref, comp in nl.components.items():
         k = kind(lref)
         val = parse_value(comp["value"])
-        if not (k in ("L", "FB", "FL") or (k == "R" and val == 0.0)):
+        if not (k in ("L", "FB", "FL", "F", "FU", "D") or (k == "R" and val == 0.0)):
             continue
         ends = _two_terminal(nl, lref)
         if not ends or ends[0] == ends[1]:
@@ -591,18 +620,33 @@ def analyze(nl: Netlist, vref: dict | None = None,
         a_net, b_net = ends
         if {a_net, b_net} & sw_nets or is_ground(a_net) or is_ground(b_net):
             continue
+        if k == "D":
+            # An OR-ing / blocking diode passes supply anode to cathode only.
+            pol = _diode_anode_cathode(nl, lref)
+            if pol is None:
+                continue
+            links[pol[0]].append({"ref": lref, "value": comp["value"], "to": pol[1],
+                                  "dnp": comp["dnp"], "diode": True})
+            continue
         for x, y in ((a_net, b_net), (b_net, a_net)):
             links[x].append({"ref": lref, "value": comp["value"], "to": y,
                              "dnp": comp["dnp"]})
 
+    # Discovery walks diodes both ways, so the other inputs of an OR-ing
+    # (USB VBUS -> D -> +5V) become rails too; voltages flow forward only.
+    upstream: dict[str, list[str]] = defaultdict(list)
+    for src_net, lks in links.items():
+        for lk in lks:
+            if lk.get("diode"):
+                upstream[lk["to"]].append(src_net)
     rail_set = set(reg_nets)
     frontier = list(reg_nets)
     while frontier:
         n = frontier.pop()
-        for lk in links.get(n, []):
-            if lk["to"] not in rail_set:
-                rail_set.add(lk["to"])
-                frontier.append(lk["to"])
+        for t in [lk["to"] for lk in links.get(n, [])] + upstream.get(n, []):
+            if t not in rail_set:
+                rail_set.add(t)
+                frontier.append(t)
 
     # Prune dead ends: a linked net with no consumer (no power-input pin, no
     # connector), not a regulator net, and no further link. This drops the
@@ -640,6 +684,25 @@ def analyze(nl: Netlist, vref: dict | None = None,
                  "feeds": [r["name"] for r in regs if r["input_net"] == n],
                  "links": links.get(n, [])} for n in sorted(rail_set)}
 
+    # What feeds a rail that no regulator outputs: OR-ing diodes always (they
+    # pass anode to cathode only), a fuse / ferrite / 0R only from the side
+    # that holds the supply connector or a regulator output.
+    def _supplied(n: str) -> bool:
+        return bool(rails[n]["connectors"] or rails[n]["sourced_by"])
+
+    for n, rail in rails.items():
+        fed = []
+        for src, lks in links.items():
+            for lk in lks:
+                if lk["to"] != n or src not in rails:
+                    continue
+                if lk.get("diode") or (_supplied(src) and not _supplied(n)):
+                    fed.append({"ref": lk["ref"], "from": src,
+                                **({"diode": True} if lk.get("diode") else {}),
+                                **({"dnp": True} if lk["dnp"] else {})})
+        if fed:
+            rail["fed_via"] = fed
+
     # Rails downstream of a regulator output through links belong under it.
     downstream: set = set()
     for n in rails:
@@ -667,10 +730,15 @@ def analyze(nl: Netlist, vref: dict | None = None,
                 child["output"] = subtree(out, seen)
             node["regulators"].append(child)
         for lk in rails[net]["links"]:
+            via_lk = {"ref": lk["ref"], "value": lk["value"], "dnp": lk["dnp"]}
             if lk["to"] in seen or rails[lk["to"]]["sourced_by"]:
+                # An OR-ing diode into a rail drawn elsewhere: list the join
+                # (VBUS -> D9 -> +5V) under `joins`, not the subtree twice
+                # (current walkers follow `linked` only).
+                if lk.get("diode") and lk["to"] in seen:
+                    node.setdefault("joins", []).append({"rail": lk["to"], "via": via_lk})
                 continue
-            node["linked"].append(subtree(lk["to"], seen, {
-                "ref": lk["ref"], "value": lk["value"], "dnp": lk["dnp"]}))
+            node["linked"].append(subtree(lk["to"], seen, via_lk))
         return node
 
     # Links carry no direction, so roots are taken from regulator inputs that
@@ -731,7 +799,10 @@ def analyze(nl: Netlist, vref: dict | None = None,
             "sequencing": sequencing, "findings": findings,
             **({"net_voltages": {n: {"volts": round(v, 4), "source": s}
                                  for n, (v, s) in sorted(dc["volts"].items()) if n not in volts},
-                "dc_model": {"clamps": dc["clamps"], "notes": dc["notes"]}} if dc else {}),
+                "dc_model": {"clamps": dc["clamps"], "notes": dc["notes"] + [
+                    "Switches are not modelled here (as if off): a load switch's gate "
+                    "sits at its pull-up and its clamp idles. Per-state gate voltages and "
+                    "clamps: review_connectivity scenarios."]}} if dc else {}),
             "counts": {k: sum(1 for f in findings if f["severity"] == k) for k in order}}
 
 

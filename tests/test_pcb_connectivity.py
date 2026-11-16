@@ -19,6 +19,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import sexpdata
 
 from kicad_claude import state
 from kicad_claude.adapters import pcb_netlist as pn
@@ -594,6 +595,56 @@ def test_update_pcb_keeps_escaped_net_and_fields_scope(tmp_path, monkeypatch):
     call("set_symbol_property", reference="R1", name="Value", value="22k")
     res = call("update_pcb_from_schematic", scope="fields")
     assert res["scope"] == "fields" and "netlist_path" not in res
-    assert res["fields_synced"]
+    assert res["fields_synced"]["parts"] == 1 and res["fields_synced"]["fields"]["Value"] == 1
     assert '"22k"' in files["pcb"].read_text(encoding="utf-8")
     state.clear_active()
+
+
+# ===== OP-20: pour islands, pad outlines, pad-less copper ================== #
+
+_TWO_ISLANDS = """(kicad_pcb (version 20260206) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+  (footprint "T:A" (layer "F.Cu") (at 10 10)
+    (property "Reference" "A1" (at 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 2 2) (layers "F.Cu") (net "VIN")))
+  (footprint "T:B" (layer "F.Cu") (at 30 10)
+    (property "Reference" "B1" (at 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 2 2) (layers "F.Cu") (net "VIN")))
+  (zone (net "VIN") (layer "F.Cu") (name "VIN")
+    (polygon (pts (xy 5 5) (xy 35 5) (xy 35 15) (xy 5 15)))
+    (filled_polygon (layer "F.Cu") (pts (xy 5 5) (xy 15 5) (xy 15 15) (xy 5 15)))
+    (filled_polygon (layer "F.Cu") (pts (xy 25 5) (xy 35 5) (xy 35 15) (xy 25 15))))
+  (segment (start 50 50) (end 55 50) (width 0.25) (layer "F.Cu") (net "VIN") (uuid "s1"))
+)"""
+
+
+def test_split_pour_is_two_islands_and_stub_is_reported():
+    tree = sexpdata.loads(_TWO_ISLANDS)
+    res = pn.list_unrouted(tree)
+    assert res["count"] == 1
+    assert {res["unrouted"][0]["from"]["ref"], res["unrouted"][0]["to"]["ref"]} == {"A1", "B1"}
+    assert [i["items"] for i in res["islands"]] == [{"track": 1}]
+
+
+_STARVED = """(kicad_pcb (version 20260206) (generator "pcbnew")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+  (footprint "T:Q" (layer "F.Cu") (at 20 20)
+    (property "Reference" "Q1" (at 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 5.6 4.5) (layers "F.Cu") (net "D")))
+  (footprint "T:C" (layer "F.Cu") (at 40 20)
+    (property "Reference" "C1" (at 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "D")))
+  (zone (net "D") (layer "F.Cu") (name "D")
+    (polygon (pts (xy 10 10) (xy 45 10) (xy 45 30) (xy 10 30)))
+    (filled_polygon (layer "F.Cu") (pts
+      (xy 10 10) (xy 45 10) (xy 45 30) (xy 10 30) (xy 10 10)
+      (xy 16.7 16.75) (xy 16.7 23.25) (xy 23.3 23.25) (xy 23.3 16.75) (xy 16.7 16.75))))
+)"""
+
+
+def test_relief_without_spokes_does_not_connect_a_large_pad():
+    """The hole edge is 0.5 mm off the pad but inside its bounding circle."""
+    tree = sexpdata.loads(_STARVED)
+    res = pn.list_unrouted(tree)
+    assert res["count"] == 1
+    assert {res["unrouted"][0]["from"]["ref"], res["unrouted"][0]["to"]["ref"]} == {"Q1", "C1"}

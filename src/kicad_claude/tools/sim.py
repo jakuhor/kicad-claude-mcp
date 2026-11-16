@@ -125,7 +125,7 @@ def register(mcp) -> None:
         try:
             r = subprocess.run(
                 [sim.path, "-b", str(driver_path), "-o", str(out)],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=timeout_seconds, check=False,
             )
         except subprocess.TimeoutExpired as e:
