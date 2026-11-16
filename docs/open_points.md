@@ -46,11 +46,9 @@ Kept so they stay visible; each is stated in the tool output.
 
 ---
 
-Field test 2026-11-14: JH_LED_control rebuilt from `requirements.md`, first
-schematic only (`source_repo/test_board/mcp_test_issues.md`, all server items
-fixed), then schematic + PCB (`source_repo/test_board_v2/mcp_test_issues.md`).
-Its server items OP-18 … OP-21 and OP-23 … OP-27 are done (README); what is
-left is below.
+Field test 2026-11-14: JH_LED_control rebuilt from `requirements.md`
+(`source_repo/test_board_v2`). All its server items are done (README); the
+board itself is left below.
 
 ## OP-28 — Finish the v2 board (acceptance, layout work)
 
@@ -71,6 +69,17 @@ power pours, thermal vias in U1 EP and U5 EPAD, autoroute, part ratings with
   (`tidy_footprint_fields` on a copy: 89 -> 24 silk warnings; the rest are
   the 9 references it finds no room for in the same crowded Q2 / Q3 block,
   plus 3 U5 outline-to-edge), F2 temperature rerating.
-- Checked: test 1 item 28 (`Diode:SMAJ24A` names its cathode `A1`) does not
+- Checked: `Diode:SMAJ24A` naming its cathode `A1` does not
   mislead the reviews: TVS pin pairs take names from the datasheet pin table
   by number, and a TVS is never a power-tree link.
+
+---
+
+Field test 3, 2026-11-16: JH_LED_control rebuilt from `requirements.md`:
+schematic, placement and pours, no routing
+(`source_repo/test_board_v3/hardware`). All its server items (OP-37 …
+OP-39) are done (README). Checked: KiCAD's DRC is right not to flag C11 /
+C12 / R15 / C17 beside the ESP32-C6-MINI-1: its courtyard is T-shaped (the
+antenna keep-out above the module), and they sit in the notches beside the
+body that only the courtyard's bounding box covers (`list_footprints` now
+says `courtyard_is_box: false`).

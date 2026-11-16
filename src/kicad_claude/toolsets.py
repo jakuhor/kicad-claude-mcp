@@ -308,6 +308,13 @@ def _advertise_list_changed(mcp) -> None:
     low.create_initialization_options = create_initialization_options
 
 
+# Clients that defer tool schemas (Claude Code's ToolSearch) fetch them by
+# query: a keyword query pulls in every matching schema of a large set.
+SELECT_BY_NAME = ("If your client defers tool schemas, fetch only the tools you need "
+                  "by exact name (e.g. ToolSearch 'select:<tool>,<tool>'), not by "
+                  "keyword: a keyword search loads dozens of schemas.")
+
+
 def install(mcp, startup: str | list[str] | None = None) -> ToolsetManager:
     """Register core, the control tools, and the startup sets on `mcp`.
 
@@ -329,12 +336,16 @@ def install(mcp, startup: str | list[str] | None = None) -> ToolsetManager:
     async def load_toolset(toolsets: list[str], ctx: Context) -> dict:
         added = {n: manager.load(n) for n in parse_names(toolsets)}
         notified = await _notify_list_changed(ctx) if any(added.values()) else False
-        return {
+        out = {
             "added": {n: len(tools) for n, tools in added.items() if tools},
             "already_loaded": [n for n, tools in added.items() if not tools],
             "loaded": list(manager.loaded),
             "client_notified": notified,
         }
+        if any(added.values()):
+            out["tools"] = {n: sorted(tools) for n, tools in added.items() if tools}
+            out["hint"] = SELECT_BY_NAME
+        return out
 
     @mcp.tool()
     async def unload_toolset(toolsets: list[str], ctx: Context) -> dict:

@@ -547,6 +547,24 @@ def build_connectivity(tree: list) -> dict:
             if _zone_touches_pad(pad, zone["points"]):
                 uf.union(pad_key, ("zone", zi))
 
+    # Pads of one net whose copper overlaps on a shared layer are one node,
+    # as in KiCAD: a USB-C receptacle stacks A4 / B9 and A1 / B12 on one land.
+    by_pad_net: dict[str, list[int]] = {}
+    for i, pad in enumerate(pads):
+        if pad["net_name"] and len(pad.get("corners") or []) == 4:
+            by_pad_net.setdefault(pad["net_name"], []).append(i)
+    for idx in by_pad_net.values():
+        for k, i in enumerate(idx):
+            for j in idx[k + 1:]:
+                a, b = pads[i], pads[j]
+                if not set(a["layers"]) & set(b["layers"]):
+                    continue
+                reach = a["radius_mm"] + b["radius_mm"]
+                if abs(a["point"][0] - b["point"][0]) > reach or                         abs(a["point"][1] - b["point"][1]) > reach:
+                    continue
+                if _quad_gap(a["corners"], b["corners"]) <= 1e-6:
+                    uf.union(("pad", i), ("pad", j))
+
     # Collect pads per net, grouped by what they are joined to.
     by_net: dict[str, dict] = {}
     for i, pad in enumerate(pads):
@@ -630,7 +648,8 @@ def list_unrouted(tree: list) -> dict:
             items.append(
                 {
                     "net": net["name"] or str(net["net"]),
-                    "net_number": net["net"],
+                    # KiCAD 10 boards name nets; a legacy index only when set.
+                    **({"net_number": net["net"]} if net["net"] else {}),
                     "from": {"ref": pa["ref"], "pad": pa["pad"],
                              "position_mm": list(pa["point"])},
                     "to": {"ref": pb["ref"], "pad": pb["pad"],
@@ -662,7 +681,7 @@ def net_route_status(tree: list, net_name: str) -> dict:
         groups = list(net["groups"].values())
         return {
             "net": net["name"],
-            "net_number": net["net"],
+            **({"net_number": net["net"]} if net["net"] else {}),
             "pads": sum(len(g) for g in groups),
             "connected_groups": [
                 [{"ref": p["ref"], "pad": p["pad"]} for p in group] for group in groups

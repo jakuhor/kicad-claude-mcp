@@ -47,6 +47,30 @@ def _class_pad_conflicts(pro: dict, class_name: str) -> list[dict]:
     return pcb_netlist.tight_pad_gaps(tree, nets, float(clearance))[:10]
 
 
+def _design_net_names() -> list[str]:
+    """Net names of the active board, else of the schematic hierarchy."""
+    from kicad_claude.adapters import pcb_editor, sch_io, sch_netlist
+
+    try:
+        names = [n["name"] for n in pcb_editor.list_nets(
+            sch_io.parse_file(state.get_active_board_path()))]
+        if names:
+            return names
+    except Exception:  # no board yet
+        pass
+    try:
+        return list(sch_netlist.build_hierarchy_nets(state.get_active().sch_path))
+    except Exception:
+        return []
+
+
+def _matching(names: list[str], pattern: str) -> list[str]:
+    import fnmatch
+
+    return sorted(n for n in names if n and (
+        fnmatch.fnmatchcase(n, pattern) or fnmatch.fnmatchcase(n.lstrip("/"), pattern.lstrip("/"))))
+
+
 def register(mcp) -> None:
     """Register the design-rules and net-class tools."""
 
@@ -129,9 +153,10 @@ def register(mcp) -> None:
         applied directly and `mode` is not needed. `dry_run=True` returns the
         comparison and the resolved values without writing.
 
-        Response: `comparison` — one row per rule with `project`, `preset`,
-        `stricter`, `conflict`, `preset_is` (looser / stricter / equal /
-        unset_in_project); `decision_required` when a mode is needed;
+        Response: `comparison` (on a conflict or `dry_run` only) — one row
+        per rule with `project`, `preset`, `stricter`, `conflict`,
+        `preset_is` (looser / stricter / equal / unset_in_project);
+        `decision_required` when a mode is needed;
         `rules_applied` — the values written.
         """
         if preset not in ps.FAB_PRESETS:
@@ -165,6 +190,8 @@ def register(mcp) -> None:
             })
             return result
         resolved = ps.resolve_preset(rows, mode or "preset")
+        if not conflicts and not dry_run:
+            del result["comparison"]  # nothing to decide: `rules_applied` says it all
         result["mode"] = mode or "preset"  # no conflicts: modes coincide
         result["rules_applied"] = resolved
         result["written"] = not dry_run
@@ -288,17 +315,28 @@ def register(mcp) -> None:
         return {"removed": name}
 
     @mcp.tool()
-    def assign_net_class(net_pattern: str, class_name: str) -> dict:
-        """Match nets to a class by pattern (KiCAD glob, e.g. '+5V', 'GND', 'USB_*').
-
-        The class must exist (use `add_net_class` first). Idempotent on
-        (pattern, class) pairs.
+    def assign_net_class(class_name: str, net_pattern: str = "",
+                         patterns: list[str] | None = None) -> dict:
+        """Match nets to a class by pattern (KiCAD glob, e.g. '+5V', 'GND',
+        'USB_*'): `net_pattern`, or several at once in `patterns`. Returns
+        `matched_nets` per pattern (board nets, else schematic) and warns
+        about a pattern that matches nothing. The class must exist
+        (`add_net_class` first). Idempotent on (pattern, class) pairs.
         """
+        pats = list(patterns or []) + ([net_pattern] if net_pattern else [])
+        if not pats:
+            raise ValueError("give net_pattern or patterns")
         proj = state.get_active()
         pro = ps.load_pro(proj.pro_path)
-        entry = ps.assign_pattern(pro, netclass=class_name, pattern=net_pattern)
+        entries = [ps.assign_pattern(pro, netclass=class_name, pattern=p) for p in pats]
         ps.save_pro(proj.pro_path, pro)
-        out: dict = {"assignment": entry}
+        names = _design_net_names()
+        matched = {p: _matching(names, p) for p in pats}
+        out: dict = {"assignment": entries[0] if len(entries) == 1 else entries,
+                     "matched_nets": matched}
+        empty = [p for p, m in matched.items() if not m]
+        if empty and names:
+            out["warnings"] = [f"pattern {p!r} matches no net of the design" for p in empty]
         tight = _class_pad_conflicts(pro, class_name)
         if tight:
             out["tight_footprints"] = tight

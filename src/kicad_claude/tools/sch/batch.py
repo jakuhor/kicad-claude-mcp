@@ -9,6 +9,7 @@ take "REF.PIN" so no coordinates have to be looked up first.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from kicad_claude import state
@@ -44,6 +45,18 @@ class _Batch:
         self.refs = refs
         self.warnings: list[str] = []
         self._footprints = None
+        self.ported: set[str] = set()       # nets this batch drew ports on
+        self._flagged: set[str] | None = None
+
+    def flagged(self, net: str) -> bool:
+        """The net carries a PWR_FLAG already (on the sheet or from this batch)."""
+        if self._flagged is None:
+            from kicad_claude.adapters import sch_netlist
+
+            self._flagged = {
+                name for name, n in sch_netlist.build_sheet_nets(self.tree).nets.items()
+                if any(pin["ref"].startswith("#FLG") for pin in n["pins"])}
+        return net in self._flagged
 
     # ----- helpers -------------------------------------------------------- #
 
@@ -76,7 +89,9 @@ class _Batch:
             if self._footprints is None:
                 self._footprints = lib_tools._ensure_index().get("footprints") or {}
             if self._footprints and footprint not in self._footprints:
-                self.warnings.append(f"{ref}: footprint {footprint!r} is not in the library index")
+                hint = lib_tools.suggest_id(footprint, self._footprints)
+                self.warnings.append(f"{ref}: footprint {footprint!r} is not in the library index"
+                                     + (f"; did you mean {hint!r}?" if hint else ""))
         node = ed.add_symbol(
             self.tree, qualified_lib_id=lib_id, reference=ref, value=value,
             x_mm=x, y_mm=y, rotation=rotation, sym_def_node=sym_def,
@@ -97,8 +112,9 @@ class _Batch:
     def power_port(self, net: str, x: float, y: float, rotation: float | None,
                    out: tuple[int, int] | None, base_symbol: str = "",
                    trial: bool = False) -> str:
-        candidate, _custom, warns = sch._power_choice(self.tree, net, base_symbol)
-        self.warnings += warns
+        candidate, _custom, _warns = sch._power_choice(self.tree, net, base_symbol)
+        if net != "PWR_FLAG" and not trial:
+            self.ported.add(net)  # the driver reminder is judged on the result
         lib_path, sym_name, meta = sch._resolve_lib_symbol(candidate)
         sym_def = ed.fetch_symbol_def(lib_path, sym_name)
         ref = ed.next_virtual_reference(self.refs, ed.library_reference_prefix(sym_def))
@@ -161,11 +177,20 @@ def _port_rotation(tree: list, node: list, out: tuple[int, int], ground_like: bo
 def _route(b: _Batch, a: dict, c: dict) -> list[tuple[float, float]]:
     """Manhattan path from pin `a` to pin `c`: straight, or the L whose legs
     leave each pin outward and cross no symbol body."""
+    pts, hits = _l_route(b, a, c)
+    if hits:
+        b.warnings.append(f"wire {a['number']}->{c['number']}: no clean L route, crosses a symbol")
+    return pts
+
+
+def _l_route(b: _Batch, a: dict, c: dict) -> tuple[list[tuple[float, float]], int]:
+    """The best Manhattan path from pin `a` to pin `c` and how many symbol
+    bodies it crosses."""
     p, q = a["point"], c["point"]
-    if abs(p[0] - q[0]) < 1e-4 or abs(p[1] - q[1]) < 1e-4:
-        return [p, q]
     bodies = [g.inset(bx, 0.3) for s in ed.iter_instance_symbols(b.tree)
               if (bx := g.body_box(b.tree, s)) is not None and not g.is_power(b.tree, s)]
+    if abs(p[0] - q[0]) < 1e-4 or abs(p[1] - q[1]) < 1e-4:
+        return [p, q], sum(g.segment_hits_box(p, q, bx) for bx in bodies)
 
     def score(corner):
         legs = [(p, corner), (corner, q)]
@@ -178,9 +203,8 @@ def _route(b: _Batch, a: dict, c: dict) -> list[tuple[float, float]]:
 
     corners = [(q[0], p[1]), (p[0], q[1])]
     best = min(corners, key=score)
-    if score(best) >= 10:
-        b.warnings.append(f"wire {a['number']}->{c['number']}: no clean L route, crosses a symbol")
-    return [p, best, q]
+    return [p, best, q], sum(g.segment_hits_box(u, v, bx)
+                                 for u, v in ((p, best), (best, q)) for bx in bodies)
 
 
 def _add_path(b: _Batch, pts: list) -> int:
@@ -317,9 +341,39 @@ def _op_pwr_flag(b: _Batch, op: dict) -> dict:
                                               for side in sides])}
 
 
+JOIN_SPAN_MM = 15.0  # pins this close are wired together under one label
+
+
+def _wire_close_pins(b: _Batch, pins: list[str]) -> tuple[list[str], int]:
+    """Wire pins that sit within `JOIN_SPAN_MM` of each other: each one to
+    its nearest already-wired pin of its group, by a clean straight / L
+    path. Returns the pins that still need a label of their own (one per
+    group, and any with no clean path) and the wires drawn."""
+    pts = {a: b.pin(a) for a in pins}
+    rest, own, wires = list(pins), [], 0
+    while rest:
+        group = [rest.pop(0)]
+        own.append(group[0])
+        while True:
+            near = [(w, r) for w in group for r in rest
+                    if math.dist(pts[w]["point"], pts[r]["point"]) <= JOIN_SPAN_MM]
+            if not near:
+                break
+            a, c = min(near, key=lambda e: math.dist(pts[e[0]]["point"], pts[e[1]]["point"]))
+            rest.remove(c)
+            path, hits = _l_route(b, pts[a], pts[c])
+            if hits:
+                own.append(c)  # no clean path: its own stub and label
+                continue
+            wires += _add_path(b, path)
+            group.append(c)
+    return own, wires
+
+
 def _op_connect(b: _Batch, op: dict) -> dict:
     """Tie pins to a net: a stub wire out of each pin, then a label or a
-    power port at its end, facing away from the body."""
+    power port at its end, facing away from the body. Label-style pins
+    close together are wired to each other under one label instead."""
     pins = op.get("pins") or ([op["pin"]] if "pin" in op else [])
     if not pins:
         raise OpError("connect needs pin or pins")
@@ -329,7 +383,10 @@ def _op_connect(b: _Batch, op: dict) -> dict:
         style = "power" if b.is_power_net(net) else "label"
     stub = float(op.get("stub_mm", 2.54))
     made = []
-    for addr in pins:
+    labelled = pins
+    if style in ("label", "global") and len(pins) > 1 and op.get("join", True):
+        labelled, _wires = _wire_close_pins(b, list(pins))
+    for addr in labelled:
         p = b.pin(addr)
         o = p["out"]
         end = (round(p["point"][0] + o[0] * stub, 4), round(p["point"][1] + o[1] * stub, 4))
@@ -353,8 +410,10 @@ def _op_connect(b: _Batch, op: dict) -> dict:
                 ed.add_label(b.tree, net, end[0], end[1], orient)
         else:
             raise OpError(f"style must be auto, label, global or power, got {style!r}")
-        if op.get("flag"):
-            made.append(_op_pwr_flag(b, {"pin": addr})["ref"])
+    if op.get("flag") and not b.flagged(net):
+        # One flag marks the whole net as driven.
+        made.append(_op_pwr_flag(b, {"pin": pins[0]})["ref"])
+        b._flagged.add(net)
     out = {"style": style, "pins": len(pins)}
     if made:
         out["refs"] = made
@@ -383,11 +442,43 @@ def _op_text(b: _Batch, op: dict) -> dict:
     return {"uuid": ed.get_uuid(node)}
 
 
+def _pin_nets(tree: list) -> dict[tuple[str, str], str]:
+    """(ref, pin) -> net name for the real (non-power) pins of the sheet."""
+    from kicad_claude.adapters import sch_netlist
+
+    return {(p["ref"], p["pin"]): name
+            for name, n in sch_netlist.build_sheet_nets(tree).nets.items()
+            for p in n["pins"] if not p["power"]}
+
+
+def _merged_nets(before: dict, after: dict) -> list[list[str]]:
+    """Groups of connected nets (named, or 2+ pins) that a change joined."""
+    real = {}
+    for name in before.values():
+        real[name] = real.get(name, 0) + 1
+    joined: dict[str, set[str]] = {}
+    for key, name in after.items():
+        old = before.get(key)
+        if old is not None and (real[old] > 1 or not old.startswith("unconnected")):
+            joined.setdefault(name, set()).add(old)
+    return [sorted(s) for s in joined.values() if len(s) > 1]
+
+
 def _op_move(b: _Batch, op: dict) -> dict:
     x, y = b.point(op)
     if op.get("ref"):
-        return layout.move_symbol(b.tree, op["ref"], x, y, op.get("rotation"),
-                                  drag=op.get("drag", True), mirror=op.get("mirror"))
+        before = _pin_nets(b.tree)
+        res = layout.move_symbol(b.tree, op["ref"], x, y, op.get("rotation"),
+                                 drag=op.get("drag", True), mirror=op.get("mirror"))
+        merged = _merged_nets(before, _pin_nets(b.tree))
+        if merged and not op.get("allow_merge"):
+            raise OpError(f"moving {op['ref']} merges nets "
+                          f"{'; '.join(' + '.join(m) for m in merged)} (a wire or label "
+                          f"now touches another net); move elsewhere, or pass "
+                          f"allow_merge: true")
+        if merged:
+            res["nets_merged"] = merged
+        return res
     if op.get("uuid"):
         ed.move_item(b.tree, op["uuid"], x, y)
         return {}
@@ -395,16 +486,37 @@ def _op_move(b: _Batch, op: dict) -> dict:
 
 
 def _op_remove(b: _Batch, op: dict) -> dict:
-    if op.get("ref"):
-        r = ed.remove_symbol_with_wires(b.tree, op["ref"],
-                                        remove_connected_wires=op.get("wires", True))
-        if not r["removed"]:
-            raise OpError(f"no symbol {op['ref']!r}")
-        b.refs = [x for x in b.refs if x != op["ref"]]
-        return {"wires": r["wires"]}
-    if op.get("uuid"):
-        return {"kind": ed.remove_by_uuid(b.tree, op["uuid"])["kind"]}
-    raise OpError("remove needs ref or uuid")
+    refs = list(op.get("refs") or ([op["ref"]] if op.get("ref") else []))
+    if op.get("pattern"):
+        import fnmatch
+
+        refs += [r for r in (ed.get_symbol_property(s, "Reference") or ""
+                             for s in ed.iter_instance_symbols(b.tree))
+                 if fnmatch.fnmatchcase(r, op["pattern"]) and r not in refs]
+        if not refs:
+            raise OpError(f"no symbol matches {op['pattern']!r}")
+    if refs:
+        wires = 0
+        for ref in refs:
+            r = ed.remove_symbol_with_wires(b.tree, ref,
+                                            remove_connected_wires=op.get("wires", True))
+            if not r["removed"]:
+                raise OpError(f"no symbol {ref!r}")
+            b.refs = [x for x in b.refs if x != ref]
+            wires += r["wires"]
+        return {"wires": wires, "removed": len(refs)}
+    if op.get("label"):
+        pt = b.point(op) if "x_mm" in op else None
+        n = ed.remove_labels(b.tree, op["label"], pt)
+        if not n:
+            raise OpError(f"no label {op['label']!r}" + (f" at {pt}" if pt else ""))
+        return {"removed": n}
+    uuids = list(op.get("uuids") or ([op["uuid"]] if op.get("uuid") else []))
+    if uuids:
+        for u in uuids:
+            ed.remove_by_uuid(b.tree, u)
+        return {"removed": len(uuids)}
+    raise OpError("remove needs ref, refs, pattern, label or uuid / uuids")
 
 
 def _op_property(b: _Batch, op: dict) -> dict:
@@ -438,8 +550,27 @@ def _op_autoplace(b: _Batch, op: dict) -> dict:
 _DISPATCH = {name: globals()[f"_op_{name}"] for name in OPS}
 
 
+def _check_lib_ids(ops: list[dict]) -> None:
+    """Refuse a batch naming unknown symbols before any op runs, all of them
+    at once with a did-you-mean each, so one typo costs one retry."""
+    wanted = [(i, op["lib_id"]) for i, op in enumerate(ops)
+              if isinstance(op, dict) and op.get("op") == "symbol" and op.get("lib_id")]
+    if not wanted:
+        return
+    known = lib_tools._ensure_index()["symbols"]
+    bad = []
+    for i, lib_id in wanted:
+        if lib_id not in known:
+            hint = lib_tools.suggest_id(lib_id, known)
+            bad.append(f"op {i}: unknown lib_id {lib_id!r}"
+                       + (f" (did you mean {hint!r}?)" if hint else ""))
+    if bad:
+        raise OpError("; ".join(bad))
+
+
 def apply_ops(tree: list, ops: list[dict]) -> tuple[list[dict], list[str]]:
     """Apply `ops` to `tree` in order. Raises `OpError` naming the failing op."""
+    _check_lib_ids(ops)
     b = _Batch(tree)
     results = []
     for i, op in enumerate(ops):
@@ -454,30 +585,27 @@ def apply_ops(tree: list, ops: list[dict]) -> tuple[list[dict], list[str]]:
             raise OpError(f"op {i} ({kind}): {type(exc).__name__}: {exc}") from None
         if res:
             results.append({"i": i, **res})
-    return results, _drop_settled_flag_warnings(tree, b.warnings)
+    return results, b.warnings + _driver_reminders(tree, b.ported)
 
 
-def _drop_settled_flag_warnings(tree: list, warnings: list[str]) -> list[str]:
-    """Judge the PWR_FLAG reminder on the batch's result: a net that ended up
-    with a flag on it (placed by a later op) needs no reminder."""
-    import re
-
+def _driver_reminders(tree: list, ported: set[str]) -> list[str]:
+    """Judge the PWR_FLAG reminder on the batch's result, for every net the
+    batch drew ports on (stock symbols too): one with no PWR_FLAG and no
+    power-output pin fails ERC `power_pin_not_driven`."""
+    if not ported:
+        return []
     from kicad_claude.adapters import sch_netlist
 
-    pending = [(w, m.group(1)) for w in warnings
-               if "PWR_FLAG" in w and (m := re.match(r"net '([^']+)'", w))]
-    if not pending:
-        return warnings
-    flagged = {name for name, net in sch_netlist.build_sheet_nets(tree).nets.items()
-               if any(pin["ref"].startswith("#FLG") for pin in net["pins"])}
-    drop = {w for w, net in pending if net in flagged}
-    return [w for w in warnings if w not in drop]
+    undriven = sch_netlist.undriven_power_nets(tree)
+    return [f"net {net!r} has power ports but no driver: add a pwr_flag on it, "
+            f"unless a power-output pin on another sheet drives it"
+            for net in sorted(ported & undriven)]
 
 
 # Result keys the caller cannot know from its own op.
 _NEW_INFO = {"power": ("ref",), "pwr_flag": ("ref",), "connect": ("refs",),
-             "text": ("uuid",), "remove": ("wires", "kind"),
-             "move": ("contacts_broken",)}
+             "text": ("uuid",), "remove": ("wires",),
+             "move": ("contacts_broken", "nets_merged")}
 
 
 def _new_info(ops: list[dict], results: list[dict]) -> list[dict]:
@@ -524,15 +652,21 @@ def register(mcp) -> None:
           connect     pin | pins [...], net, style auto|label|global|power
                       (auto: power port for GND / stock power nets / nets
                       already drawn with ports, else label), stub_mm (2.54;
-                      0 = on the pin), flag (also a PWR_FLAG), shape
+                      0 = on the pin), flag (one PWR_FLAG for the net),
+                      shape, join (default true: label pins within 15 mm
+                      are wired together under one label)
           no_connect  pin | pins | x_mm, y_mm
           junction    x_mm, y_mm
           text        text, x_mm, y_mm, size_mm, rotation (multi-line text
                       grows upward from its anchor)
           move        ref | uuid, x_mm, y_mm, rotation, mirror (x / y / ""
                       clears), drag (default true: wires, labels, ports on
-                      the pins follow)
-          remove      ref (wires: remove its pin stubs, default true) | uuid
+                      the pins follow); a move that joins two nets is
+                      refused unless allow_merge: true
+          remove      ref | refs [...] | pattern ("#PWR*", fnmatch on
+                      references; wires: remove their pin stubs, default
+                      true) | label NET (+ x_mm, y_mm: only that one) |
+                      uuid | uuids [...]
           property    ref, name, value, create
           field       ref, field, x_mm, y_mm, angle, visible
           autoplace   refs [...] | "all", force

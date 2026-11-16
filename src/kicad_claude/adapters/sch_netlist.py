@@ -480,6 +480,24 @@ def build_sheet_nets(tree: list, path: Path | None = None) -> SheetNets:
     return result
 
 
+def undriven_power_nets(tree: list) -> set[str]:
+    """Names of the sheet's power-port nets that no `power_out` pin drives
+    (no PWR_FLAG, no regulator output): ERC `power_pin_not_driven` unless a
+    driver sits on another sheet."""
+    graph = build_sheet_graph(tree)
+    uf: _Union = graph["uf"]
+    names: dict[Any, set[str]] = {}
+    driven: set[Any] = set()
+    for p, name in graph["power_names"].items():
+        names.setdefault(uf.find(p), set()).add(name)
+    for p, pin_list in graph["pins"].items():
+        if any(pin.get("_type") == "power_out" for pin in pin_list):
+            driven.add(uf.find(p))
+    # Ports of one name are one net, however many islands they sit on.
+    driven_names = {n for root, ns in names.items() if root in driven for n in ns}
+    return {n for ns in names.values() for n in ns} - driven_names
+
+
 def _name_for(data: dict) -> str:
     """Pick a net's name. Priority: local, hierarchical, global, power, generated."""
     by_kind = {k: [] for k in LABEL_KINDS}

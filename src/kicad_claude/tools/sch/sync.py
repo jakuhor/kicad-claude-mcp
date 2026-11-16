@@ -108,10 +108,10 @@ def register(mcp) -> None:
 
         Details:
 
-        Result: `placed_footprints` and `fields_synced` are compact by
-        default (refs placed; parts changed and count per field, BOM / DNP /
-        simulation flags as `attr:<flag>`). `verbose=True` returns the
-        per-part lists (positions, field names per part).
+        Result: `placed_count` and `fields_synced` are compact by default
+        (parts changed and count per field, BOM / DNP / simulation flags as
+        `attr:<flag>`). `verbose=True` adds `placed_footprints` (with
+        positions) and the field names per part.
 
         `scope="fields"` does step 2 only: copy Value / MPN / LCSC / … onto the
         footprints in pure Python and save. No footprint placement, no deletion,
@@ -228,8 +228,9 @@ def register(mcp) -> None:
         result["scope"] = "full"
         result["netlist_path"] = str(netlist_path)
         result["pcb_path"] = str(pcb_path)
-        result["placed_footprints"] = (placement["placed"] if verbose
-                                       else [p["reference"] for p in placement["placed"]])
+        result["placed_count"] = len(placement["placed"])
+        if verbose:
+            result["placed_footprints"] = placement["placed"]
         result["no_footprint"] = placement["no_footprint"]
         result["unresolved"] = placement["unresolved"]
         result["fields_synced"] = fields_changed if verbose else _field_summary(fields_changed)

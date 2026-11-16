@@ -287,7 +287,9 @@ def test_net_class_reports_footprints_tighter_than_its_clearance(tmp_path: Path,
     mcp = _make_mcp(monkeypatch, tmp_path)
     res = _call(mcp, "add_net_class", name="Power", clearance_mm=0.25)
     assert "tight_footprints" not in res          # no nets assigned yet
-    res = _call(mcp, "assign_net_class", net_pattern="VIN", class_name="Power")
+    res = _call(mcp, "assign_net_class", patterns=["VIN", "NOPE_*"], class_name="Power")
+    assert res["matched_nets"] == {"VIN": ["VIN"], "NOPE_*": []}
+    assert res["warnings"] == ["pattern 'NOPE_*' matches no net of the design"]
     assert res["tight_footprints"] == [
         {"ref": "U1", "pads": ["1", "2"], "nets": ["VIN", "GND"], "gap_mm": 0.2}]
     res = _call(mcp, "add_net_class", name="Power", clearance_mm=0.2)

@@ -25,7 +25,8 @@ SET_BUDGET = {  # ~5-10 % above the sizes after the v2.0 merges (2026-11-11)
     # sch +3500: OP-18 edit_schematic, set_page, autoplace_fields,
     # check_schematic_readability, label_type / drag / rotation / compact
     # (measured 25211, + 3 %)
-    "core": 5000, "sch": 26000, "pcb": 18700, "rules": 5500, "library": 4000,
+    # library +400: OP-39 check_lib_ids, search `verbose` (measured 4328, + 1.7 %)
+    "core": 5000, "sch": 26000, "pcb": 18700, "rules": 5500, "library": 4400,
     # review +505: OP-17 A7 derating_profile x2, A3 i2c_mode / i2c_bus_capacitance_pf,
     # A5 source_ohm / inrush_limit_a (measured +481, + 5 %)
     # OP-30: review_part_ratings vref / rth_ja (measured 9928, + 0.2 %)

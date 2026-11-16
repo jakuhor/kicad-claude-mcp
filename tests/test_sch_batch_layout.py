@@ -554,3 +554,127 @@ def test_list_pins_groups_stacked_pins(mcp):
     assert len(grouped) == 1 and grouped[0]["numbers"] == ["1", "2"]
     assert len(_call(mcp, "list_pins", reference="R1", group_stacked=False)) == 2
     assert r is not None
+
+
+# ===== Field test 3 (OP-37 / OP-38 / OP-39) ================================ #
+
+
+R1_ONLY = [{"op": "symbol", "lib_id": "Device:R", "ref": "R1", "value": "10k",
+            "x_mm": 50.8, "y_mm": 50.8}]
+
+
+def _wire_count() -> int:
+    return len(sch_io.find_children(_tree(), "wire"))
+
+
+def test_removing_a_port_on_a_bottom_pin_takes_its_straight_stub(mcp):
+    _call(mcp, "edit_schematic", ops=R1_ONLY + [{"op": "connect", "pin": "R1.2", "net": "GND"}])
+    assert _wire_count() == 1
+    port = next(ed.get_symbol_property(s, "Reference") for s in ed.iter_instance_symbols(_tree())
+                if ed.get_symbol_property(s, "Value") == "GND")
+    res = _call(mcp, "edit_schematic", ops=[{"op": "remove", "ref": port}])
+    assert res["results"][0]["wires"] == 1
+    assert _wire_count() == 0
+
+
+def test_removing_a_part_keeps_a_wire_to_another_pin(mcp):
+    _call(mcp, "edit_schematic", ops=R1_ONLY + [
+        {"op": "symbol", "lib_id": "Device:R", "ref": "R2", "value": "1k",
+         "x_mm": 50.8, "y_mm": 76.2},
+        {"op": "wire", "from": "R1.2", "to": "R2.1"}])
+    _call(mcp, "edit_schematic", ops=[{"op": "remove", "ref": "R1"}])
+    assert _wire_count() == 1
+
+
+TWO_R = R1_ONLY + [{"op": "symbol", "lib_id": "Device:R", "ref": "R2", "value": "1k",
+                    "x_mm": 76.2, "y_mm": 50.8}]
+
+
+def _flags() -> int:
+    return sum(1 for s in ed.iter_instance_symbols(_tree())
+               if (ed.get_symbol_property(s, "Reference") or "").startswith("#FLG"))
+
+
+def test_connect_flag_places_one_flag_per_net(mcp):
+    _call(mcp, "edit_schematic", ops=TWO_R + [
+        {"op": "connect", "pins": ["R1.2", "R2.2"], "net": "GND", "flag": True},
+        {"op": "connect", "pin": "R1.1", "net": "GND", "flag": True}])
+    assert _flags() == 1
+    _call(mcp, "edit_schematic", ops=[{"op": "connect", "pin": "R2.1", "net": "GND",
+                                       "flag": True}])
+    assert _flags() == 1
+
+
+def test_stock_power_port_without_driver_gets_a_reminder(mcp):
+    res = _call(mcp, "edit_schematic", ops=TWO_R + [
+        {"op": "connect", "pins": ["R1.1", "R2.1"], "net": "+5V"}])
+    assert any("'+5V'" in w and "driver" in w for w in res["warnings"])
+    res = _call(mcp, "edit_schematic", ops=[
+        {"op": "connect", "pin": "R1.2", "net": "+5V", "flag": True}])
+    assert "warnings" not in res, res["warnings"]
+
+
+def test_move_that_merges_two_nets_is_refused(mcp):
+    _call(mcp, "edit_schematic", ops=TWO_R + [
+        {"op": "connect", "pin": "R1.1", "net": "A"},
+        {"op": "connect", "pin": "R1.2", "net": "A2"},
+        {"op": "connect", "pin": "R2.1", "net": "B"},
+        {"op": "connect", "pin": "R2.2", "net": "B2"}])
+    move = {"op": "move", "ref": "R2", "x_mm": 50.8, "y_mm": 48.26}
+    with pytest.raises(ValueError, match="merges nets"):
+        _call(mcp, "edit_schematic", ops=[move])
+    res = _call(mcp, "edit_schematic", ops=[{**move, "allow_merge": True}])
+    assert ["A", "B"] in res["results"][0]["nets_merged"]
+
+
+def test_readability_sees_ports_flags_and_the_border_band(mcp):
+    _call(mcp, "edit_schematic", ops=R1_ONLY + [
+        {"op": "power", "net": "+5V", "x_mm": 101.6, "y_mm": 50.8, "rotation": 0},
+        {"op": "power", "net": "+5V", "x_mm": 101.6, "y_mm": 50.8, "rotation": 0},
+        {"op": "label", "net": "EDGE", "x_mm": 11.43, "y_mm": 100.33}])
+    res = _call(mcp, "check_schematic_readability")
+    msgs = [f["message"] for f in res["findings"]]
+    assert any("stacked" in m for m in msgs)
+    assert any("EDGE" in m and "border" in m for m in msgs)
+
+
+def test_labels_list_and_bulk_remove_and_multi_ref_remove(mcp):
+    _call(mcp, "edit_schematic", ops=TWO_R + [
+        {"op": "connect", "pins": ["R1.1", "R2.1"], "net": "SIG"},
+        {"op": "connect", "pins": ["R1.2", "R2.2"], "net": "GND"}])
+    labels = _call(mcp, "list_texts", kind="labels", net="SIG")
+    assert len(labels) == 2 and {lab["orientation"] for lab in labels} == {"up"}
+    assert all(lab["uuid"] for lab in labels)
+    x, y = labels[0]["position_mm"]
+    _call(mcp, "edit_schematic", ops=[{"op": "remove", "label": "SIG", "x_mm": x, "y_mm": y}])
+    assert len(_call(mcp, "list_texts", kind="labels")) == 1
+    res = _call(mcp, "edit_schematic", ops=[{"op": "remove", "label": "SIG"},
+                                            {"op": "remove", "pattern": "#PWR*"}])
+    assert _call(mcp, "list_texts", kind="labels") == []
+    assert res["results"] == [{"i": 1, "wires": 2}]
+    assert not any((ed.get_symbol_property(s, "Reference") or "").startswith("#PWR")
+                   for s in ed.iter_instance_symbols(_tree()))
+    _call(mcp, "edit_schematic", ops=[{"op": "remove", "refs": ["R1", "R2"]}])
+    assert list(ed.iter_instance_symbols(_tree())) == []
+
+
+def test_connect_wires_close_pins_under_one_label(mcp):
+    ops = R1_ONLY + [{"op": "symbol", "lib_id": "Device:R", "ref": "R2", "value": "1k",
+                      "x_mm": 58.42, "y_mm": 50.8},
+                     {"op": "symbol", "lib_id": "Device:R", "ref": "R3", "value": "1k",
+                      "x_mm": 101.6, "y_mm": 50.8},
+                     {"op": "connect", "pins": ["R1.1", "R2.1", "R3.1"], "net": "SIG"}]
+    _call(mcp, "edit_schematic", ops=ops)
+    labels = _call(mcp, "list_texts", kind="labels", net="SIG")
+    assert len(labels) == 2          # R1 + R2 share one; R3 is 50 mm away
+    assert _nets(mcp)["SIG"] == ["R1.1", "R2.1", "R3.1"]
+    assert _call(mcp, "check_schematic_readability")["counts"].get("SR-SHORT-LABEL-NET", 0) == 0
+
+
+def test_unknown_lib_ids_are_refused_up_front_with_a_hint(mcp):
+    with pytest.raises(ValueError, match=r"op 1: unknown lib_id 'Devices:R' \(did you mean "
+                                         r"'Device:R'\?\).*nothing written"):
+        _call(mcp, "edit_schematic", ops=R1_ONLY + [
+            {"op": "symbol", "lib_id": "Devices:R", "ref": "R2", "value": "1k",
+             "x_mm": 76.2, "y_mm": 50.8}])
+    assert list(ed.iter_instance_symbols(_tree())) == []

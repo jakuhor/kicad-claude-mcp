@@ -134,9 +134,18 @@ def register(mcp) -> None:
 
     @on_board
     def list_footprints() -> list[dict]:
-        """Placed footprints: reference, value, lib_id, layer, position_mm,
-        rotation, courtyard_mm [x1, y1, x2, y2] (board coords, rotation
-        applied; null without a courtyard) for placement and spacing."""
+        """Placed footprints: reference, value, position, rotation,
+        courtyard and body boxes, a connector's `edge_side`.
+
+        Details:
+
+        Each: reference, value, lib_id, layer, position_mm, rotation,
+        courtyard_mm and body_mm (F.Fab outline) [x1, y1, x2, y2] (board
+        coords, rotation applied; null when missing). `courtyard_is_box:
+        false` when the courtyard is not a rectangle and the box covers free
+        notches (a module's antenna keep-out). `edge_side` (connectors): the
+        board side the mating face points to, from the footprint's "PCB
+        Edge" line, else the body overhanging its pads."""
         tree, _ = _load_active_pcb()
         return ed.list_footprints_summary(tree)
 
@@ -429,12 +438,13 @@ def register(mcp) -> None:
         For text on copper, use F.Cu / B.Cu — handy for IDs etched into copper.
         """
         tree, path = _load_active_pcb()
-        ed.add_silk_text(
+        node = ed.add_silk_text(
             tree, text=text, x_mm=x_mm, y_mm=y_mm,
             layer=layer, size_mm=size_mm, rotation=rotation,
         )
         backup = _save_with_backup(tree, path)
         return {
+            "uuid": str(sch_io.find_child(node, "uuid")[1]),
             "text": text,
             "position_mm": [x_mm, y_mm],
             "layer": layer,
@@ -455,7 +465,8 @@ def register(mcp) -> None:
     ):
         """2D PNG of the board (kicad-cli plot, KiCAD colours) returned as an
         image, to check placement, silkscreen and routing by eye. `layers`
-        default F/B.Cu, F/B.SilkS, F.Fab, Edge.Cuts; `region_mm=[x1, y1, x2,
+        default F/B.Cu, F/B.SilkS, Edge.Cuts (add F.Fab for values);
+        `region_mm=[x1, y1, x2,
         y2]` zooms (board coords), else the outline + 1 mm; `bottom=True`
         mirrors to view from below.
 
@@ -499,6 +510,7 @@ def register(mcp) -> None:
         rotation: float | None = None,
         size_mm: float | None = None,
         layer: str | None = None,
+        thickness_mm: float | None = None,
     ) -> dict:
         """Show / hide, move, rotate, resize or re-layer a placed footprint's
         field (Reference, Value or a user field) on the board. `x_mm`/`y_mm`
@@ -508,7 +520,8 @@ def register(mcp) -> None:
         Details:
 
         `references` takes several parts for a bulk change (`visible`,
-        `size_mm` - thickness scales with it -, `layer`, `rotation`). A
+        `size_mm` - thickness scales with it unless `thickness_mm` is
+        given -, `thickness_mm`, `layer`, `rotation`). A
         position needs exactly one reference. `layer` e.g. F.SilkS / F.Fab.
         For a whole-board pass use `tidy_footprint_fields`.
         """
@@ -530,7 +543,7 @@ def register(mcp) -> None:
             changed |= pcb_fields.set_field(
                 fp, field, visible=visible,
                 position=(x_mm, y_mm) if x_mm is not None else None,
-                angle=rotation, size=size_mm, layer=layer)
+                angle=rotation, size=size_mm, layer=layer, thickness=thickness_mm)
             out.append({"reference": ref,
                         **pcb_fields.field_info(fp, pcb_fields.field_node(fp, field))})
         backup = _save_with_backup(tree, path) if changed else None
@@ -547,6 +560,7 @@ def register(mcp) -> None:
         clearance_mm: float = 0.2,
         hide_unplaced: bool = False,
         dry_run: bool = False,
+        verbose: bool = False,
     ) -> dict:
         """Keep silkscreen references off copper: move each footprint's
         Reference (default all) to the first free spot around its courtyard,
@@ -559,16 +573,29 @@ def register(mcp) -> None:
         Spots tried: above, below, right, left, then the four corners, each
         at `clearance_mm` from the courtyard and then 0.5 / 1.0 mm further.
         Text is set horizontal. `size_mm` resizes the references first
-        (thickness scales). Text extents are an estimate of KiCAD's stroke
+        (thickness scales). A reference below the project's
+        `min_text_height` / `min_text_thickness` rules (`apply_fab_preset`)
+        is raised to them (`raised_to_minimum`). `moved` lists references;
+        `verbose=True` adds each new position. Text extents are an estimate of KiCAD's stroke
         font, so confirm with `run_drc` (silk_overlap, silk_over_copper).
         `dry_run=True` reports without writing.
         """
         from kicad_claude.adapters import pcb_fields
 
         tree, path = _load_active_pcb()
-        result = pcb_fields.tidy_fields(tree, references, hide_values, size_mm,
-                                        clearance_mm, hide_unplaced)
-        changed = any(result[k] for k in ("moved", "values_hidden", "references_hidden"))
+        proj = state.get_active()
+        rules = {}
+        if proj.pro_path.is_file():
+            rules = ps.get_design_rules(ps.load_pro(proj.pro_path))
+        result = pcb_fields.tidy_fields(
+            tree, references, hide_values, size_mm, clearance_mm, hide_unplaced,
+            min_thickness=float(rules.get("min_text_thickness") or 0),
+            min_height=float(rules.get("min_text_height") or 0))
+        changed = any(result[k] for k in ("moved", "values_hidden", "references_hidden",
+                                          "raised_to_minimum"))
+        if not verbose:
+            result["moved"] = [m["ref"] for m in result["moved"]]
+        result = {k: v for k, v in result.items() if v or k == "moved"}
         backup = _save_with_backup(tree, path) if changed and not dry_run else None
         result.update(dry_run=dry_run, backup=str(backup) if backup else None)
         return result
@@ -848,7 +875,7 @@ def register(mcp) -> None:
             "position_mm": list(found["point"]),
             "layers": found["layers"],
             "net": found["net_name"],
-            "net_number": found["net"],
+            **({"net_number": found["net"]} if found["net"] else {}),
             "type": found["type"],
         }
 
@@ -856,8 +883,14 @@ def register(mcp) -> None:
 
     @on_board
     def list_pads(reference: str = "") -> list[dict]:
-        """Every pad on the board, or only those of one footprint: position,
-        layers, net, type, shape, size_mm [w, h] (before the pad's rotation)."""
+        """Every pad on the board, or one footprint's: position, net, size,
+        board-axes box.
+
+        Details:
+
+        Each: position, layers, net, type, shape, size_mm [w, h] (before the
+        pad's rotation) and bbox_mm [x1, y1, x2, y2] on the board axes
+        (rotation applied)."""
         tree, _ = _load_active_pcb()
         pads = pcb_netlist.list_pads(tree)
         if reference:
@@ -874,6 +907,10 @@ def register(mcp) -> None:
                 "type": p["type"],
                 "shape": p.get("shape", ""),
                 "size_mm": p.get("size_mm", []),
+                "bbox_mm": [round(min(c[0] for c in p["corners"]), 4),
+                            round(min(c[1] for c in p["corners"]), 4),
+                            round(max(c[0] for c in p["corners"]), 4),
+                            round(max(c[1] for c in p["corners"]), 4)] if p.get("corners") else None,
             }
             for p in pads
         ]

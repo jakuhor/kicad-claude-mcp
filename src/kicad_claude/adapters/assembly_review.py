@@ -478,6 +478,53 @@ def _testpoint_coverage(fps: list[dict], findings: list) -> dict:
     return {"nets": len(nets), "with_testpoint": got, "rails_without": rails}
 
 
+# Supply / power-path net names: VIN, +24V, LED_24V, VBUS, +3V3, ...
+POWER_PATH_RE = re.compile(r"(^|[_+/-])(\d+V\d*|VIN|VBUS|VBAT|VSYS|VCC|VDD|VOUT|VMOT|PWR)"
+                           r"($|[_+-])", re.I)
+
+
+def power_path_blocks(fps: list[dict], min_run_mm: float = 5.0) -> list[dict]:
+    """Parts that stand in a supply net's straight run: the net's
+    footprints joined by a minimum spanning tree (pad-group centres), and a
+    part with no pad on that net whose courtyard that tree's edge crosses.
+    A floorplan smell: the power path is split by another block (the buck
+    placed between the input jack and the load switch)."""
+    from kicad_claude.adapters.pcb_geometry import is_ground_net
+
+    by_net: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    for f in fps:
+        for pad in f["pads"]:
+            if pad["net"] and POWER_PATH_RE.search(pad["net"].lstrip("/")) \
+                    and not is_ground_net(pad["net"]):
+                by_net[pad["net"]][f["ref"]].append(pad["at"])
+    fitted = [f for f in fps if "dnp" not in f["attrs"] and len(f["hull"]) >= 3]
+    out = []
+    for net, groups in sorted(by_net.items()):
+        if len(groups) < 2:
+            continue
+        nodes = [(ref, (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)))
+                 for ref, pts in groups.items()]
+        # Prim's minimum spanning tree over the footprints of the net.
+        done, edges = {0}, []
+        while len(done) < len(nodes):
+            i, j = min(((i, j) for i in done for j in range(len(nodes)) if j not in done),
+                       key=lambda e: math.dist(nodes[e[0]][1], nodes[e[1]][1]))
+            done.add(j)
+            edges.append((nodes[i], nodes[j]))
+        for (ra, pa), (rb, pb) in edges:
+            if math.dist(pa, pb) < min_run_mm:
+                continue
+            for f in fitted:
+                if f["ref"] in groups:
+                    continue
+                hull = f["hull"]
+                crosses = any(_seg_cross(pa, pb, hull[k], hull[(k + 1) % len(hull)])
+                              for k in range(len(hull)))
+                if crosses or _inside((pa[0] + pb[0]) / 2, (pa[1] + pb[1]) / 2, hull):
+                    out.append({"net": net, "ref": f["ref"], "between": [ra, rb]})
+    return out
+
+
 def check_assembly(tree: list, assembly_sides: str = "auto", min_spacing_mm: float = 0.0,
                    edge_clearance_mm: float = 0.3, fiducials_min: int = 2,
                    tall_mm: float = 5.0, tall_edge_mm: float = 3.0,
@@ -625,6 +672,16 @@ def check_assembly(tree: list, assembly_sides: str = "auto", min_spacing_mm: flo
         for path, refs in sorted(missing.items()):
             findings.append(_f("info", "AS-3D-MISSING", ",".join(refs[:10]),
                                f"3D model {path} does not resolve to a file: no height, no render."))
+    by_ref: dict[str, list[dict]] = defaultdict(list)
+    for b in power_path_blocks(fps):
+        by_ref[b["ref"]].append(b)
+    for ref, hits in sorted(by_ref.items()):
+        runs = "; ".join(f"{h['net']} {h['between'][0]}-{h['between'][1]}" for h in hits[:3])
+        findings.append(_f("info", "AS-POWER-PATH", ref,
+                           f"sits in the straight run of a supply net ({runs}"
+                           f"{'; ...' if len(hits) > 3 else ''}): the power path detours "
+                           f"around it. Keep the input -> protection -> switch / regulator "
+                           f"chain in one region, unless this part belongs there."))
     order = {"error": 0, "warning": 1, "info": 2}
     findings.sort(key=lambda x: (order[x["severity"]], x["rule"], x["ref"]))
     return {"footprints": len(fps), "fitted": len(fitted), "smd": len(smd), "tht": len(tht),

@@ -7,9 +7,29 @@ string built from `lib_id + description + keywords/tags` so a query like
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from rapidfuzz import fuzz, process, utils
+
+# Vendor prefixes in front of a generic part number: SN74AHCT1G125 is
+# KiCAD's 74AHCT1G125, MC74HC595 its 74HC595.
+_VENDOR_PREFIX = re.compile(r"^(sn|mc|nl|tc|hd|m|cd|74lvc|nc7s)(?=74|4\d{3})", re.I)
+
+
+def _name_tiers(q: str, entries: dict, top: int = 100) -> list[tuple[int, int, str]]:
+    """(-score, name length, lib_id) for names equal to / starting with /
+    containing the processed query `q`: scores top, top-1, top-2."""
+    tiers = []
+    for lid in entries:
+        name = utils.default_process(lid.split(":", 1)[-1])
+        if name == q:
+            tiers.append((-top, len(name), lid))
+        elif name.startswith(q):
+            tiers.append((-(top - 1), len(name), lid))
+        elif len(q) >= 3 and q in name:
+            tiers.append((-(top - 2), len(name), lid))
+    return tiers
 
 
 def _symbol_haystack(entry: dict[str, Any]) -> str:
@@ -56,14 +76,25 @@ def _search(
     q = utils.default_process(query)
     tiers: list[tuple[int, int, str]] = []  # (-score, name length, lib_id)
     if q:
-        for lid in entries:
-            name = utils.default_process(lid.split(":", 1)[-1])
-            if name == q:
-                tiers.append((-100, len(name), lid))
-            elif name.startswith(q):
-                tiers.append((-99, len(name), lid))
-            elif len(q) >= 3 and q in name:
-                tiers.append((-98, len(name), lid))
+        tiers = _name_tiers(q, entries)
+    words = query.split()
+    if not tiers and len(words) > 1:
+        # "D_TVS unidirectional": a name plus a description word. The name
+        # word still matches by name (96 .. 94); the other words rank them.
+        best: dict[str, tuple[int, int, str]] = {}
+        for w in words:
+            wq = utils.default_process(w)
+            if len(wq) < 2:
+                continue
+            for t in _name_tiers(wq, entries, top=96):
+                if t[2] not in best or t < best[t[2]]:
+                    best[t[2]] = t
+        rest = [utils.default_process(w) for w in words]
+        tiers = [(neg - sum(1 for w in rest if w and w in utils.default_process(
+                     haystack_fn(entries[lid]))), n, lid)
+                 for neg, n, lid in best.values()]
+    if not tiers and q and (m := _VENDOR_PREFIX.match(q)):
+        tiers = _name_tiers(q[m.end():], entries, top=97)
     family = False
     if not tiers and len(q) >= 4:
         # A part number the libraries lack (SMCJ24A, LMR36520): the longest

@@ -22,7 +22,8 @@ from kicad_claude.adapters import kicad_cli
 
 PT_PER_MM = 72 / 25.4
 MAX_PIXELS = 4000          # longest side; the dpi is lowered to fit
-DEFAULT_LAYERS = ("F.Cu", "B.Cu", "F.SilkS", "B.SilkS", "F.Fab", "Edge.Cuts")
+# No F.Fab: its values cover the placement view; pass it in `layers` to see it.
+DEFAULT_LAYERS = ("F.Cu", "B.Cu", "F.SilkS", "B.SilkS", "Edge.Cuts")
 
 
 def draw_order(layers: list[str], bottom: bool) -> list[str]:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -161,8 +162,10 @@ def _group_pins(pins: list[dict]) -> list[dict]:
     """Merge pins with the same name, type, shape and side into one entry
     carrying `numbers`, in first-seen order; a lone pin keeps `number`.
     Unnamed pins (`""`, `~`) are never merged: they are different pins.
-    A grouped entry drops `at` (one position per pin)."""
+    A grouped entry keeps one `at` when its pins are stacked, else `at` is
+    a list with one position per number (USB-C D+ A6 / B6 sit apart)."""
     groups: dict[tuple, dict] = {}
+    ats: dict[tuple, list] = {}
     for pin in pins:
         if pin.get("name") in ("", "~", None):
             groups[("#", len(groups))] = dict(pin)
@@ -171,12 +174,39 @@ def _group_pins(pins: list[dict]) -> list[dict]:
         g = groups.get(key)
         if g is None:
             groups[key] = dict(pin)
+            ats[key] = [pin.get("at")]
         else:
             if "numbers" not in g:
                 g["numbers"] = [g.pop("number")]
-                g.pop("at", None)
             g["numbers"].append(pin.get("number"))
+            ats[key].append(pin.get("at"))
+    for key, g in groups.items():
+        if "numbers" not in g or "at" not in g:
+            continue
+        pts = ats[key]
+        if any(p != pts[0] for p in pts):
+            g["at"] = pts
     return list(groups.values())
+
+
+# TVS series: a trailing "CA" is bidirectional, a bare "A" unidirectional.
+_TVS_PART = re.compile(r"^(SMAJ|SMBJ|SMCJ|SMDJ|SMF|SMLJ|P4SMA|P6SMB|1\.5SMC|P6KE|1\.5KE|"
+                       r"SA|5KP|15KP|SD)\d+(\.\d+)?(C?A)(?![A-Z0-9])", re.I)
+
+
+def _generic_hint(query: str) -> str:
+    """Generic symbols to suggest when no symbol is named like `query`."""
+    m = _TVS_PART.match(query.strip())
+    if m:
+        if m.group(3).upper() == "CA":
+            return (f"{query} is a bidirectional TVS: use Device:D_TVS with the "
+                    f"part number as Value, or create_symbol.")
+        return (f"{query} is a unidirectional TVS: use Device:D_Zener (pin 1 = K, "
+                f"pin 2 = A; D_TVS is bidirectional) with the part number as "
+                f"Value, or create_symbol.")
+    return ("Use a generic symbol (Device:D_Zener for a unidirectional TVS, "
+            "Device:D_TVS for a bidirectional one, Transistor_FET:Q_PMOS_SGD, "
+            "...) with the part number as Value, or create_symbol.")
 
 
 def _search_result(query: str, hits: list[dict], kind: str) -> dict:
@@ -187,10 +217,72 @@ def _search_result(query: str, hits: list[dict], kind: str) -> dict:
             f"no {kind} is named like {query!r}: " +
             ("the hits match description words only and are often unrelated. "
              if hits else "nothing matched. ") +
-            ("Use a generic symbol (Device:D_TVS, Device:D_Zener, "
-             "Transistor_FET:Q_PMOS_SGD, ...) with the part number as Value, "
-             "or create_symbol." if kind == "symbol" else
+            (_generic_hint(query) if kind == "symbol" else
              "Search the package name (SOT-23-5, SOIC-8, ...) or create_footprint."))
+    return out
+
+
+def suggest_id(wanted: str, known) -> str | None:
+    """The closest known `Lib:Name` for a mistyped one: the same name in
+    another library first, else the nearest spelling."""
+    import difflib
+
+    name = wanted.split(":", 1)[-1]
+    same = sorted(k for k in known if k.split(":", 1)[-1] == name)
+    if same:
+        return same[0]
+    lname = name.lower()
+    same = sorted(k for k in known if k.split(":", 1)[-1].lower() == lname)
+    if same:
+        return same[0]
+    hit = difflib.get_close_matches(wanted, list(known), n=1, cutoff=0.75)
+    if hit:
+        return hit[0]
+    names: dict[str, str] = {}
+    for k in known:
+        names.setdefault(k.split(":", 1)[-1], k)
+    hit = difflib.get_close_matches(name, list(names), n=1, cutoff=0.8)
+    return names[hit[0]] if hit else None
+
+
+def check_ids(symbols: list[str], footprints: list[str]) -> dict:
+    """Existence check for many lib_ids at once, with did-you-mean."""
+    idx = _ensure_index()
+    out: dict = {}
+    if symbols:
+        rows = {}
+        for lib_id in symbols:
+            meta = idx["symbols"].get(lib_id)
+            if meta is None:
+                rows[lib_id] = {"exists": False, "did_you_mean": suggest_id(lib_id, idx["symbols"])}
+            else:
+                rows[lib_id] = {"exists": True, "pins": meta.get("pin_count"),
+                                "default_footprint": meta.get("default_footprint") or None}
+        out["symbols"] = rows
+    if footprints:
+        fps = idx.get("footprints") or {}
+        rows = {}
+        for fp in footprints:
+            meta = fps.get(fp)
+            if meta is None:
+                rows[fp] = {"exists": False, "did_you_mean": suggest_id(fp, fps)}
+            else:
+                rows[fp] = {"exists": True}
+        out["footprints"] = rows
+    return out
+
+
+# What a hit carries by default; `verbose=True` returns the whole entry.
+_COMPACT = ("lib_id", "description", "pin_count", "default_footprint", "_score", "_match")
+
+
+def _compact(entry: dict, verbose: bool) -> dict:
+    if verbose:
+        return entry
+    out = {k: entry[k] for k in _COMPACT if entry.get(k) not in (None, "")}
+    d = out.get("description", "")
+    if len(d) > 90:
+        out["description"] = d[:87] + "..."
     return out
 
 
@@ -281,8 +373,8 @@ def register(mcp) -> None:
         }
 
     @mcp.tool()
-    def search_symbol(query: str, max_results: int = 10) -> dict:
-        """Fuzzy search across indexed symbols: `{"hits": [...]}`, each with
+    def search_symbol(query: str, max_results: int = 10, verbose: bool = False) -> dict:
+        """Fuzzy search across indexed symbols: `{"hits": [...]}` with
         `_score` and `_match` (name / family / text); `note` when no hit
         matches by name or family.
 
@@ -291,31 +383,48 @@ def register(mcp) -> None:
         Searches lib_id, description and keywords. `_match`: "name" (the
         query is in the symbol name), "family" (only a shorter prefix
         matched: same series, not that part) or "text" (description words;
-        often unrelated). `_score` is 0-100.
+        often unrelated). `_score` is 0-100. A hit carries lib_id,
+        description, pin_count, default_footprint; `verbose=True` the whole
+        entry (keywords, datasheet, ...). A vendor prefix is dropped when
+        nothing else matches (SN74AHCT1G125 finds 74AHCT1G125); in a
+        several-word query a word that names a symbol still matches by name
+        ("D_TVS unidirectional").
         """
         idx = _ensure_index()
         return _search_result(query, [
-            _decode_readable(e)
+            _compact(_decode_readable(e), verbose)
             for e in search_symbols(query, idx, max_results=max_results)
         ], "symbol")
 
     @mcp.tool()
-    def search_footprint(query: str, max_results: int = 10) -> dict:
+    def search_footprint(query: str, max_results: int = 10, verbose: bool = False) -> dict:
         """Fuzzy search across indexed footprints by lib_id, description,
         tags: `{"hits": [...]}` with `_score` / `_match` as `search_symbol`,
-        and `note` when no hit is a name or family match."""
+        and `note` when no hit is a name or family match.
+
+        Details:
+
+        A hit carries lib_id and description; `verbose=True` adds tags."""
         idx = _ensure_index()
         return _search_result(query, [
-            _decode_readable(e)
+            _compact(_decode_readable(e), verbose)
             for e in search_footprints(query, idx, max_results=max_results)
         ], "footprint")
+
+    @mcp.tool()
+    def check_lib_ids(symbols: list[str] | None = None,
+                      footprints: list[str] | None = None) -> dict:
+        """Check many symbol / footprint lib_ids in one call: `exists`, pin
+        count, default footprint, `did_you_mean` for an unknown one."""
+        return check_ids(list(symbols or []), list(footprints or []))
 
     @mcp.tool()
     def get_symbol_details(lib_id: str, group_pins: bool = True) -> dict:
         """Metadata and pins of a symbol by `lib_id`, each with the body
         `side` it sits on (plan placement before `add_symbol`). Pins sharing
-        name, type, shape and side are one entry with `numbers`;
-        `group_pins=False` lists each pin with its library `at` [x, y].
+        name, type, shape and side are one entry with `numbers` and `at`
+        (one point when stacked, else one per number); `group_pins=False`
+        lists each pin with its library `at` [x, y].
 
         Details:
 

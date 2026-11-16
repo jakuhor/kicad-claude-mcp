@@ -18,7 +18,7 @@ from kicad_claude.tools.pcb import layout as pcb
 
 logger = logging.getLogger("kicad-claude.tools.pcb.batch")
 
-OPS = ("move", "track", "via", "zone", "remove")
+OPS = ("move", "track", "via", "zone", "zone_set", "text", "remove")
 
 
 class OpError(ValueError):
@@ -63,6 +63,21 @@ class _Board:
 
 
 def _op_move(b: _Board, op: dict) -> dict:
+    if "near" in op:
+        refs = op.get("refs") or [op["ref"]]
+        if op.get("layer"):
+            for ref in refs:
+                fp = ed.find_footprint_by_reference(b.tree, ref)
+                if fp is None:
+                    raise OpError(f"no footprint {ref!r}")
+                at = ed.find_child(fp, "at")
+                ed.move_footprint(b.tree, ref, *ed.file_to_pcb_xy(float(at[1]), float(at[2])),
+                                  layer=op["layer"])
+        placed = ed.place_near(b.tree, refs, op["near"], op.get("side", "right"),
+                               gap_mm=float(op.get("gap_mm", 0.25)),
+                               rotation=op.get("rotation"))
+        b.moved()
+        return {"placed": placed}
     x, y = _xy(op)
     ed.move_footprint(b.tree, op["ref"], x, y, rotation=op.get("rotation"),
                       layer=op.get("layer"))
@@ -125,6 +140,36 @@ def _op_zone(b: _Board, op: dict) -> dict:
     return {}
 
 
+def _op_zone_set(b: _Board, op: dict) -> dict:
+    zones = ed.find_zones(b.tree, item_uuid=op.get("uuid", ""), name=op.get("name", ""),
+                          net=op.get("net", ""), layer=op.get("layer", ""))
+    if not zones:
+        raise OpError("no zone matches")
+    keys = ("pad_connection", "priority", "clearance_mm", "min_thickness_mm",
+            "thermal_gap_mm", "thermal_bridge_mm")
+    args = {k: op[k] for k in keys if k in op}
+    if not args:
+        raise OpError(f"nothing to set; keys: {', '.join(keys)}")
+    for z in zones:
+        ed.set_zone(z, **args)
+    return {"zones": len(zones)} if "uuid" not in op else {}
+
+
+def _op_text(b: _Board, op: dict) -> dict:
+    if op.get("uuid"):
+        ed.edit_text(b.tree, op["uuid"], text=op.get("text"), x_mm=op.get("x_mm"),
+                     y_mm=op.get("y_mm"), rotation=op.get("rotation"),
+                     layer=op.get("layer"), size_mm=op.get("size_mm"))
+        return {}
+    x, y = _xy(op)
+    node = ed.add_silk_text(b.tree, text=op["text"], x_mm=x, y_mm=y,
+                            layer=op.get("layer", "F.SilkS"),
+                            size_mm=float(op.get("size_mm", 1.0)),
+                            rotation=op.get("rotation", 0),
+                            thickness_mm=op.get("thickness_mm"))
+    return {"uuid": str(ed.find_child(node, "uuid")[1])}
+
+
 def _op_remove(b: _Board, op: dict) -> dict:
     if op.get("ref"):
         if not ed.remove_footprint(b.tree, op["ref"]):
@@ -138,7 +183,8 @@ def _op_remove(b: _Board, op: dict) -> dict:
 
 
 _HANDLERS = {"move": _op_move, "track": _op_track, "via": _op_via,
-             "zone": _op_zone, "remove": _op_remove}
+             "zone": _op_zone, "zone_set": _op_zone_set, "text": _op_text,
+             "remove": _op_remove}
 
 
 def apply_ops(tree: list, ops: list[dict]) -> tuple[dict, list[dict]]:
@@ -170,15 +216,19 @@ def register(mcp) -> None:
     def edit_board(ops: list[dict[str, Any]], dry_run: bool = False) -> dict:
         """Many board edits in ONE write, all or nothing; prefer it to
         single move_footprint / add_track / add_via / add_zone calls. Ops:
-        move, track, via, zone, remove. Pads are "REF.PAD": {"op":"track",
-        "from":"U1.3","to":"C5.1","width_mm":0.4} takes the pads' net.
-        help() lists every op's keys.
+        move (or "near":"U1.2","side":"left"), track, via, zone, zone_set,
+        text, remove. Pads are "REF.PAD": {"op":"track","from":"U1.3",
+        "to":"C5.1"} takes the pads' net. help() lists every op's keys.
 
         Details:
 
         Ops (coordinates in mm, KiCAD board coords, Y down):
           move    ref, x_mm, y_mm, rotation, layer (pads, footprint zones
-                  follow)
+                  follow) | ref or refs [...], near "REF" or "REF.PAD",
+                  side left / right / top / bottom (default right), gap_mm
+                  (0.25, courtyard to courtyard), rotation, layer: beside
+                  the anchor, the first centred on it (or its pad), the
+                  rest stacked along that side; returns the positions
           track   from "REF.PAD" | [x, y], points [[x, y], ...], to …;
                   width_mm (0.25), layer (F.Cu), net (default: the pads'
                   net; pads on two nets are refused)
@@ -187,12 +237,19 @@ def register(mcp) -> None:
           zone    net, layer, polygon_mm, pad_connection (thermal / solid /
                   thru_hole_only / none), priority, fill_clearance_mm,
                   min_thickness_mm, thermal_gap_mm, thermal_bridge_mm, name
-          remove  ref (a footprint) | uuid | net (+ kinds [track, arc, via,
-                  zone], layer)
+          zone_set  uuid | name | net (+ layer); pad_connection,
+                  priority, clearance_mm, min_thickness_mm, thermal_gap_mm,
+                  thermal_bridge_mm (changes a pour in place; refill after)
+          text    text, x_mm, y_mm, layer (F.SilkS), size_mm (1.0),
+                  rotation, thickness_mm: adds, returns its uuid | uuid +
+                  any of text, x_mm, y_mm, rotation, layer, size_mm: edits.
+                  Back-layer text is mirrored
+          remove  ref (a footprint) | uuid (track, arc, via, zone, text) |
+                  net (+ kinds [track, arc, via, zone], layer)
 
         Returns `applied` (count per op kind), `notes` only for what the
         caller did not pass (a track's net taken from its pads, items
-        removed), and `backup`. An op that fails raises "op N (kind): ..."
+        removed, new text uuids, near-move positions), and `backup`. An op that fails raises "op N (kind): ..."
         and nothing is written. `dry_run=True` applies in memory only.
         Zones need `run_drc(refill_zones=True)` afterwards.
         """

@@ -781,3 +781,142 @@ def test_courtyard_bbox_rotates_with_the_footprint():
     fp = sexpdata.loads('(footprint "X" (layer "F.Cu") (at 0 0)'
                         ' (fp_circle (center 1 1) (end 2 1) (layer "F.CrtYd")))')
     assert ed.footprint_courtyard_bbox(fp) == [0, 0, 2, 2]
+
+
+# ===== Field test 3 (OP-37 / OP-38 / OP-39) ================================ #
+
+
+def _pcb_tree(blank_project):
+    return sch_io.parse_file(blank_project["pcb"])
+
+
+def test_back_silk_text_is_mirrored_and_text_ops_edit_and_remove(blank_project, tmp_path,
+                                                                  monkeypatch):
+    mcp = _mcp_with_batch(monkeypatch, tmp_path)
+    res = _call(mcp, "add_silk_text", text="REV A", x_mm=10, y_mm=10, layer="B.SilkS")
+    node = sch_io.find_children(_pcb_tree(blank_project), "gr_text")[0]
+    assert res["uuid"] == str(sch_io.find_child(node, "uuid")[1])
+    j = sch_io.find_child(sch_io.find_child(node, "effects"), "justify")
+    assert [str(w) for w in j[1:]] == ["mirror"]
+
+    res = _call(mcp, "edit_board", ops=[
+        {"op": "text", "uuid": res["uuid"], "text": "REV B", "x_mm": 12, "layer": "F.SilkS"},
+        {"op": "text", "text": "T2", "x_mm": 5, "y_mm": 5}])
+    new_uuid = res["notes"][0]["uuid"]
+    texts = sch_io.find_children(_pcb_tree(blank_project), "gr_text")
+    first = texts[0]
+    assert first[1] == "REV B"
+    assert [float(v) for v in sch_io.find_child(first, "at")[1:3]] == [12.0, 10.0]
+    assert sch_io.find_child(sch_io.find_child(first, "effects"), "justify") is None
+    _call(mcp, "edit_board", ops=[{"op": "remove", "uuid": new_uuid}])
+    assert len(sch_io.find_children(_pcb_tree(blank_project), "gr_text")) == 1
+
+
+def test_zone_set_changes_a_pour_in_place(blank_project, tmp_path, monkeypatch):
+    mcp = _mcp_with_batch(monkeypatch, tmp_path)
+    _call(mcp, "edit_board", ops=[
+        {"op": "zone", "net": "", "layer": "F.Cu", "name": "POUR",
+         "polygon_mm": [[0, 0], [10, 0], [10, 10]]}])
+    zone = sch_io.find_children(_pcb_tree(blank_project), "zone")[0]
+    zid = str(sch_io.find_child(zone, "uuid")[1])
+    _call(mcp, "edit_board", ops=[{"op": "zone_set", "uuid": zid, "pad_connection": "solid",
+                                   "priority": 2, "clearance_mm": 0.3}])
+    zone = sch_io.find_children(_pcb_tree(blank_project), "zone")[0]
+    cp = sch_io.find_child(zone, "connect_pads")
+    assert str(cp[1]) == "yes"
+    assert float(sch_io.find_child(cp, "clearance")[1]) == 0.3
+    assert int(sch_io.find_child(zone, "priority")[1]) == 2
+    assert str(sch_io.find_child(zone, "uuid")[1]) == zid
+    _call(mcp, "edit_board", ops=[{"op": "zone_set", "name": "POUR",
+                                   "pad_connection": "thermal"}])
+    cp = sch_io.find_child(sch_io.find_children(_pcb_tree(blank_project), "zone")[0], "connect_pads")
+    assert all(isinstance(c, list) for c in cp[1:])
+
+
+def test_move_near_packs_parts_beside_the_anchor_by_courtyard(blank_project, tmp_path,
+                                                               monkeypatch):
+    mcp = _mcp_with_batch(monkeypatch, tmp_path)
+    tree = _pcb_tree(blank_project)
+    for ref, x in (("U1", 50), ("C1", 10), ("C2", 10)):
+        ed.add_footprint(tree, qualified_lib_id="T:R", reference=ref, value="x",
+                         x_mm=x, y_mm=x, fp_def_node=sexpdata.loads(_R_DEF))
+    sch_io.write_file(blank_project["pcb"], tree)
+    # U1 courtyard [48.5, 49.25, 51.5, 50.75]; a rotated R courtyard is 1.5 x 3.
+    res = _call(mcp, "edit_board", ops=[
+        {"op": "move", "refs": ["C1", "C2"], "near": "U1.1", "side": "left",
+         "rotation": 90, "gap_mm": 0.5}])
+    placed = {p["ref"]: p for p in res["notes"][0]["placed"]}
+    boxes = {f["reference"]: f["courtyard_mm"]
+             for f in _call(mcp, "list_footprints")}
+    assert boxes["C1"][2] == 48.0          # right edge 0.5 mm left of U1
+    assert boxes["C1"][1] + boxes["C1"][3] == 2 * 50  # centred on U1.1 (y 50)
+    assert boxes["C2"][1] == boxes["C1"][3] + 0.5   # stacked below
+    assert placed["C2"]["x_mm"] == placed["C1"]["x_mm"]
+
+
+def test_thin_reference_is_raised_to_the_text_minimum():
+    from kicad_claude.adapters import pcb_fields as pf
+    from tests.test_pcb_fields import _board, _fp
+
+    tree = _board(_fp("Q2", 20, 20).replace("(thickness 0.15)", "(thickness 0.1)", 1))
+    fp = ed.find_footprint_by_reference(tree, "Q2")
+    r = pf.tidy_fields(tree, min_thickness=0.15, min_height=0.8)
+    assert r["raised_to_minimum"] == ["Q2"]
+    assert pf.field_info(fp, pf.field_node(fp, "Reference"))["thickness_mm"] == 0.15
+    assert pf.set_field(fp, "Reference", thickness=0.2)
+    assert pf.field_info(fp, pf.field_node(fp, "Reference"))["thickness_mm"] == 0.2
+
+
+def test_connector_edge_side_body_and_pad_bbox(blank_project, tmp_path, monkeypatch):
+    import pytest
+
+    from kicad_claude.utils.kicad_paths import find_footprint_lib_dirs
+
+    mod = next((d / "Connector_USB.pretty" /
+                "USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal.kicad_mod"
+                for d in map(__import__("pathlib").Path, find_footprint_lib_dirs())
+                if (d / "Connector_USB.pretty").is_dir()), None)
+    if mod is None or not mod.is_file():
+        pytest.skip("KiCAD footprint libraries not installed")
+    mcp = _mcp_with_batch(monkeypatch, tmp_path)
+    tree = _pcb_tree(blank_project)
+    ed.add_footprint(tree, qualified_lib_id="Connector_USB:USB4105", reference="J4",
+                     value="USB", x_mm=30, y_mm=30, rotation=90,
+                     fp_def_node=ed.fetch_footprint_def(mod))
+    sch_io.write_file(blank_project["pcb"], tree)
+    j4 = {f["reference"]: f for f in _call(mcp, "list_footprints")}["J4"]
+    assert j4["edge_side"] == "right"     # mouth at local +y, turned 90 deg CCW
+    assert j4["body_mm"] == [26.325, 25.53, 33.675, 34.47]
+    pad = _call(mcp, "list_pads", reference="J4")[0]
+    w, h = pad["size_mm"]
+    box = pad["bbox_mm"]
+    assert round(box[2] - box[0], 3) == h and round(box[3] - box[1], 3) == w  # rotated
+
+
+def test_power_path_block_is_reported():
+    from kicad_claude.adapters import assembly_review as ar
+
+    def fp(ref, x, pads):
+        hull = [(x - 1, -1), (x + 1, -1), (x + 1, 1), (x - 1, 1)]
+        return {"ref": ref, "attrs": set(), "hull": hull,
+                "pads": [{"net": n, "at": (x, 0)} for n in pads]}
+
+    fps = [fp("J1", 0, ["/VIN"]), fp("L1", 10, ["SW"]), fp("Q2", 20, ["/VIN"]),
+           fp("R1", 30, ["SIG"])]
+    assert ar.power_path_blocks(fps) == [{"net": "/VIN", "ref": "L1", "between": ["J1", "Q2"]}]
+    fps[1]["pads"].append({"net": "/VIN", "at": (10, 0)})
+    assert ar.power_path_blocks(fps) == []
+
+
+def test_stacked_pads_of_one_net_are_connected():
+    """USB-C A4 / B9 share one land: DRC sees no missing link there."""
+    from kicad_claude.adapters import pcb_netlist
+
+    tree = sexpdata.loads("""(kicad_pcb (version 20260206)
+      (footprint "T:J" (layer "F.Cu") (at 10 10)
+        (property "Reference" "J4" (at 0 0) (layer "F.SilkS"))
+        (pad "A4" smd rect (at 0 0) (size 0.6 1.2) (layers "F.Cu") (net "VBUS"))
+        (pad "B9" smd rect (at 0 0) (size 0.6 1.2) (layers "F.Cu") (net "VBUS"))
+        (pad "A9" smd rect (at 5 0) (size 0.6 1.2) (layers "F.Cu") (net "VBUS"))))""")
+    r = pcb_netlist.list_unrouted(tree)
+    assert r["count"] == 1  # A4/B9 joined; only the link to A9 is missing

@@ -275,20 +275,20 @@ class TestSearchBraceDecoding:
 
     def test_symbol_description_and_keywords_are_decoded(self, monkeypatch):
         mcp = self._mcp(monkeypatch)
-        hit = _call(mcp, "search_symbol", query="bridge rectifier")["hits"][0]
+        hit = _call(mcp, "search_symbol", query="bridge rectifier", verbose=True)["hits"][0]
         assert hit["description"] == "Bridge rectifier, AC/DC input"
         assert hit["keywords"] == "diode bridge ac/dc"
 
     def test_symbol_identity_is_left_alone(self, monkeypatch):
         """lib_id goes straight back into add_symbol — decoding it breaks lookup."""
         mcp = self._mcp(monkeypatch)
-        hit = _call(mcp, "search_symbol", query="bridge rectifier")["hits"][0]
+        hit = _call(mcp, "search_symbol", query="bridge rectifier", verbose=True)["hits"][0]
         assert hit["lib_id"] == "MiniLib:Bridge{slash}Rect"
         assert hit["name"] == "Bridge{slash}Rect"
 
     def test_footprint_description_and_tags_are_decoded(self, monkeypatch):
         mcp = self._mcp(monkeypatch)
-        hit = _call(mcp, "search_footprint", query="big pad")["hits"][0]
+        hit = _call(mcp, "search_footprint", query="big pad", verbose=True)["hits"][0]
         assert hit["description"] == "Big pad, 2/1 aspect"
         assert hit["tags"] == "pad big 2/1"
         assert hit["lib_id"] == "MiniFP:Pad{slash}Big"
@@ -550,4 +550,38 @@ def test_get_symbol_details_gives_pin_sides_and_keeps_unnamed_pins_apart(
         {"number": "4", "name": "GND", "type": "power_in", "side": "bottom", "at": [0, -5]},
     ])
     assert [g.get("number") or g.get("numbers") for g in grouped] == ["1", "2", ["3", "4"]]
-    assert "at" not in grouped[2]
+    assert grouped[2]["at"] == [0, -5]  # stacked: one point
+    apart = lib_tools._group_pins([
+        {"number": "A6", "name": "D+", "type": "bidirectional", "side": "right", "at": [5, 0]},
+        {"number": "B6", "name": "D+", "type": "bidirectional", "side": "right", "at": [5, -5]},
+    ])
+    assert apart == [{"name": "D+", "type": "bidirectional", "side": "right",
+                      "numbers": ["A6", "B6"], "at": [[5, 0], [5, -5]]}]
+
+
+def test_search_hits_are_compact_by_default(synthetic_index, monkeypatch):
+    mcp = _make_mcp_with_lib_tools(monkeypatch, synthetic_index)
+    hit = _call(mcp, "search_symbol", query="esp32")["hits"][0]
+    assert "keywords" not in hit and "datasheet" not in hit and "lib" not in hit
+    assert hit["lib_id"] == "MiniLib:ESP32_Demo"
+
+
+def test_search_drops_a_vendor_prefix_and_keeps_a_name_word():
+    from kicad_claude.indexer.search import search_symbols
+
+    idx = {"symbols": {k: {"lib_id": k, "description": d, "keywords": ""} for k, d in (
+        ("74xGxx:74AHCT1G125", "buffer"), ("Device:D_TVS", "bidirectional TVS"),
+        ("Device:D_Zener", "Zener diode"))}}
+    assert search_symbols("SN74AHCT1G125", idx)[0]["lib_id"] == "74xGxx:74AHCT1G125"
+    hit = search_symbols("D_TVS unidirectional", idx)[0]
+    assert hit["lib_id"] == "Device:D_TVS" and hit["_match"] == "name"
+
+
+def test_check_lib_ids_and_batch_did_you_mean(synthetic_index, monkeypatch):
+    mcp = _make_mcp_with_lib_tools(monkeypatch, synthetic_index)
+    res = _call(mcp, "check_lib_ids", symbols=["MiniLib:Resistor", "Other:Resistor"],
+                footprints=["MiniFP:Nope"])
+    assert res["symbols"]["MiniLib:Resistor"]["exists"]
+    assert res["symbols"]["Other:Resistor"] == {"exists": False,
+                                                "did_you_mean": "MiniLib:Resistor"}
+    assert res["footprints"]["MiniFP:Nope"]["exists"] is False

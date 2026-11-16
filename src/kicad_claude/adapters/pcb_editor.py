@@ -559,7 +559,8 @@ def remove_footprint(tree: list, reference: str) -> bool:
 
 
 # Board item kinds `remove_board_items` removes, by s-expression head.
-REMOVABLE_KINDS = {"track": "segment", "arc": "arc", "via": "via", "zone": "zone"}
+REMOVABLE_KINDS = {"track": "segment", "arc": "arc", "via": "via", "zone": "zone",
+                   "text": "gr_text"}
 
 
 def _item_layers(node: list) -> list[str]:
@@ -608,7 +609,7 @@ def remove_board_items(
         matched.append((i, {"kind": kind, "uuid": uid, "net": net_of(node, tree),
                             "layers": _item_layers(node)}))
     if item_uuid and not matched:
-        raise KeyError(f"no track, arc, via or zone with uuid {item_uuid!r} on this board")
+        raise KeyError(f"no track, arc, via, zone or text with uuid {item_uuid!r} on this board")
     if not dry_run:
         for i, _ in reversed(matched):
             del tree[i]
@@ -657,6 +658,85 @@ def move_footprint(
         layer_node = find_child(fp, "layer")
         if layer_node:
             layer_node[1] = layer
+
+
+_SIDES = {"left": (-1, 0), "right": (1, 0), "top": (0, -1), "bottom": (0, 1)}
+
+
+def _fp_box(tree: list, fp: list) -> list[float]:
+    """Courtyard box on the board; pads' centres +-0.5 mm when it has none."""
+    box = footprint_courtyard_bbox(fp)
+    if box is not None:
+        return box
+    from kicad_claude.adapters import pcb_netlist
+
+    ref = get_footprint_reference(fp)
+    pts = [p["point"] for p in pcb_netlist.list_pads(tree) if p["ref"] == ref]
+    if not pts:
+        at = find_child(fp, "at")
+        x, y = file_to_pcb_xy(float(at[1]), float(at[2]))
+        return [x - 0.5, y - 0.5, x + 0.5, y + 0.5]
+    xs, ys = [float(p[0]) for p in pts], [float(p[1]) for p in pts]
+    return [min(xs) - 0.5, min(ys) - 0.5, max(xs) + 0.5, max(ys) + 0.5]
+
+
+def place_near(tree: list, refs: list[str], anchor: str, side: str, *,
+               gap_mm: float = 0.25, rotation: float | None = None,
+               grid_mm: float = 0.05) -> list[dict]:
+    """Put footprints beside `anchor` ("REF", or "REF.PAD" to line up with
+    that pad) on `side` (left / right / top / bottom), courtyard to
+    courtyard `gap_mm` apart. Several refs stack along that side in order,
+    the first centred on the anchor (or its pad). Positions snap to
+    `grid_mm`. Returns [{ref, x_mm, y_mm}]."""
+    if side not in _SIDES:
+        raise ValueError(f"side must be one of {list(_SIDES)}, got {side!r}")
+    a_ref, _, a_pad = anchor.partition(".")
+    a_fp = find_footprint_by_reference(tree, a_ref)
+    if a_fp is None:
+        raise KeyError(f"no footprint {a_ref!r}")
+    abox = _fp_box(tree, a_fp)
+    centre = ((abox[0] + abox[2]) / 2, (abox[1] + abox[3]) / 2)
+    if a_pad:
+        from kicad_claude.adapters import pcb_netlist
+
+        pad = next((p for p in pcb_netlist.list_pads(tree)
+                    if p["ref"] == a_ref and p["pad"] == a_pad), None)
+        if pad is None:
+            raise KeyError(f"no pad {anchor!r}")
+        centre = (float(pad["point"][0]), float(pad["point"][1]))
+    dx, dy = _SIDES[side]
+
+    def snap(v: float) -> float:
+        return round(round(v / grid_mm) * grid_mm, 4) if grid_mm > 0 else round(v, 4)
+
+    out = []
+    cursor = None  # running edge along the side
+    for ref in refs:
+        if ref == a_ref:
+            raise ValueError(f"{ref} is the anchor")
+        fp = find_footprint_by_reference(tree, ref)
+        if fp is None:
+            raise KeyError(f"no footprint {ref!r}")
+        at = find_child(fp, "at")
+        ox, oy = file_to_pcb_xy(float(at[1]), float(at[2]))
+        move_footprint(tree, ref, ox, oy, rotation)
+        b = _fp_box(tree, fp)
+        rel = (b[0] - ox, b[1] - oy, b[2] - ox, b[3] - oy)  # box around the origin
+        w, h = rel[2] - rel[0], rel[3] - rel[1]
+        if dx:  # left / right: facing edge on x, stack downwards in y
+            x = (abox[0] - gap_mm - rel[2]) if dx < 0 else (abox[2] + gap_mm - rel[0])
+            top = centre[1] - h / 2 if cursor is None else cursor + gap_mm
+            y = top - rel[1]
+            cursor = top + h
+        else:   # top / bottom: facing edge on y, stack rightwards in x
+            y = (abox[1] - gap_mm - rel[3]) if dy < 0 else (abox[3] + gap_mm - rel[1])
+            left = centre[0] - w / 2 if cursor is None else cursor + gap_mm
+            x = left - rel[0]
+            cursor = left + w
+        x, y = snap(x), snap(y)
+        move_footprint(tree, ref, x, y)
+        out.append({"ref": ref, "x_mm": x, "y_mm": y})
+    return out
 
 
 def place_footprints_grid(
@@ -1276,6 +1356,130 @@ def add_zone(
     return zone_node
 
 
+def find_zones(tree: list, *, item_uuid: str = "", name: str = "", net: str = "",
+               layer: str = "") -> list[list]:
+    """Zones matching a uuid, or a name, or a net (optionally on one layer)."""
+    if not (item_uuid or name or net):
+        raise ValueError("pass a zone uuid, name or net")
+    out = []
+    for node in find_children(tree, "zone"):
+        u, n = find_child(node, "uuid"), find_child(node, "name")
+        if item_uuid:
+            if u and str(u[1]) == item_uuid:
+                out.append(node)
+            continue
+        if name and not (n and str(n[1]) == name):
+            continue
+        if net and normalize_name(net_of(node, tree)) != normalize_name(net):
+            continue
+        if layer and layer not in _item_layers(node):
+            continue
+        out.append(node)
+    return out
+
+
+def set_zone(zone: list, *, pad_connection: str | None = None, priority: int | None = None,
+             clearance_mm: float | None = None, min_thickness_mm: float | None = None,
+             thermal_gap_mm: float | None = None,
+             thermal_bridge_mm: float | None = None) -> list[str]:
+    """Change a zone's fill settings in place; returns the keys changed.
+    The fill itself is stale afterwards: refill (`run_drc(refill_zones=True)`)."""
+    changed = []
+
+    def put(parent: list, head: str, value, before: str | None = None) -> None:
+        node = find_child(parent, head)
+        if node is None:
+            node = [sym(head), value]
+            idx = next((i for i, c in enumerate(parent) if before and is_call(c, before)),
+                       len(parent))
+            parent.insert(idx, node)
+        else:
+            node[1:] = [value]
+
+    if pad_connection is not None:
+        if pad_connection not in PAD_CONNECTIONS:
+            raise ValueError(f"pad_connection must be one of {PAD_CONNECTIONS}")
+        cp = find_child(zone, "connect_pads")
+        if cp is None:
+            cp = [sym("connect_pads"), [sym("clearance"), 0.5]]
+            zone.insert(len(zone) - 1, cp)
+        rest = [c for c in cp[1:] if isinstance(c, list)]
+        cp[1:] = list(_PAD_CONNECTION_TOKEN[pad_connection]) + rest
+        changed.append("pad_connection")
+    if clearance_mm is not None:
+        cp = find_child(zone, "connect_pads")
+        if cp is None:
+            cp = [sym("connect_pads")]
+            zone.insert(len(zone) - 1, cp)
+        put(cp, "clearance", round_mm(clearance_mm))
+        changed.append("clearance_mm")
+    if priority is not None:
+        if priority < 0:
+            raise ValueError("priority must be >= 0")
+        put(zone, "priority", int(priority), before="connect_pads")
+        changed.append("priority")
+    if min_thickness_mm is not None:
+        put(zone, "min_thickness", round_mm(min_thickness_mm), before="filled_areas_thickness")
+        changed.append("min_thickness_mm")
+    fill = find_child(zone, "fill")
+    for key, head, value in (("thermal_gap_mm", "thermal_gap", thermal_gap_mm),
+                             ("thermal_bridge_mm", "thermal_bridge_width", thermal_bridge_mm)):
+        if value is not None:
+            if fill is None:
+                fill = [sym("fill"), sym("yes")]
+                zone.insert(len(zone) - 1, fill)
+            put(fill, head, round_mm(value))
+            changed.append(key)
+    return changed
+
+
+def edit_text(tree: list, item_uuid: str, *, text: str | None = None,
+              x_mm: float | None = None, y_mm: float | None = None,
+              rotation: float | None = None, layer: str | None = None,
+              size_mm: float | None = None) -> list:
+    """Change a board `(gr_text ...)` by uuid: content, position, rotation,
+    layer (mirrored on a back layer), size."""
+    node = next((n for n in find_children(tree, "gr_text")
+                 if (u := find_child(n, "uuid")) and str(u[1]) == item_uuid), None)
+    if node is None:
+        raise KeyError(f"no board text with uuid {item_uuid!r}")
+    if text is not None:
+        node[1] = text
+    at = find_child(node, "at")
+    if x_mm is not None or y_mm is not None:
+        xk, yk = pcb_to_file_xy(x_mm if x_mm is not None else file_to_pcb_xy(at[1], at[2])[0],
+                                y_mm if y_mm is not None else file_to_pcb_xy(at[1], at[2])[1])
+        at[1], at[2] = round_mm(xk), round_mm(yk)
+    if rotation is not None:
+        rot = normalize_rotation(rotation)
+        if len(at) >= 4:
+            at[3] = rot
+        else:
+            at.append(rot)
+    effects = find_child(node, "effects")
+    if size_mm is not None and effects is not None:
+        font = find_child(effects, "font")
+        size = find_child(font, "size") if font else None
+        if size is not None:
+            size[1:] = [round_mm(size_mm), round_mm(size_mm)]
+    if layer is not None:
+        find_child(node, "layer")[1] = layer
+        if effects is not None:
+            j = find_child(effects, "justify")
+            words = [str(w) for w in j[1:]] if j else []
+            want = layer.startswith("B.")
+            if want and "mirror" not in words:
+                if j is None:
+                    effects.append([sym("justify"), sym("mirror")])
+                else:
+                    j.append(sym("mirror"))
+            elif not want and "mirror" in words:
+                j[1:] = [w for w in j[1:] if str(w) != "mirror"]
+                if len(j) == 1:
+                    effects.remove(j)
+    return node
+
+
 def add_ground_plane(
     tree: list,
     *,
@@ -1331,6 +1535,8 @@ def add_silk_text(
     """Add a `(gr_text ...)` to the PCB, default on F.SilkS.
 
     Common layers: F.SilkS, B.SilkS, F.Fab, B.Fab, F.Cu, B.Cu (text on copper).
+    Text on a back layer is mirrored (`justify mirror`), as KiCAD draws it:
+    unmirrored back text fails DRC `nonmirrored_text_on_back_layer`.
     """
     if thickness_mm is None:
         thickness_mm = round_mm(size_mm * 0.15)
@@ -1351,6 +1557,8 @@ def add_silk_text(
             ],
         ],
     ]
+    if layer.startswith("B."):
+        node[-1].append([sym("justify"), sym("mirror")])
     tree.append(node)
     return node
 
@@ -1382,32 +1590,28 @@ def list_footprints_summary(tree: list) -> list[dict]:
                 "position_mm": [round_mm(x_mcp), round_mm(y_mcp)],
                 "rotation": rot,
                 "courtyard_mm": footprint_courtyard_bbox(fp),
+                "body_mm": footprint_layer_bbox(fp, ("F.Fab", "B.Fab")),
             }
         )
+        side = connector_edge_side(fp)
+        if side:
+            out[-1]["edge_side"] = side
+        crt = [p for shape in _local_shapes(fp, ("F.CrtYd", "B.CrtYd")) for p in shape]
+        if len({round(p[0], 3) for p in crt}) > 2 or len({round(p[1], 3) for p in crt}) > 2:
+            # e.g. a module's T-shaped antenna keep-out: parts may sit in the
+            # notches that the bounding box covers.
+            out[-1]["courtyard_is_box"] = False
     return out
 
 
-_CRTYD_SHAPES = ("fp_line", "fp_rect", "fp_circle", "fp_arc", "fp_poly")
-
-
-def footprint_courtyard_bbox(fp: list) -> list[float] | None:
-    """Board-coordinate box [x1, y1, x2, y2] around the footprint's courtyard
-    (F.CrtYd / B.CrtYd), with its rotation applied; None when it has none.
-
-    Graphics in a placed footprint are footprint-local. A circle counts with
-    its full radius; an arc by its three points (a slight under-estimate on a
-    wide arc).
-    """
-    at = find_child(fp, "at")
-    frame = (float(at[1]) if at and len(at) > 1 else 0.0,
-             float(at[2]) if at and len(at) > 2 else 0.0,
-             float(at[3]) if at and len(at) > 3 else 0.0)
-    local: list[tuple[float, float]] = []
+def _local_shapes(fp: list, layers: tuple[str, ...]) -> list[list[tuple[float, float]]]:
+    """Footprint-local outline points of each graphic on `layers`."""
+    shapes = []
     for child in fp:
         if head_of(child) not in _CRTYD_SHAPES:
             continue
         layer = find_child(child, "layer")
-        if not layer or str(layer[1]) not in ("F.CrtYd", "B.CrtYd"):
+        if not layer or str(layer[1]) not in layers:
             continue
         pts = [(float(n[1]), float(n[2])) for key in ("start", "mid", "end", "center")
                for n in [find_child(child, key)] if n and len(n) >= 3]
@@ -1421,9 +1625,97 @@ def footprint_courtyard_bbox(fp: list) -> list[float] | None:
         elif head_of(child) == "fp_rect" and len(pts) >= 2:
             (x1, y1), (x2, y2) = pts[0], pts[-1]
             pts = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
-        local += pts
+        if pts:
+            shapes.append(pts)
+    return shapes
+
+
+def _fp_frame(fp: list) -> tuple[float, float, float]:
+    at = find_child(fp, "at")
+    return (float(at[1]) if at and len(at) > 1 else 0.0,
+            float(at[2]) if at and len(at) > 2 else 0.0,
+            float(at[3]) if at and len(at) > 3 else 0.0)
+
+
+def footprint_layer_bbox(fp: list, layers: tuple[str, ...]) -> list[float] | None:
+    """Board box [x1, y1, x2, y2] of the footprint's graphics on `layers`
+    (rotation applied); None when it has none there."""
+    local = [p for shape in _local_shapes(fp, layers) for p in shape]
     if not local:
         return None
+    frame = _fp_frame(fp)
     board = [file_to_pcb_xy(*_frame_point(x, y, frame)) for x, y in local]
     xs, ys = [p[0] for p in board], [p[1] for p in board]
     return [round_mm(min(xs)), round_mm(min(ys)), round_mm(max(xs)), round_mm(max(ys))]
+
+
+def _board_side(fp: list, frm: tuple[float, float], to: tuple[float, float]) -> str:
+    """Board side (left / right / top / bottom) a local vector points to."""
+    frame = _fp_frame(fp)
+    a, b = _frame_point(*frm, frame), _frame_point(*to, frame)
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    if abs(dx) >= abs(dy):
+        return "right" if dx > 0 else "left"
+    return "bottom" if dy > 0 else "top"
+
+
+def connector_edge_side(fp: list) -> str | None:
+    """Board side a connector's mating face points to: put the part on that
+    board edge. From the footprint's "PCB Edge" line on Dwgs.User, else
+    (connectors only) from the body sitting off its pads. None when unknown."""
+    pads = [(float(at[1]), float(at[2])) for pad in find_children(fp, "pad")
+            if (at := find_child(pad, "at")) and len(at) >= 3]
+    if not pads:
+        return None
+    pc = (sum(p[0] for p in pads) / len(pads), sum(p[1] for p in pads) / len(pads))
+    marker = None
+    for child in fp:
+        if head_of(child) in ("fp_text", "property") and len(child) > 2 \
+                and "edge" in str(child[2] if head_of(child) == "fp_text" else "").lower():
+            lay = find_child(child, "layer")
+            at = find_child(child, "at")
+            if lay and str(lay[1]) in ("Dwgs.User", "Cmts.User") and at:
+                marker = (float(at[1]), float(at[2]))
+    if marker is not None:
+        lines = [shape for shape in _local_shapes(fp, ("Dwgs.User", "Cmts.User"))
+                 if len(shape) == 2]
+        if lines:
+            def dist(seg):
+                mx, my = (seg[0][0] + seg[1][0]) / 2, (seg[0][1] + seg[1][1]) / 2
+                return math.hypot(mx - marker[0], my - marker[1])
+            seg = min(lines, key=dist)
+            mid = ((seg[0][0] + seg[1][0]) / 2, (seg[0][1] + seg[1][1]) / 2)
+            horizontal = abs(seg[0][1] - seg[1][1]) < abs(seg[0][0] - seg[1][0])
+            to = (pc[0], mid[1]) if horizontal else (mid[0], pc[1])
+            if math.hypot(to[0] - pc[0], to[1] - pc[1]) > 1e-6:
+                return _board_side(fp, pc, to)
+    lib = str(fp[1]) if len(fp) > 1 and isinstance(fp[1], str) else ""
+    if not lib.startswith("Connector") and not (get_footprint_reference(fp) or "").startswith("J"):
+        return None
+    body = [p for shape in _local_shapes(fp, ("F.Fab", "B.Fab")) for p in shape]
+    if not body:
+        return None
+    x1, y1 = min(p[0] for p in body), min(p[1] for p in body)
+    x2, y2 = max(p[0] for p in body), max(p[1] for p in body)
+    bc = ((x1 + x2) / 2, (y1 + y2) / 2)
+    off = (bc[0] - pc[0], bc[1] - pc[1])
+    # The body overhangs its pads by more than a quarter of its size.
+    if abs(off[0]) > 0.25 * (x2 - x1) and abs(off[0]) >= abs(off[1]):
+        return _board_side(fp, pc, (bc[0], pc[1]))
+    if abs(off[1]) > 0.25 * (y2 - y1):
+        return _board_side(fp, pc, (pc[0], bc[1]))
+    return None
+
+
+_CRTYD_SHAPES = ("fp_line", "fp_rect", "fp_circle", "fp_arc", "fp_poly")
+
+
+def footprint_courtyard_bbox(fp: list) -> list[float] | None:
+    """Board-coordinate box [x1, y1, x2, y2] around the footprint's courtyard
+    (F.CrtYd / B.CrtYd), with its rotation applied; None when it has none.
+
+    Graphics in a placed footprint are footprint-local. A circle counts with
+    its full radius; an arc by its three points (a slight under-estimate on a
+    wide arc).
+    """
+    return footprint_layer_bbox(fp, ("F.CrtYd", "B.CrtYd"))

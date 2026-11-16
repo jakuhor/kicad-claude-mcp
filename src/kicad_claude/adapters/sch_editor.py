@@ -1499,6 +1499,7 @@ def remove_stub_chains(
     points: list[tuple[float, float]],
     *,
     tolerance_mm: float = POINT_TOLERANCE_MM,
+    keep_pin_links: bool = True,
 ) -> int:
     """Remove the wire stubs that led only to `points` (pins just removed).
 
@@ -1509,7 +1510,9 @@ def remove_stub_chains(
     meets the rest of the net, so a stub that ended on a real wire leaves
     that wire alone; a wire that runs on to another pin or a label is a
     connection and stays. A junction left at that point with fewer than three
-    connections is removed. Returns the wires removed.
+    connections is removed. With `keep_pin_links=False` (a power port or
+    flag removed) a wire whose far end is a lone pin is that pin's stub to
+    the port and goes too. Returns the wires removed.
     """
     from kicad_claude.adapters.sch_netlist import _on_segment  # imports this module
 
@@ -1552,6 +1555,10 @@ def remove_stub_chains(
             wire = ws[0]
             far = next(q for q in node_points(wire) if not _same_point(q, current, tolerance_mm))
             if has_endpoint_item(far) and len(wires_at(far)) == 1:
+                if not keep_pin_links and other_items_at(far, [wire]) == 1 and any(
+                        _same_point(far, q, tolerance_mm) for q in _pin_points(tree)):
+                    tree.remove(wire)  # the pin's own stub to the removed port
+                    removed += 1
                 break  # the only wire to another pin or a label: keep that link
             tree.remove(wire)
             remove_junction(tree, current[0], current[1], tolerance_mm=tolerance_mm)
@@ -1601,7 +1608,8 @@ def remove_symbol_with_wires(
             counts["no_connects"] += 1
         if remove_junction(tree, x, y, tolerance_mm=tolerance_mm):
             counts["junctions"] += 1
-    counts["wires"] = remove_stub_chains(tree, pin_points, tolerance_mm=tolerance_mm)
+    counts["wires"] = remove_stub_chains(tree, pin_points, tolerance_mm=tolerance_mm,
+                                         keep_pin_links=not reference.startswith("#"))
     return counts
 
 
@@ -1727,6 +1735,43 @@ def list_texts(tree: list) -> list[dict]:
 
 # Every node kind whose first atom is a net name that must rename together.
 _LABEL_KINDS = ("label", "global_label", "hierarchical_label")
+_ORIENT = {0: "right", 90: "up", 180: "left", 270: "down"}
+
+
+def list_labels(tree: list, net: str = "") -> list[dict]:
+    """Every net label on the sheet (local, global, hierarchical) with net,
+    kind, position, orientation and uuid; `net` keeps only that net."""
+    out = []
+    for node in tree[1:]:
+        head = head_of(node)
+        if head not in _LABEL_KINDS or len(node) < 2 or not isinstance(node[1], str):
+            continue
+        if net and node[1] != net and normalize_name(node[1]) != net:
+            continue
+        at = find_child(node, "at")
+        angle = int(float(at[3])) % 360 if at and len(at) > 3 else 0
+        out.append({"net": node[1], "kind": head,
+                    "position_mm": [round_mm(float(at[1])), round_mm(float(at[2]))],
+                    "orientation": _ORIENT.get(angle, angle), "uuid": get_uuid(node) or ""})
+    return out
+
+
+def remove_labels(tree: list, net: str, point: tuple[float, float] | None = None,
+                  tolerance_mm: float = POINT_TOLERANCE_MM) -> int:
+    """Remove the labels of `net` on the sheet (only the one at `point` when
+    given). Returns how many went."""
+    gone = 0
+    for node in list(tree[1:]):
+        if head_of(node) not in _LABEL_KINDS or len(node) < 2 or not isinstance(node[1], str):
+            continue
+        if node[1] != net and normalize_name(node[1]) != net:
+            continue
+        if point is not None and not any(_same_point(point, q, tolerance_mm)
+                                         for q in node_points(node)):
+            continue
+        tree.remove(node)
+        gone += 1
+    return gone
 
 
 def rename_label_in_tree(tree: list, old_name: str, new_name: str) -> dict[str, int]:

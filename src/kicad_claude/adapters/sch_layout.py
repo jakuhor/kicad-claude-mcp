@@ -155,6 +155,9 @@ SEVERITY = {
 }
 
 
+FRAME_BAND_MM = 2.0  # KiCAD's default sheet border: two frames 2 mm apart
+
+
 def _items(tree: list) -> dict:
     """Every drawn thing with a box: bodies, fields, labels, notes, wires."""
     bodies, texts, wires = [], [], []
@@ -210,21 +213,21 @@ def check_readability(tree: list, max_findings: int = 60) -> dict:
     def centre(b):
         return (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
 
-    # Text vs text.
+    # Text vs text. Raw boxes: two texts whose corners touch already read
+    # as one (a field over a port's net name).
     for i, a in enumerate(texts):
-        ia = g.inset(a["box"], 0.15)
         for b in texts[i + 1:]:
             if a["owner"] is not None and a["owner"] == b["owner"]:
                 continue  # one symbol's own fields: autoplace stacks them
-            if g.overlap_area(ia, g.inset(b["box"], 0.15)) > 0.2:
+            if g.overlap_area(a["box"], b["box"]) > 0.15:
                 add("SR-OVERLAP", f"{a['id']} overlaps {b['id']}", centre(a["box"]),
                     [a["id"], b["id"]], "move one item or `autoplace_fields`")
 
-    # Text vs bodies.
+    # Text vs bodies (power ports and flags too: a field over a port).
     for t in texts:
         tb = g.inset(t["box"], 0.15)
         for body in bodies:
-            if body["power"]:
+            if body["power"] and t["owner"] == body["ref"]:
                 continue
             if g.overlap_area(tb, body["box"]) <= 0.3:
                 continue
@@ -241,24 +244,30 @@ def check_readability(tree: list, max_findings: int = 60) -> dict:
                 add("SR-OVERLAP", f"{t['id']} overlaps symbol {body['ref']}",
                     centre(t["box"]), [t["id"], body["ref"]], "move the text or the symbol")
 
-    # Bodies vs bodies (power ports included: a GND drawn into a part).
+    # Bodies vs bodies (power ports included: a GND drawn into a part, two
+    # ports stacked on one spot).
     for i, a in enumerate(bodies):
         for b in bodies[i + 1:]:
-            if a["power"] and b["power"]:
-                continue
             if g.overlap_area(g.inset(a["box"], 0.1), g.inset(b["box"], 0.1)) > 0.2:
+                if a["power"] and b["power"]:
+                    add("SR-OVERLAP", f"ports {a['ref']} and {b['ref']} are stacked",
+                        centre(a["box"]), [a["ref"], b["ref"]],
+                        "move one port, or join the pins with a wire and one port")
+                    continue
                 rule = "SR-PORT-INTO-BODY" if (a["power"] or b["power"]) else "SR-OVERLAP"
                 add(rule, f"{a['ref']} and {b['ref']} overlap", centre(a["box"]),
                     [a["ref"], b["ref"]],
                     "rotate the power port away from the body" if rule == "SR-PORT-INTO-BODY"
                     else "move one symbol")
 
-    # Frame and title block.
+    # Frame and title block. The frame's outer 2 mm band carries the zone
+    # letters: an item in it runs into the border.
     frame, tblock = g.frame_and_title_block(tree)
+    frame = g.inset(frame, FRAME_BAND_MM)
     everything = [(t["id"], t["box"]) for t in texts] + [(b["ref"], b["box"]) for b in bodies]
     for ident, box in everything:
         if box[0] < frame[0] or box[1] < frame[1] or box[2] > frame[2] or box[3] > frame[3]:
-            add("SR-FRAME", f"{ident} is outside the sheet frame", centre(box), [ident],
+            add("SR-FRAME", f"{ident} runs onto or past the sheet border", centre(box), [ident],
                 "move it inside, or `set_page` to a larger paper")
         elif g.overlap_area(box, tblock) > 0:
             add("SR-TITLE-BLOCK", f"{ident} overlaps the title block", centre(box), [ident],

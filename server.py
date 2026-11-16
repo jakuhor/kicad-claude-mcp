@@ -21,7 +21,10 @@ from kicad_claude.utils.logging import setup_logging  # noqa: E402
 
 logger = setup_logging()
 
-mcp = FastMCP("kicad-claude")
+mcp = FastMCP("kicad-claude", instructions=(
+    "Start with core; add tool groups with load_toolset. "
+    + toolsets.SELECT_BY_NAME
+    + " help(tool) gives the full docs of any tool."))
 
 
 @mcp.tool()

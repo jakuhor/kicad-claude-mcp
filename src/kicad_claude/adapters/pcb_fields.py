@@ -107,9 +107,11 @@ def field_info(fp: list, prop: list) -> dict:
 
 def set_field(fp: list, name: str, *, visible: bool | None = None,
               position: tuple[float, float] | None = None, angle: float | None = None,
-              size: float | None = None, layer: str | None = None) -> bool:
+              size: float | None = None, layer: str | None = None,
+              thickness: float | None = None) -> bool:
     """Edit one field in place. `position` is the board point, `angle` the
-    absolute text angle. Returns True when the tree changed."""
+    absolute text angle; `size` scales the thickness with it unless
+    `thickness` is given. Returns True when the tree changed."""
     prop = field_node(fp, name)
     if prop is None:
         raise KeyError(f"footprint {ed.get_footprint_reference(fp)!r} has no field {name!r}")
@@ -148,8 +150,16 @@ def set_field(fp: list, name: str, *, visible: bool | None = None,
             raise ValueError(f"field {name!r} has no font size")
         old = float(sz[1]) or 1.0
         sz[1] = sz[2] = round_mm(float(size))
-        if th is not None and len(th) > 1:
+        if th is not None and len(th) > 1 and thickness is None:
             th[1] = round_mm(float(th[1]) * float(size) / old)
+    if thickness is not None:
+        font, _, th = _font(prop)
+        if font is None:
+            raise ValueError(f"field {name!r} has no font")
+        if th is None:
+            font.append([sym("thickness"), round_mm(float(thickness))])
+        else:
+            th[1:] = [round_mm(float(thickness))]
     return repr(prop) != before
 
 
@@ -234,10 +244,13 @@ def _candidates(box: list[float], w: float, h: float, gap: float):
 
 def tidy_fields(tree: list, references: list[str] | None = None, hide_values: bool = True,
                 size: float | None = None, clearance: float = 0.2,
-                hide_unplaced: bool = False) -> dict:
+                hide_unplaced: bool = False, min_thickness: float = 0.0,
+                min_height: float = 0.0) -> dict:
     """Move each chosen footprint's Reference (on silkscreen) to a free spot
     next to its courtyard, keep it horizontal, and hide Values that sit on a
-    silkscreen layer. Mutates `tree`."""
+    silkscreen layer. A Reference thinner than `min_thickness` or smaller
+    than `min_height` (the board's text rules) is raised to them first.
+    Mutates `tree`."""
     fps = list(ed.iter_footprints(tree))
     wanted = set(references) if references else None
     if wanted:
@@ -304,10 +317,20 @@ def tidy_fields(tree: list, references: list[str] | None = None, hide_values: bo
                     set_field(fp, "Value", visible=False)
                     values_hidden.append(ref)
 
+    raised = []
     for fp, ref in todo:
         if size is not None:
             set_field(fp, "Reference", size=size)
         prop = field_node(fp, "Reference")
+        before = repr(_font(prop)[1:])
+        _, sz, _th = _font(prop)
+        if sz is not None and min_height and float(sz[2]) < min_height - 1e-9:
+            set_field(fp, "Reference", size=min_height)
+        _, _sz, th = _font(prop)
+        if min_thickness and (th is None or float(th[1]) < min_thickness - 1e-9):
+            set_field(fp, "Reference", thickness=min_thickness)
+        if repr(_font(prop)[1:]) != before:
+            raised.append(ref)
         info = field_info(fp, prop)
         side = _side(info["layer"])
         body = ed.footprint_courtyard_bbox(fp)
@@ -349,4 +372,4 @@ def tidy_fields(tree: list, references: list[str] | None = None, hide_values: bo
         texts[side].append(_grow(box, clearance))
         moved.append({"ref": ref, "position_mm": [round_mm(cx + dx), round_mm(cy + dy)]})
     return {"moved": moved, "values_hidden": values_hidden, "references_hidden": hidden,
-            "unplaced": unplaced}
+            "unplaced": unplaced, "raised_to_minimum": raised}

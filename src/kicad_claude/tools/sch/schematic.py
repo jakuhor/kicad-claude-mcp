@@ -836,7 +836,8 @@ def register(mcp) -> None:
         KiCAD does. `scope`: "active" sheet or "all" (merges global labels,
         power nets and sheet ports). Power-symbol pins are hidden unless
         `include_power_pins=True`. `compact=True`: pins as "REF.PIN", label
-        names once — for checking a netlist.
+        names once, single-pin `unconnected-*` nets only counted — for
+        checking a netlist.
 
         Details:
 
@@ -861,11 +862,15 @@ def register(mcp) -> None:
             nets = netlist.build_hierarchy_nets(state.get_active().sch_path)
 
         out = []
+        lone = 0
         for name in sorted(nets):
             entry = nets[name]
             pins = [
                 p for p in entry["pins"] if include_power_pins or not p["power"]
             ]
+            if compact and name.startswith("unconnected-") and len(pins) <= 1:
+                lone += 1
+                continue
             if compact:
                 item = {"name": name, "pins": [f"{p['ref']}.{p['pin']}" for p in pins]}
                 label_names = sorted({lb["name"] for lb in entry["labels"]})
@@ -885,7 +890,10 @@ def register(mcp) -> None:
                     "no_connect": entry["no_connect"],
                 }
             )
-        return {"scope": scope, "net_count": len(out), "nets": out}
+        res = {"scope": scope, "net_count": len(out), "nets": out}
+        if lone:
+            res["unconnected_pins"] = lone
+        return res
 
     @mcp.tool()
 
@@ -924,8 +932,14 @@ def register(mcp) -> None:
     @mcp.tool()
 
     @on_sheet
-    def get_pin_net(reference: str, pin: str, scope: Literal["active", "all"] = "active") -> dict:
-        """The net a given pin sits on.
+    def get_pin_net(reference: str, pin: str, scope: Literal["active", "all"] = "active",
+                    count_only: bool = False) -> dict:
+        """A pin's net and the part pins on it (`connected_to`).
+
+        Details:
+
+        Power ports and flags are left out of `connected_to`; `power_ports`
+        counts them. `count_only=True` gives `pin_count` instead of the list.
 
         `connected` is False when the pin reaches no other pin. KiCAD still
         names such a net — `unconnected-(R1-Pad1)` — so read `connected`, not
@@ -948,13 +962,18 @@ def register(mcp) -> None:
                         q for q in entry["pins"]
                         if not (q["ref"] == p["ref"] and q["pin"] == p["pin"])
                     ]
-                    return {
-                        "reference": reference,
-                        "pin": pin,
-                        "net": net_name,
-                        "connected": any(not q["power"] for q in others),
-                        "connected_to": others,
-                    }
+                    real = [{"ref": q["ref"], "pin": q["pin"], "pin_name": q["pin_name"]}
+                            for q in others if not q["power"]]
+                    out = {"reference": reference, "pin": pin, "net": net_name,
+                           "connected": bool(real)}
+                    if count_only:
+                        out["pin_count"] = len(real)
+                    else:
+                        out["connected_to"] = real
+                    ports = len(others) - len(real)
+                    if ports:
+                        out["power_ports"] = ports
+                    return out
         return {
             "reference": reference,
             "pin": pin,
@@ -1020,9 +1039,20 @@ def register(mcp) -> None:
     @mcp.tool()
 
     @on_sheet
-    def list_texts() -> list[dict]:
-        """Every free text note on the active sheet, with uuid and position."""
+    def list_texts(kind: Literal["notes", "labels"] = "notes", net: str = "") -> list[dict]:
+        """Sheet text notes, or `kind="labels"` net labels (`net` filters),
+        with uuids.
+
+        Details:
+
+        Labels carry net, kind, position, orientation and uuid. Remove them
+        in bulk with edit_schematic {"op":"remove","label":NET}."""
         tree, _ = _load_active_schematic()
+        if kind == "labels":
+            items = ed.list_labels(tree, net)
+            for item in items:
+                item["net"] = normalize_name(item["net"])
+            return items
         items = ed.list_texts(tree)
         for item in items:
             item["text"] = normalize_name(item["text"])

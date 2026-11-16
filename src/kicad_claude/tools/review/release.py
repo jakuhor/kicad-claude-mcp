@@ -567,7 +567,10 @@ def register(mcp) -> None:
         per-side passive orientation as data (`orientation`),
         polarized parts with no silkscreen of their own
         (AS-SILK-POLARITY) or no mark nearer pad 1 than the other pads
-        (AS-PIN1-MARK: pin-1 dot, cathode bar, chamfer). DNP parts are skipped.
+        (AS-PIN1-MARK: pin-1 dot, cathode bar, chamfer), parts standing in
+        the straight run (>= 5 mm) of a supply net (VIN, +24V, LED_24V, ...)
+        with no pad on it: a floorplan that splits the power path
+        (AS-POWER-PATH, info). DNP parts are skipped.
 
         Heights (`heights`): from each footprint's 3D STEP model (point
         bounding box, with the model's offset / scale / x-y rotation; a
