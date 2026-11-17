@@ -1521,6 +1521,91 @@ class TestReplaceSymbol:
         s = ed.find_symbol_by_reference(tree, "R1")
         assert sch_io.find_child(s, "lib_id")[1] == "MiniLib:Resistor"
 
+    def test_user_fields_and_node_layout_survive(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        """OP-41: the placement is edited in place, not rebuilt."""
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=100.33, y_mm=100.33,
+              fields={"MPN": "RC0402FR-0710KL", "Mouser": "603-RC0402FR-0710KL"})
+        tree = sch_io.parse_file(blank_project["sch"])
+        node = ed.find_symbol_by_reference(tree, "R1")
+        # KiCAD 10 nodes this server does not write itself.
+        node.insert(node.index(sch_io.find_child(node, "dnp")),
+                    [sch_io.sym("in_pos_files"), sch_io.sym("yes")])
+        sch_io.write_file(blank_project["sch"], tree)
+
+        res = _call(mcp, "replace_symbol", reference="R1", lib_id="MiniLib:Resistor_Wide")
+        props = _call(mcp, "get_symbol_properties", reference="R1")["properties"]
+        assert props["MPN"] == "RC0402FR-0710KL"
+        assert props["Mouser"] == "603-RC0402FR-0710KL"
+        assert props["Description"].startswith("Resistor with pins further apart")
+        assert props["Footprint"] == "Resistor_SMD:R_0603_1608Metric"
+        assert "R_1206_3216Metric" in res["footprint_warning"]
+        tree = sch_io.parse_file(blank_project["sch"])
+        node = ed.find_symbol_by_reference(tree, "R1")
+        assert sch_io.find_child(node, "in_pos_files") is not None
+        # The old part's definition is gone, nothing else uses it.
+        assert ed.find_lib_symbol_def(tree, "MiniLib:Resistor") is None
+
+    def test_rotated_pin_map_moves_every_item_once(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        """OP-41: 1->2, 2->3, 3->1 must not drag pin 1's wire on to pin 3."""
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:ESP32_Demo", reference="U1",
+              value="ESP32", x_mm=101.6, y_mm=101.6)
+        pins = {p["number"]: p["position_mm"] for p in _call(mcp, "list_pins", reference="U1")}
+        out = {"1": (0, -12.7), "2": (0, 12.7), "3": (12.7, 0)}
+        for num, net in (("1", "A"), ("2", "B"), ("3", "C")):
+            (px, py), (dx, dy) = pins[num], out[num]
+            _call(mcp, "add_wire", x1_mm=px, y1_mm=py, x2_mm=px + dx, y2_mm=py + dy)
+            _call(mcp, "add_label", net=net, x_mm=px + dx, y_mm=py + dy)
+
+        res = _call(mcp, "replace_symbol", reference="U1", lib_id="MiniLib:ESP32_Demo",
+                    pin_map={"1": "2", "2": "3", "3": "1"})
+        assert {r["items_moved"] for r in res["reconnected"]} == {1}
+        assert res["new_pins_unconnected"] == []
+        assert "diagonal_wires" not in res
+        new = {p["number"]: tuple(p["position_mm"])
+               for p in _call(mcp, "list_pins", reference="U1")}
+        tree = sch_io.parse_file(blank_project["sch"])
+        ends = []
+        for w in (n for n in tree[1:] if sch_io.head_of(n) == "wire"):
+            (x1, y1), (x2, y2) = ed.node_points(w)
+            assert x1 == pytest.approx(x2) or y1 == pytest.approx(y2), "diagonal wire"
+            ends += [(round(x1, 3), round(y1, 3)), (round(x2, 3), round(y2, 3))]
+        for pos in new.values():  # one wire end on every pin, none stacked
+            assert ends.count((round(pos[0], 3), round(pos[1], 3))) == 1
+
+    def test_power_port_follows_its_pin(self, blank_project, tmp_path, monkeypatch):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=101.6, y_mm=101.6)
+        # A `#` reference marks a power port; its pin 1 sits on R1 pin 2.
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="#PWR01",
+              value="GND", x_mm=101.6, y_mm=106.68)
+        res = _call(mcp, "replace_symbol", reference="R1", lib_id="MiniLib:Resistor_Wide")
+        assert [r["items_moved"] for r in res["reconnected"] if r["to_pin"] == "2"] == [1]
+        r1 = {p["number"]: p["position_mm"] for p in _call(mcp, "list_pins", reference="R1")}
+        port = {p["number"]: p["position_mm"]
+                for p in _call(mcp, "list_pins", reference="#PWR01")}
+        assert port["1"] == pytest.approx(r1["2"])
+
+    def test_pin_to_pin_contact_is_reported_not_reached(
+        self, blank_project, tmp_path, monkeypatch
+    ):
+        mcp = _make_mcp_with_fixture_index(monkeypatch, tmp_path)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
+              value="10k", x_mm=101.6, y_mm=101.6)
+        _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R2",
+              value="10k", x_mm=101.6, y_mm=106.68)  # R2.1 sits on R1.2
+        res = _call(mcp, "replace_symbol", reference="R1", lib_id="MiniLib:Resistor_Wide")
+        pin2 = next(r for r in res["reconnected"] if r["to_pin"] == "2")
+        assert pin2.get("not_reached") is True
+        assert "2" in res["new_pins_unconnected"]
+
     def test_lib_symbols_gains_the_new_definition(
         self, blank_project, tmp_path, monkeypatch
     ):

@@ -87,17 +87,17 @@ def translate_element(node: list, dx_kicad: float, dy_kicad: float) -> list:
         # Only the parent (at ...) is in board coords; pads are footprint-local.
         _translate_xy(new, dx_kicad, dy_kicad)
         # Refresh uuids on the footprint itself + pads to avoid duplicates
-        _refresh_uuids(new)
+        pcb_ed.refresh_uuids(new)
         return new
 
     if head == "via":
         _translate_xy(new, dx_kicad, dy_kicad)
-        _refresh_uuids(new)
+        pcb_ed.refresh_uuids(new)
         return new
 
     if head == "segment":
         _translate_xy(new, dx_kicad, dy_kicad)
-        _refresh_uuids(new)
+        pcb_ed.refresh_uuids(new)
         return new
 
     if head == "zone":
@@ -106,37 +106,25 @@ def translate_element(node: list, dx_kicad: float, dy_kicad: float) -> list:
         # when DRC --refill-zones runs. Strip filled_polygon to be safe.
         new[:] = [c for c in new if not is_call(c, "filled_polygon")]
         _translate_polygon(new, dx_kicad, dy_kicad)
-        _refresh_uuids(new)
+        pcb_ed.refresh_uuids(new)
         return new
 
     if head in ("gr_line", "gr_rect", "gr_arc", "gr_circle"):
         _translate_xy(new, dx_kicad, dy_kicad)
-        _refresh_uuids(new)
+        pcb_ed.refresh_uuids(new)
         return new
 
     if head == "gr_poly":
         _translate_polygon(new, dx_kicad, dy_kicad)
-        _refresh_uuids(new)
+        pcb_ed.refresh_uuids(new)
         return new
 
     if head == "gr_text":
         _translate_xy(new, dx_kicad, dy_kicad)
-        _refresh_uuids(new)
+        pcb_ed.refresh_uuids(new)
         return new
 
     return new
-
-
-def _refresh_uuids(node: list) -> None:
-    """Walk recursively and replace every `(uuid "...")` with a fresh uuid4."""
-    if not isinstance(node, list):
-        return
-    for i, child in enumerate(node):
-        if isinstance(child, list):
-            if is_call(child, "uuid") and len(child) >= 2:
-                child[1] = str(uuid.uuid4())
-            else:
-                _refresh_uuids(child)
 
 
 def _suffix_reference(footprint_node: list, suffix: str) -> str | None:

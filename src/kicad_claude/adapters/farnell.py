@@ -147,6 +147,18 @@ def _summarize_part(p: dict) -> dict:
         "datasheet_url": _first_datasheet(p),
         "product_url": f"https://{_store()}/{sku}" if sku else "",
         "sku": sku,
+        "price_breaks": sorted(
+            ({"qty": int(b["from"]), "unit_price": float(b["cost"])}
+             for b in prices if b.get("from") is not None and b.get("cost") is not None),
+            key=lambda b: b["qty"]),
+        "min_qty": _int(p.get("translatedMinimumOrderQuality")),
         "lifecycle": p.get("productStatus") or "",
         "operating_temp": temp_grade.attr_text(p.get("attributes") or []),
     }
+
+
+def _int(raw: Any) -> int | None:
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None

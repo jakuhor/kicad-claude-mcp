@@ -83,3 +83,9 @@ C12 / R15 / C17 beside the ESP32-C6-MINI-1: its courtyard is T-shaped (the
 antenna keep-out above the module), and they sit in the notches beside the
 body that only the courtyard's bounding box covers (`list_footprints` now
 says `courtyard_is_box: false`).
+
+---
+
+Field test 4, 2026-11-17: add a `Mouser` field (Mouser part number) to every
+symbol of `~/github/JH_LED_control/hardware`, cost-optimise its BOM and swap
+U1. All its server items (OP-40 … OP-44) are done (README).

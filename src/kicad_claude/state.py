@@ -14,6 +14,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from kicad_claude.adapters import sch_io
+
 
 @dataclass(frozen=True)
 class ActiveProject:
@@ -217,7 +219,9 @@ def remember() -> None:
                                 "sheet": _active_sheet, "board": _active_board}
     try:
         _session_file.parent.mkdir(parents=True, exist_ok=True)
-        _session_file.write_text(json.dumps(data, indent=1), encoding="utf-8")
+        # Atomic: another server process reading mid-write would see broken
+        # JSON, fall back to {} and drop every other directory's entry.
+        sch_io.atomic_write_bytes(_session_file, json.dumps(data, indent=1).encode("utf-8"))
     except OSError as e:
         logging.getLogger("kicad-claude.state").warning("session not saved: %s", e)
 

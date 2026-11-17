@@ -369,6 +369,18 @@ def _strip_top_fields(fp: list, names: set[str]) -> list:
     return [c for c in fp[2:] if head_of(c) not in names]
 
 
+def refresh_uuids(node: list) -> None:
+    """Walk recursively and replace every `(uuid "...")` with a fresh uuid4."""
+    if not isinstance(node, list):
+        return
+    for child in node:
+        if isinstance(child, list):
+            if is_call(child, "uuid") and len(child) >= 2:
+                child[1] = str(uuid.uuid4())
+            else:
+                refresh_uuids(child)
+
+
 def _build_placed_footprint(
     fp_def: list,
     qualified_lib_id: str,
@@ -381,6 +393,9 @@ def _build_placed_footprint(
 ) -> list:
     """Construct a placed footprint instance from a lib (footprint ...) def."""
     placed = copy.deepcopy(fp_def)
+    # A library footprint may carry uuids on its pads and graphics; placing it
+    # twice must not put the same uuid on the board twice.
+    refresh_uuids(placed)
     # Drop fields that the placed instance owns directly: layer/at/uuid go in
     # our header. Drop version/generator/generator_version since those describe
     # the source lib, not the placed instance.

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+from collections import deque
 from typing import Any
 
 import httpx
@@ -22,6 +24,11 @@ from kicad_claude.adapters import temp_grade  # noqa: E402
 quiet_http()
 
 DEFAULT_BASE = "https://api.mouser.com/api/v2"
+
+#: Mouser's search API allows about 30 calls per minute per key.
+RATE_LIMIT = 30
+RATE_WINDOW_S = 60.0
+_calls: deque[float] = deque()
 
 
 class MouserError(RuntimeError):
@@ -39,8 +46,28 @@ def _base_url() -> str:
     return os.environ.get("MOUSER_API_BASE", DEFAULT_BASE).rstrip("/")
 
 
+def _throttle() -> None:
+    """Wait so that no more than RATE_LIMIT calls start in any RATE_WINDOW_S."""
+    now = time.monotonic()
+    while _calls and now - _calls[0] >= RATE_WINDOW_S:
+        _calls.popleft()
+    if len(_calls) >= RATE_LIMIT:
+        wait = RATE_WINDOW_S - (now - _calls[0])
+        logger.info("Mouser rate limit: waiting %.1f s", wait)
+        time.sleep(wait)
+        _calls.popleft()
+    _calls.append(time.monotonic())
+
+
+def _too_many(text: str) -> MouserError:
+    return MouserError(
+        f"Mouser TooManyRequests: the API allows about {RATE_LIMIT} calls per "
+        f"minute (and a daily cap); retry later. {text[:200]}")
+
+
 def _post(path: str, body: dict[str, Any]) -> Any:
     url = f"{_base_url()}{path}"
+    _throttle()
     try:
         r = httpx.post(
             url,
@@ -51,10 +78,14 @@ def _post(path: str, body: dict[str, Any]) -> Any:
         )
     except httpx.HTTPError as e:
         raise MouserError(f"network error: {e}") from e
+    if r.status_code == 429:
+        raise _too_many(r.text)
     if r.status_code >= 400:
         raise MouserError(f"POST {path} → {r.status_code}: {r.text[:300]}")
     payload = r.json()
     errs = payload.get("Errors") or []
+    if errs and "toomanyrequests" in str(errs).lower().replace(" ", ""):
+        raise _too_many(str(errs))
     if errs:
         # Mouser returns 200 with an Errors array on auth failures.
         raise MouserError(f"Mouser API errors: {errs}")
@@ -137,6 +168,13 @@ def _summarize_part(p: dict) -> dict:
         first = price_breaks[0]
         unit_price = _parse_price(first.get("Price", "") or "")
         currency = first.get("Currency", "")
+    breaks = []
+    for b in price_breaks:
+        price = _parse_price(b.get("Price", "") or "")
+        try:
+            breaks.append({"qty": int(b.get("Quantity")), "unit_price": price})
+        except (TypeError, ValueError):
+            continue
 
     return {
         "source": "mouser",
@@ -146,6 +184,11 @@ def _summarize_part(p: dict) -> dict:
         "stock": stock,
         "unit_price": unit_price,
         "currency": currency,
+        "price_breaks": sorted((b for b in breaks if b["unit_price"] is not None),
+                               key=lambda b: b["qty"]),
+        "sku": p.get("MouserPartNumber", "") or "",
+        "min_qty": _int(p.get("Min")),
+        "order_multiple": _int(p.get("Mult")),
         "datasheet_url": p.get("DataSheetUrl", "") or "",
         "product_url": p.get("ProductDetailUrl", "") or "",
         "lead_time": p.get("LeadTime", ""),
@@ -154,3 +197,10 @@ def _summarize_part(p: dict) -> dict:
         "operating_temp": temp_grade.attr_text(p.get("ProductAttributes") or [],
                                           "AttributeName", "AttributeValue"),
     }
+
+
+def _int(raw: Any) -> int | None:
+    try:
+        return int(str(raw).replace(",", "").replace(".", ""))
+    except (TypeError, ValueError):
+        return None

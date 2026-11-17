@@ -341,6 +341,141 @@ def test_enrich_bom_adds_a_column_block_per_source(tmp_path, monkeypatch):
     state.clear_active()
 
 
+def test_mouser_summary_keeps_every_price_break_and_its_part_number():
+    from kicad_claude.adapters import mouser
+    part = mouser._summarize_part({
+        "ManufacturerPartNumber": "1N4148W-7-F",
+        "MouserPartNumber": "621-1N4148W-F",
+        "PriceBreaks": [
+            {"Quantity": 100, "Price": "0,90 Kč", "Currency": "CZK"},
+            {"Quantity": 1, "Price": "3,96 Kč", "Currency": "CZK"},
+            {"Quantity": 10, "Price": "2,10 Kč", "Currency": "CZK"},
+        ],
+    })
+    assert part["sku"] == "621-1N4148W-F"
+    assert part["price_breaks"] == [{"qty": 1, "unit_price": 3.96},
+                                    {"qty": 10, "unit_price": 2.1},
+                                    {"qty": 100, "unit_price": 0.9}]
+
+
+def test_other_sources_return_their_order_code_and_breaks():
+    from kicad_claude.adapters import digikey, farnell
+    dk = digikey._summarize_product({
+        "ManufacturerProductNumber": "LM358N",
+        "ProductVariations": [{"DigiKeyProductNumber": "296-1395-5-ND",
+                               "StandardPricing": [{"BreakQuantity": 10, "UnitPrice": 0.4},
+                                                   {"BreakQuantity": 1, "UnitPrice": 0.5}]}],
+    })
+    assert dk["sku"] == "296-1395-5-ND"
+    assert [b["qty"] for b in dk["price_breaks"]] == [1, 10]
+    fn = farnell._summarize_part({"sku": "1234", "prices": [
+        {"from": 1, "to": 9, "cost": 0.5}, {"from": 10, "to": 99, "cost": 0.3}]})
+    assert fn["sku"] == "1234" and fn["price_breaks"][1] == {"qty": 10, "unit_price": 0.3}
+    assert digikey._summarize_product({})["sku"] == ""
+
+
+def test_price_at_picks_the_break_for_the_quantity():
+    hit = {"unit_price": 3.96, "price_breaks": [{"qty": 1, "unit_price": 3.96},
+                                                {"qty": 10, "unit_price": 2.1},
+                                                {"qty": 100, "unit_price": 0.9}]}
+    assert [sourcing_tools.price_at(hit, q) for q in (1, 9, 10, 99, 5000)] == [
+        3.96, 3.96, 2.1, 2.1, 0.9]
+    moq = {"price_breaks": [{"qty": 10, "unit_price": 2.0}]}
+    assert sourcing_tools.price_at(moq, 3) == 2.0  # below a minimum order
+    assert sourcing_tools.price_at({"unit_price": 7.5}, 50) == 7.5
+
+
+def _mouser_post(monkeypatch, resp):
+    from kicad_claude.adapters import mouser
+    from collections import deque
+    monkeypatch.setenv("MOUSER_API_KEY", "k")
+    monkeypatch.setattr(mouser, "_calls", deque())
+    monkeypatch.setattr(mouser.httpx, "post", lambda *a, **k: resp)
+    return mouser
+
+
+def test_mouser_rate_limit_is_a_clean_error(monkeypatch):
+    mouser = _mouser_post(monkeypatch, _Resp({}, 429))
+    with pytest.raises(mouser.MouserError, match="TooManyRequests"):
+        mouser.search_part("X")
+    mouser = _mouser_post(monkeypatch, _Resp(
+        {"Errors": [{"Code": "TooManyRequests", "Message": "Too Many Requests"}]}))
+    with pytest.raises(mouser.MouserError, match="about 30 calls per"):
+        mouser.search_part("X")
+
+
+def test_mouser_throttles_to_thirty_calls_a_minute(monkeypatch):
+    from kicad_claude.adapters import mouser
+    from collections import deque
+    now = [1000.0]
+    slept = []
+    monkeypatch.setattr(mouser.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(mouser.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(mouser, "_calls", deque(990.0 + i * 0.1 for i in range(30)))
+    mouser._throttle()  # 31st call within the window
+    assert slept == [pytest.approx(50.0)]
+    assert len(mouser._calls) == 30
+    now[0] = 2000.0  # a minute later the window is empty again
+    slept.clear()
+    mouser._throttle()
+    assert slept == [] and len(mouser._calls) == 1
+
+
+def test_check_availability_prices_the_quantity(monkeypatch):
+    idx = {"symbols": {}, "footprints": {}, "symbol_dirs": [], "footprint_dirs": []}
+    mo_hit = {"source": "mouser", "mpn": "LM358N", "sku": "595-LM358N", "unit_price": 5.0,
+              "price_breaks": [{"qty": 1, "unit_price": 5.0}, {"qty": 25, "unit_price": 3.0}]}
+    mcp = _make_mcp(monkeypatch, idx, mo_results=[mo_hit])
+    res = _call(mcp, "check_availability", mpn="LM358N", qty=30)
+    assert res["mouser"]["sku"] == "595-LM358N"
+    assert res["mouser"]["qty"] == 30 and res["mouser"]["unit_price_at_qty"] == 3.0
+
+
+def test_search_distributors_ranks_by_price_at_quantity(monkeypatch):
+    from kicad_claude.adapters import mouser
+    seen = {}
+
+    def fake(query, records=10):
+        seen["q"], seen["n"] = query, records
+        return [{"mpn": "A", "unit_price": 1.0, "price_breaks": [{"qty": 1, "unit_price": 1.0}]},
+                {"mpn": "B", "unit_price": None},
+                {"mpn": "C", "unit_price": 2.0, "price_breaks": [{"qty": 1, "unit_price": 2.0},
+                                                                {"qty": 10, "unit_price": 0.5}]}]
+
+    idx = {"symbols": {}, "footprints": {}, "symbol_dirs": [], "footprint_dirs": []}
+    mcp = _make_mcp(monkeypatch, idx)
+    monkeypatch.setattr(mouser, "search_keyword", fake)
+    res = _call(mcp, "search_distributors", query="22uF 10V 0805 X7R", limit=3, qty=10)
+    assert seen == {"q": "22uF 10V 0805 X7R", "n": 3}
+    assert [h["mpn"] for h in res["mouser"]] == ["C", "A", "B"]
+    _stub_source(monkeypatch, "mouser", err="TooManyRequests")
+    monkeypatch.setattr(mouser, "search_keyword", mouser.search_part)
+    assert "TooManyRequests" in _call(mcp, "search_distributors", query="x")["errors"]["mouser"]
+
+
+def test_enrich_bom_prices_line_quantity_times_boards(tmp_path, monkeypatch):
+    write_blank_project(tmp_path / "demo", "demo")
+    state.clear_active()
+    state.set_active(tmp_path / "demo", "demo")
+    bom = tmp_path / "bom.csv"
+    bom.write_text('Reference,Value\n"R1,R2,R3",10k\nC1,1uF\n', encoding="utf-8")
+    out = tmp_path / "enriched.csv"
+    idx = {"symbols": {}, "footprints": {}, "symbol_dirs": [], "footprint_dirs": []}
+    mcp = _make_mcp(monkeypatch, idx, mo_results=[{
+        "source": "mouser", "mpn": "RC0402", "sku": "603-RC0402", "unit_price": 2.2,
+        "price_breaks": [{"qty": 1, "unit_price": 2.2}, {"qty": 10, "unit_price": 0.6}]}])
+    res = _call(mcp, "enrich_bom_with_sourcing", bom_path=str(bom),
+                output_path=str(out), boards=5)
+    import csv as _csv
+    with out.open(encoding="utf-8", newline="") as f:
+        rows = list(_csv.DictReader(f))
+    assert rows[0]["mo_sku"] == "603-RC0402"
+    assert rows[0]["mo_qty_price"] == "0.6" and rows[0]["mo_line_total"] == "9.0"  # 15 pcs
+    assert rows[1]["mo_qty_price"] == "2.2" and rows[1]["mo_line_total"] == "11.0"  # 5 pcs
+    assert res["boards"] == 5 and res["totals"] == {"mouser": 20.0}
+    state.clear_active()
+
+
 def test_find_or_fetch_symbol_local_hit(monkeypatch):
     # Build an index with one matching symbol
     idx = {
@@ -765,3 +900,72 @@ def test_private_hosts_need_the_explicit_opt_in(monkeypatch):
     from kicad_claude.adapters import datasheet_fetch
     monkeypatch.setenv(datasheet_fetch.ALLOW_PRIVATE_ENV, "1")
     assert datasheet_fetch.check_url("http://10.0.0.5/ds.pdf") == ""
+
+
+# ===== SKU choice and minimum order (OP-44) ================================ #
+
+_REEL = {"source": "farnell", "mpn": "USBLC6-2SC6", "sku": "2473979", "stock": 0,
+         "unit_price": 8.147, "min_qty": 3000,
+         "price_breaks": [{"qty": 3000, "unit_price": 8.147}]}
+_CUT = {"source": "farnell", "mpn": "USBLC6-2SC6", "sku": "1269406", "stock": 28982,
+        "unit_price": 13.23, "min_qty": 5,
+        "price_breaks": [{"qty": 5, "unit_price": 13.23}, {"qty": 50, "unit_price": 9.047}]}
+_RE_REEL = {**_CUT, "sku": "1269406RL", "min_qty": 100}
+
+
+def test_buy_qty_honours_minimum_order_and_multiple():
+    assert sourcing_tools.buy_qty(_CUT, 1) == 5
+    assert sourcing_tools.buy_qty(_CUT, 7) == 7
+    assert sourcing_tools.buy_qty(_REEL, 1) == 3000
+    # no min_qty: the first price break is the minimum
+    assert sourcing_tools.buy_qty({"price_breaks": [{"qty": 10, "unit_price": 1.0}]}, 3) == 10
+    assert sourcing_tools.buy_qty({"min_qty": 1, "order_multiple": 4}, 5) == 8
+    assert sourcing_tools.buy_qty({}, 2) == 2
+
+
+def test_check_availability_picks_the_in_stock_sku_and_prices_the_minimum(monkeypatch):
+    idx = {"symbols": {}, "footprints": {}, "symbol_dirs": [], "footprint_dirs": []}
+    mcp = _make_mcp(monkeypatch, idx, fn_results=[_REEL, _RE_REEL, _CUT])
+    res = _call(mcp, "check_availability", mpn="USBLC6-2SC6", sources=["farnell"])
+    fn = res["farnell"]
+    assert fn["sku"] == "1269406"
+    assert fn["buy_qty"] == 5 and fn["unit_price_at_qty"] == 13.23
+    assert fn["line_total"] == round(5 * 13.23, 4)
+
+
+def test_search_distributors_ranks_by_order_cost(monkeypatch):
+    idx = {"symbols": {}, "footprints": {}, "symbol_dirs": [], "footprint_dirs": []}
+    mcp = _make_mcp(monkeypatch, idx)
+    monkeypatch.setattr(sourcing_tools.farnell, "search_keyword",
+                        lambda *a, **k: [_REEL, _RE_REEL, _CUT])
+    res = _call(mcp, "search_distributors", query="USBLC6", sources=["farnell"])
+    assert [h["sku"] for h in res["farnell"]][:2] == ["1269406", "1269406RL"]
+
+
+def test_enrich_bom_buys_the_minimum_order(tmp_path, monkeypatch):
+    write_blank_project(tmp_path / "demo", "demo")
+    state.clear_active()
+    state.set_active(tmp_path / "demo", "demo")
+    bom = tmp_path / "bom.csv"
+    bom.write_text("Reference,MPN,Qty\nU6,USBLC6-2SC6,1\n", encoding="utf-8")
+    out = tmp_path / "enriched.csv"
+    idx = {"symbols": {}, "footprints": {}, "symbol_dirs": [], "footprint_dirs": []}
+    mcp = _make_mcp(monkeypatch, idx, fn_results=[_REEL, _CUT])
+    res = _call(mcp, "enrich_bom_with_sourcing", bom_path=str(bom), output_path=str(out),
+                sourcing_field="MPN", sources=["farnell"])
+    import csv as _csv
+    with out.open(encoding="utf-8", newline="") as f:
+        row = next(_csv.DictReader(f))
+    assert row["fn_sku"] == "1269406" and row["fn_buy_qty"] == "5"
+    assert res["totals"]["farnell"] == round(5 * 13.23, 2)
+    state.clear_active()
+
+
+def test_adapters_report_minimum_order():
+    from kicad_claude.adapters import farnell, mouser
+    fn = farnell._summarize_part({"sku": "1", "translatedMinimumOrderQuality": 5,
+                                  "prices": [{"from": 5, "cost": 13.23}]})
+    assert fn["min_qty"] == 5
+    mo = mouser._summarize_part({"Min": "10", "Mult": "10", "PriceBreaks": []})
+    assert mo["min_qty"] == 10 and mo["order_multiple"] == 10
+    assert mouser._summarize_part({})["min_qty"] is None

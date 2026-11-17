@@ -185,8 +185,11 @@ def prune_backups(backups_dir: Path, filename: str, keep: int) -> int:
     """Keep the newest `keep` backups of `filename`. Returns how many went."""
     if keep <= 0:
         return 0
+    # Match the name after the timestamp exactly: the glob alone would let
+    # `amp.kicad_sch` claim the backups of `pre_amp.kicad_sch`.
     existing = sorted(
-        (p for p in backups_dir.glob(f"*_{filename}") if p.is_file()),
+        (p for p in backups_dir.glob(f"*_{filename}")
+         if p.is_file() and p.name.split("_", 1)[1] == filename),
         key=lambda p: p.name,
         reverse=True,
     )
@@ -282,6 +285,8 @@ def guard_external(path: Path, run: Callable[[], object], *,
         except Exception:
             if backup is not None:
                 shutil.copy2(backup, path)
+            else:  # no previous version: a broken new file must not stay
+                path.unlink(missing_ok=True)
             return True
 
     try:
@@ -290,8 +295,9 @@ def guard_external(path: Path, run: Callable[[], object], *,
         _restore_if_broken()
         raise
     if _env_flag(VERIFY_ENV, True) and _restore_if_broken():
-        raise RuntimeError(f"{path} does not parse after the external write; "
-                           f"restored from {backup}")
+        undo = (f"restored from {backup}" if backup is not None else
+                "there was no previous version, so the new file was removed")
+        raise RuntimeError(f"{path} does not parse after the external write; {undo}")
     return result, backup
 
 

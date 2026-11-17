@@ -1,12 +1,12 @@
 # kicad-claude-mcp
 
 > Design KiCAD PCBs from natural language. An MCP server that gives Claude
-> Code (or any MCP client) **153 tools**, loaded in groups on demand, to drive a complete PCB workflow —
+> Code (or any MCP client) **154 tools**, loaded in groups on demand, to drive a complete PCB workflow —
 > schematic capture, library management, PCB layout, autorouting, design
 > review against the parts' datasheets, sourcing, manufacturing outputs,
 > signal-integrity calculations, RF design, and more.
 
-**153 MCP tools in 11 on-demand sets · 1047 tests (969 fast, 72 acceptance, 6 network) · headless from idea to gerbers**
+**154 MCP tools in 11 on-demand sets · 1073 tests (995 fast, 72 acceptance, 6 network) · headless from idea to gerbers**
 
 The server edits `.kicad_sch` / `.kicad_pcb` / `.kicad_pro` files directly, in
 KiCAD 10's own formatting — one added wire is a ten-line git diff, not a
@@ -164,7 +164,7 @@ all sets together about 20k, against 36.6k before the rework).
 | `emc_si` | EMC pre-compliance, return paths, crosstalk, ground coverage, impedance and current calculators, thermal |
 | `sim` | SPICE export, ngspice / LTspice runs, subcircuit simulation |
 | `datasheets` | datasheet download, extraction cache, specs |
-| `sourcing` | distributor availability, vendor parts, BOM enrichment and diff, field write-back |
+| `sourcing` | distributor availability and keyword search, vendor parts, BOM enrichment and diff, field write-back |
 | `fab` | Gerber/drill/pos/BOM/STEP/render exports, fab package, panelization |
 
 - `load_toolset(toolsets=[...])` registers one or more sets (`all` for every set) and sends `notifications/tools/list_changed`, so the client re-lists its tools; the server declares `tools.listChanged`. `unload_toolset` removes sets again; `core` stays. `list_toolsets` shows every set, whether it is loaded, and its tool names.
@@ -181,7 +181,7 @@ all sets together about 20k, against 36.6k before the rework).
 ### Safe file writes
 
 - **Round-trip formatting**: a write touches only the nodes it changed. The layout comes from a port of KiCAD's own `Prettify`; all 91 KiCAD 10 demo schematics round-trip byte-identically, so a git diff shows only the edit.
-- **Every write to a KiCAD file goes through one guard** (`adapters/safe_write.py`): schematics, boards, libraries and lib tables (`save_tree`), `.kicad_pro` and `.kicad_dru` (`save_text`), and the board rewrites pcbnew and Freerouting do (`guard_external`). It refuses while KiCAD holds the project's `.lck`, backs up to `<file dir>/.backups/<timestamp>_<file>` (newest 10 kept), writes a sibling temp file and swaps it in (as KiCAD does, so a crash never leaves half a file), re-parses the result and restores the backup if it does not parse. A test fails when new code writes around the guard. An edit that spans several files (annotation, `rename_label`, `refresh_lib_symbols`, `update_symbol_fields`, a new sub-sheet) is all-or-nothing: every lock is checked first, and if one file fails the others get their backups back. Control characters are escaped on write.
+- **Every write to a KiCAD file goes through one guard** (`adapters/safe_write.py`): schematics, boards, libraries and lib tables (`save_tree`), `.kicad_pro` and `.kicad_dru` (`save_text`), and the board rewrites pcbnew and Freerouting do (`guard_external`). It refuses while KiCAD holds the project's `.lck`, backs up to `<file dir>/.backups/<timestamp>_<file>` (newest 10 kept), writes a sibling temp file and swaps it in (as KiCAD does, so a crash never leaves half a file; a swap Windows refuses while an indexer or antivirus holds the new file is retried, then done as a plain copy — datasheet downloads use the same write), re-parses the result and restores the backup if it does not parse. A test fails when new code writes around the guard. An edit that spans several files (annotation, `rename_label`, `refresh_lib_symbols`, `update_symbol_fields`, a new sub-sheet) is all-or-nothing: every lock is checked first, and if one file fails the others get their backups back. Control characters are escaped on write.
 - **UTF-8 only**: files are read and written as UTF-8 and kicad-cli / git / ngspice output is decoded as UTF-8, whatever the Windows code page. A KiCAD file with bytes that are not UTF-8 is refused rather than read lossily, so a write cannot corrupt them.
 - **Custom DRC rules are edited in place**: adding, replacing or removing a rule changes only that rule's text; comments (`#`), other rules and clauses the server does not model stay byte for byte. A `.kicad_dru` that does not parse is reported, never overwritten.
 - **Stale locks**: the refusal says who holds the lock (KiCAD's lock file has only user and host) and whether a KiCAD process is running; `clear_stale_lock` removes it only on explicit request.
@@ -189,7 +189,7 @@ all sets together about 20k, against 36.6k before the rework).
 
 ### Schematic capture
 
-- **Symbol placement & connections**: `add_symbol` (with `footprint=` and arbitrary `fields=` in the same call), `add_wire`, `add_label`, `add_power_symbol`, `add_no_connect`, `move_item`, `remove_symbol`, `replace_symbol`, `get_pin_position`, `list_pins` (pins stacked on one point with one name are one entry with `numbers`)
+- **Symbol placement & connections**: `add_symbol` (with `footprint=` and arbitrary `fields=` in the same call), `add_wire`, `add_label`, `add_power_symbol`, `add_no_connect`, `move_item`, `remove_symbol`, `replace_symbol` (edits the placement in place: user fields, flags, field layout and Footprint are kept, Description and Datasheet come from the new part, a Footprint that does not fit the new part is flagged; wiring, labels and power ports on each mapped pin are collected first and moved once, diagonal wire ends get an L jog, a connection that did not follow is reported; the old part's unused cached definition is dropped), `get_pin_position`, `list_pins` (pins stacked on one point with one name are one entry with `numbers`)
 - **Batch editing**: `edit_schematic(ops=[...])` applies many edits in one guarded write, all or nothing (a failing op is named by index and nothing is written; `dry_run=True` applies in memory only). Ops: `symbol`, `wire`, `label`, `power`, `pwr_flag`, `connect`, `no_connect`, `junction`, `text`, `move`, `remove`, `property`, `field`, `autoplace`. Pins are addressed as `"REF.PIN"`, so no coordinates have to be looked up: `connect` draws a 2.54 mm stub out of each pin and ends it in a label or a power port facing away from the body (`style` auto picks a port for ground, stock power nets and nets already drawn with ports); label-style pins within 15 mm of each other are wired together under one label instead (`join=False` keeps a label per pin), and `flag: true` places one PWR_FLAG per net, not per pin; `wire` with `from` / `to` routes a straight or L path that leaves each pin outward and avoids symbol bodies (junction dots added at tees), `pwr_flag` puts the flag beside the connection, on the pin or halfway along its stub, on the side the readability check likes best; a power port on a left / right pin stands upright unless pointing it along the stub collides less; `symbol` and `move` take `mirror` (`x` / `y`); a port or flag dropped mid-wire gets its junction; the PWR_FLAG reminder is judged on the batch's result, for stock and custom ports alike (a net drawn with ports and no `power_out` pin or flag fails ERC `power_pin_not_driven`); a `move` that joins two nets (a wire or label left behind now touching another net) is refused unless `allow_merge: true`; `remove` takes `refs`, a reference `pattern` (`"#PWR*"`), a `label` net (optionally at one point) or `uuids`, and removing a power port or flag takes its stub to the pin; a batch naming an unknown `lib_id` is refused before any op runs, every unknown id listed with a did-you-mean. `check=True` returns the readability counts of the result. The result is compact: the op count, a count per kind, and per-op entries only for what the batch made up itself (auto `#PWR` / `#FLG` references, text uuids, removed items); `verbose=True` returns every entry.
 - **Labels**: local and global (`add_label(label_type="global", shape=...)`, KiCAD's `global_label` with its Intersheetrefs property). Text runs in the `orientation` direction; the justification is what KiCAD writes (`left bottom` at 0 / 90°, `right bottom` at 180 / 270°, checked against the KiCAD 10 demos), so a label on a left-facing pin reads away from the part. Hierarchical labels and sheet pins follow the same rule.
 - **Move with drag**: `move_item(reference=..., drag=True)` carries the labels, power ports, no-connects and junctions on the symbol's pins; a stub that ends in a label or port moves whole, a longer wire gets a bend that keeps the segment at the pin straight and is never laid on top of another wire. Pins of other parts that touched a moved pin directly are reported (`contacts_broken`).
@@ -229,12 +229,15 @@ all sets together about 20k, against 36.6k before the rework).
 
 ### Sourcing and datasheets
 
-- **Availability**: `check_availability` against Mouser, DigiKey, TME, Farnell and JLCPCB (opt-in source: LCSC number, stock, USD price breaks, basic / preferred / extended library type, no key needed)
+- **Availability**: `check_availability` against Mouser, DigiKey, TME, Farnell and JLCPCB (opt-in source: LCSC number, stock, USD price breaks, basic / preferred / extended library type, no key needed). Every hit carries the distributor's own order number as `sku` (Mouser part number, DigiKey product number, TME symbol, Farnell order code, LCSC number), all its `price_breaks` (`[{qty, unit_price}]`) and `unit_price_at_qty` for the requested `qty`
+- **Order quantity and SKU choice**: a distributor lists one MPN under several SKUs (reel, cut tape, re-reel); the tools pick the exact-MPN SKU that is in stock for the order at the lowest line cost. `buy_qty` raises the needed quantity to the SKU's minimum order (Farnell `translatedMinimumOrderQuality`, Mouser `Min`, else the first price break) and order multiple (Mouser `Mult`); `unit_price_at_qty` and `line_total` are priced at `buy_qty`. `enrich_bom_with_sourcing` writes a `<prefix>_buy_qty` column and totals at those quantities
+- **Keyword search**: `search_distributors` finds parts that have no MPN yet (`22uF 10V 0805 X7R`) at the chosen sources, cheapest order (in stock, at `buy_qty`) first
+- **Mouser rate limit**: calls are throttled to Mouser's ~30 per minute; a refusal comes back as a clean `TooManyRequests` error
 - **Single datasheet**: `fetch_datasheet` tries the given URL and each source's datasheet link in order and keeps the first body that really is a PDF (bot-protection HTML is rejected; TLS verification is never disabled); every attempt is reported. A Datasheet URL comes from whatever schematic is open, so downloads are http(s) only, go only to public addresses (loopback, private, link-local and reserved hosts are refused, on every redirect; `KICAD_MCP_ALLOW_PRIVATE_DOWNLOADS=1` allows an intranet server), follow at most 5 redirects and stop at 60 MB or 120 s
 - **Encrypted datasheets**: AES-encrypted PDFs (Panasonic, JST) are read through `pypdf[crypto]`
 - **Project datasheet folder**: `sync_datasheets` gives every schematic MPN its PDF in `datasheets/` and records the mapping in `datasheets/manifest.kicad-claude.json`. Existing vendor-named files (`8471fd.pdf`) are matched through the symbol's Datasheet URL, the PDF's own text (MPN or family stem) or the file name; the rest is downloaded. The folder is `<project>/datasheets`, or the nearest parent `datasheets/` up to the git root (one shared folder for a multi-board repo). Reports unmapped parts and orphan PDFs.
 - **Structured specs, extracted by the calling agent**: `get_datasheet_extraction_task` hands over the PDF path, the text of the pages holding the tables (chosen from the datasheet's table of contents — printed page numbers moved to the PDF page that names the section — then the best page per section: pinout, absolute maximum, recommended, electrical, thermal, application; each suggested page carries its reason), the part's schematic pins and nets, and the schema; `save_datasheet_extraction` validates the record and caches it in `datasheets/specs/<MPN>.json`. Every value carries its PDF page and SI unit; the server checks each number against the cited page's text with its sign, decimal point and unit (0.075 V must read `75 mV` or `0.075 V`; another scale only with that scale's unit, a bare table cell only at base scale; −40 needs its minus; `±15 V` satisfies only a −15 / 15 pair; Unicode minus and dashes, thousands separators and line-wrap hyphenation are tolerated) and warns (`unverified`) when it is not there. The extraction is bound to the PDF it was read from: the task returns the PDF's SHA-256, `save_datasheet_extraction` requires it back and refuses the save when the file changed in between; a saved record goes `stale` when its PDF changes later. `get_datasheet_specs` returns one record or the coverage. Saved and read records carry a `quality` score 0–100 with what is missing — pin table against the symbol's pin count (from the last netlist export), voltage ratings, electrical values, thermal, and the keys the analyzers read for the part's category — and `DQ-LOW` (info) below 50. A manifest entry that names a file outside `datasheets/` (a crafted manifest in a cloned repo) is refused. No value is taken from general knowledge. Pin behaviour the DC model uses goes in `pin_models` (clamp, trip current, bias current, input resistance, keyed by pin name). Graphs go in `curves` (points read off the plot, with page; e.g. a capacitor's `C_bias`, capacitance vs DC bias). The schema names the keys the analyzers read: capacitor `C`, `ESR`, `ESL`, rated `V`, `C_bias`; inductor `L`, `DCR`, `Isat`, `Irms*`; common-mode choke `Z_cm`, `DCR`, `I_rated`; LED `VF`, `IF`; constant-current regulator `I_reg`, `V_min`; connector `I_rated` (per contact) / `I_rated_total` (a rail's contacts together); `thermal.rth_ja` / `tj_max`; op-amp `GBW`; crystal `CL`.
-- **BOM enrichment**: `enrich_bom_with_sourcing` queries the chosen sources per unique value and appends MPN / stock / price / URL columns (JLCPCB adds `jlc_lcsc`, `jlc_type`)
+- **BOM enrichment**: `enrich_bom_with_sourcing` queries the chosen sources per unique value and appends MPN / stock / price / URL / order-number columns (JLCPCB adds `jlc_lcsc`, `jlc_type`). Each line is priced at its quantity × `boards` from the price breaks (`<prefix>_qty_price`, `<prefix>_line_total`), and the result carries per-source `totals` for the batch
 - API keys never reach the log: request URLs are not logged and key-like query values are redacted.
 
 ### PCB layout
@@ -685,7 +688,7 @@ kicad-claude-mcp/
 │   ├── indexer/                       # KiCAD library indexing (~10 MB cache)
 │   ├── templates/                     # blank project / sheet / PCB
 │   └── utils/                         # logging, geometry (mm, grid snap), paths
-├── tests/                             # 969 fast + 72 acceptance + 6 network tests
+├── tests/                             # 995 fast + 72 acceptance + 6 network tests
 └── docs/open_points.md                # the open-items queue
 ```
 
@@ -710,8 +713,8 @@ Open work and new field reports live in [`docs/open_points.md`](./docs/open_poin
 
 ```bash
 uv run mcp dev server.py                          # MCP Inspector (browser UI)
-uv run pytest -m "not slow and not network" -q    # 932 fast tests, ~2 min
-uv run pytest -m "slow" -q                        # 68 acceptance tests via kicad-cli (~8 min)
+uv run pytest -m "not slow and not network" -q    # 995 fast tests, ~2 min
+uv run pytest -m "slow" -q                        # 72 acceptance tests via kicad-cli (~8 min)
 uv run pytest -m "network" -q                     # 6 live distributor tests
 ```
 

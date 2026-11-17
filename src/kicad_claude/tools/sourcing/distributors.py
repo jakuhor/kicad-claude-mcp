@@ -2,6 +2,7 @@
 
 Tools:
     check_availability        — distributor stock/price lookup by MPN
+    search_distributors       — keyword / parametric search (no MPN yet)
     find_or_fetch_symbol      — local index → KiCAD official → manual SnapEDA fallback
     import_vendor_zip         — extract a vendor ZIP into the active project's lib/
     list_vendor_parts         — list ZIPs available under ./vendor_parts/
@@ -64,6 +65,10 @@ _ERROR_ATTR = {
 }
 
 
+# Hits fetched per MPN, so the cheapest in-stock SKU can be picked.
+PICK_LIMIT = 10
+
+
 def _adapter(name: str):
     """Return the adapter module by source name.
 
@@ -77,12 +82,72 @@ def source_error(name: str) -> type[Exception]:
     return getattr(_adapter(name), _ERROR_ATTR[name])
 
 
+def price_at(hit: dict, qty: int) -> float | None:
+    """Unit price at `qty`: the largest price break not above it. Below the
+    first break (a minimum order) the first break applies; with no breaks,
+    the hit's `unit_price`."""
+    breaks = hit.get("price_breaks") or []
+    if not breaks:
+        return hit.get("unit_price")
+    fit = [b for b in breaks if b["qty"] <= qty]
+    return (fit[-1] if fit else breaks[0])["unit_price"]
+
+
+def buy_qty(hit: dict, need: int) -> int:
+    """Pieces to order for `need`: at least the SKU's minimum order (else its
+    first price break), rounded up to its order multiple."""
+    breaks = hit.get("price_breaks") or []
+    minimum = hit.get("min_qty") or (breaks[0]["qty"] if breaks else 1)
+    mult = hit.get("order_multiple") or 1
+    return -(-max(need, minimum) // mult) * mult
+
+
+def _cost_key(hit: dict, need: int) -> tuple:
+    """Sort key: in stock for the order first, then priced, then cheapest line."""
+    q = buy_qty(hit, need)
+    unit = price_at(hit, q)
+    return ((hit.get("stock") or 0) < q, unit is None, (unit or 0) * q)
+
+
+def pick_hit(hits: list[dict], mpn: str, need: int) -> dict | None:
+    """Best SKU for `mpn` at `need` pieces. A distributor lists one MPN under
+    several SKUs (reel, cut tape, re-reel): prefer exact MPN matches, then
+    `_cost_key`."""
+    exact = [h for h in hits if (h.get("mpn") or "").upper() == mpn.upper()]
+    pool = exact or hits
+    return min(pool, key=lambda h: _cost_key(h, need)) if pool else None
+
+
+def _with_qty(hit: dict | None, qty: int) -> dict | None:
+    if hit:
+        q = buy_qty(hit, qty)
+        unit = price_at(hit, q)
+        hit = {**hit, "qty": qty, "buy_qty": q, "unit_price_at_qty": unit,
+               "line_total": None if unit is None else round(unit * q, 4)}
+    return hit
+
+
+def _line_qty(row: dict) -> int:
+    """Parts on one BOM line: a quantity column, else the reference count."""
+    for col in ("Qty", "Quantity", "QUANTITY", "${QUANTITY}"):
+        try:
+            return int(float(row[col]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    for col in ("Reference", "Refs", "Designator"):
+        if row.get(col):
+            return len([r for r in row[col].split(",") if r.strip()])
+    return 1
+
+
 def search_source(name: str, query: str, limit: int = 3) -> list[dict]:
     """Query one distributor. DigiKey has no part-number endpoint in V4."""
     mod = _adapter(name)
     if name == "digikey":
         return mod.search_keyword(query, limit=limit)
-    return mod.search_part(query)[:limit]
+    if name == "mouser":
+        return mod.search_part(query)[:limit]
+    return mod.search_part(query, limit=limit)[:limit]
 
 
 
@@ -144,13 +209,24 @@ def register(mcp) -> None:
     """Register the tools."""
 
     @mcp.tool()
-    def check_availability(mpn: str, sources: list[Source] | None = None) -> dict:
-        """Stock, price and links for `mpn` at each source in `sources` (digikey, mouser, tme, farnell, jlcpcb; default mouser). `jlcpcb`
-        needs no key, accepts an LCSC number, and adds the LCSC code, basic /
-        extended type and price breaks. Per-source failures are reported, not
-        raised.
+    def check_availability(mpn: str, sources: list[Source] | None = None,
+                           qty: int = 1) -> dict:
+        """Stock, price breaks, `unit_price_at_qty` and order number (`sku`) for
+        `mpn` at each source (default mouser). `jlcpcb` needs no key and
+        accepts an LCSC number. Per-source failures are reported, not raised.
 
         Details:
+
+        `sku` is the number to order by: Mouser part number, DigiKey product
+        number, TME symbol, Farnell order code, LCSC number. `price_breaks`
+        is `[{qty, unit_price}]`; `unit_price` stays the first break.
+
+        A distributor may list the MPN under several SKUs (reel, cut tape,
+        re-reel). The one returned is the exact-MPN SKU in stock for the
+        order with the lowest line cost. `buy_qty` is what must be ordered
+        for `qty`: at least the SKU's minimum order (`min_qty`, else its first
+        price break), rounded up to `order_multiple`. `unit_price_at_qty` and
+        `line_total` are priced at `buy_qty`.
 
         `sources` is a list of: digikey, mouser, tme, farnell,
         jlcpcb. The default is "mouser"; the others are opt-in. `jlcpcb` needs
@@ -170,16 +246,34 @@ def register(mcp) -> None:
 
         for name in names:
             try:
-                hits = search_source(name, mpn, limit=3)
+                hits = search_source(name, mpn, limit=PICK_LIMIT)
             except source_error(name) as e:
                 out["errors"][name] = str(e)
                 continue
-            # Prefer an exact MPN match if present, else the first result.
-            exact = next(
-                (r for r in hits if (r.get("mpn") or "").upper() == mpn.upper()), None
-            )
-            out[name] = exact or (hits[0] if hits else None)
+            out[name] = _with_qty(pick_hit(hits, mpn, qty), qty)
 
+        return out
+
+    @mcp.tool()
+    def search_distributors(query: str, sources: list[Source] | None = None,
+                            limit: int = 5, qty: int = 1) -> dict:
+        """Keyword search for a part without an MPN ("22uF 10V 0805 X7R"):
+        `limit` hits per source (default mouser), cheapest at `qty` first,
+        each with `sku`, stock and price breaks."""
+        names = _parse_sources(clean(sources, DEFAULT_SOURCES))
+        out: dict = {"query": query, "qty": qty, "errors": {}}
+        for name in names:
+            mod = _adapter(name)
+            try:
+                if name == "mouser":
+                    hits = mod.search_keyword(query, records=limit)
+                else:
+                    hits = mod.search_keyword(query, limit=limit)
+            except source_error(name) as e:
+                out["errors"][name] = str(e)
+                continue
+            hits = sorted(hits[:limit], key=lambda h: _cost_key(h, qty))
+            out[name] = [_with_qty(h, qty) for h in hits]
         return out
 
     @mcp.tool()
@@ -319,14 +413,23 @@ def register(mcp) -> None:
         sourcing_field: str = "Value",
         sources: list[Source] | None = None,
         max_rows: int = 200,
+        boards: int = 1,
     ) -> dict:
-        """Add distributor stock and price columns to a KiCAD BOM CSV (`bom_path`,
-        else a fresh export to `<project>/fab/`). Queries each unique
-        `sourcing_field` value (default "Value"; use "MPN" when present) at
-        `sources` (digikey, mouser, tme, farnell, jlcpcb; default
-        mouser): six prefixed columns per source. `max_rows` caps API calls.
+        """Add distributor columns to a BOM CSV (`bom_path`, else a fresh
+        export): each unique `sourcing_field` value ("MPN" when present) at
+        `sources` (default mouser), priced at line quantity × `boards`, with
+        per-source `totals`. `max_rows` caps API calls.
 
         Details:
+
+        Per source, besides the six columns below: `<prefix>_sku` (the
+        distributor's part number), `<prefix>_buy_qty` (line quantity ×
+        `boards`, raised to the SKU's minimum order and order multiple),
+        `<prefix>_qty_price` (unit price at `buy_qty`, from the price breaks)
+        and `<prefix>_line_total`. Per MPN the SKU is picked as in
+        `check_availability`: exact match, in stock, cheapest line.
+        The line quantity comes from a Qty / Quantity column, else from the
+        count of references. `totals` sums the line totals of the lines found.
 
         `sources` is a list of: digikey, mouser, tme, farnell,
         jlcpcb. The default is "mouser"; the others are opt-in. `jlcpcb` adds
@@ -388,7 +491,8 @@ def register(mcp) -> None:
 
         for name in names:
             prefix = SOURCE_PREFIX[name]
-            suffixes = ["mpn", "manufacturer", "stock", "price", "currency", "url"]
+            suffixes = ["mpn", "manufacturer", "stock", "price", "currency", "url",
+                        "sku", "buy_qty", "qty_price", "line_total"]
             suffixes += [c for c, _k in EXTRA_COLUMNS.get(name, ())]
             for suffix in suffixes:
                 col = f"{prefix}_{suffix}"
@@ -396,23 +500,24 @@ def register(mcp) -> None:
                     fieldnames.append(col)
 
         api_calls = 0
+        totals: dict[str, float] = {name: 0.0 for name in names}
         for row in rows[:max_rows]:
             query = (row.get(sourcing_field) or "").strip().strip('"')
             if not query:
                 continue
+            need = _line_qty(row) * boards
 
             for name in names:
                 cache = caches[name]
                 if query not in cache:
                     try:
-                        results = search_source(name, query, limit=1)
-                        cache[query] = results[0] if results else {}
+                        cache[query] = search_source(name, query, limit=PICK_LIMIT)
                         api_calls += 1
                     except source_error(name) as e:
                         errors.setdefault(name, str(e))
-                        cache[query] = {}
+                        cache[query] = []
 
-                hit = cache.get(query, {})
+                hit = pick_hit(cache[query], query, need) or {}
                 prefix = SOURCE_PREFIX[name]
                 row[f"{prefix}_mpn"] = hit.get("mpn", "")
                 row[f"{prefix}_manufacturer"] = hit.get("manufacturer", "")
@@ -420,6 +525,13 @@ def register(mcp) -> None:
                 row[f"{prefix}_price"] = hit.get("unit_price", "")
                 row[f"{prefix}_currency"] = hit.get("currency", "")
                 row[f"{prefix}_url"] = hit.get("product_url", "")
+                row[f"{prefix}_sku"] = hit.get("sku", "")
+                buy = buy_qty(hit, need) if hit else None
+                unit = price_at(hit, buy) if hit else None
+                row[f"{prefix}_buy_qty"] = "" if buy is None else buy
+                row[f"{prefix}_qty_price"] = "" if unit is None else unit
+                row[f"{prefix}_line_total"] = "" if unit is None else round(unit * buy, 4)
+                totals[name] += 0.0 if unit is None else unit * buy
                 for col, key in EXTRA_COLUMNS.get(name, ()):
                     row[f"{prefix}_{col}"] = hit.get(key, "")
 
@@ -439,6 +551,8 @@ def register(mcp) -> None:
             "unique_queries": max((len(c) for c in caches.values()), default=0),
             "api_calls": api_calls,
             "errors": errors,
+            "boards": boards,
+            "totals": {n: round(v, 2) for n, v in totals.items()},
         }
         for name in SOURCE_NAMES:
             cache = caches.get(name)

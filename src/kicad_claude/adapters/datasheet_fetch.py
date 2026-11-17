@@ -20,6 +20,8 @@ from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 
+from kicad_claude.adapters import sch_io
+
 MAX_BYTES = 60 * 1024 * 1024
 _UA = "Mozilla/5.0 (compatible; kicad-claude-mcp datasheet fetch)"
 
@@ -167,7 +169,9 @@ def fetch_first_pdf(
         attempts.append({"source": c["source"], "url": url, "ok": body is not None,
                          "reason": reason or "ok"})
         if body is not None:
-            target.write_bytes(body)
+            # Atomic: a half-written PDF would pass the `target.exists()`
+            # check above on the next run and never be fetched again.
+            sch_io.atomic_write_bytes(target, body)
             return {"saved": True, "path": str(target), "source": c["source"],
                     "url": url, "bytes": len(body), "attempts": attempts}
     return {"saved": False, "path": None, "source": None, "url": None,

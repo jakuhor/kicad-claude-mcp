@@ -207,9 +207,20 @@ def _summarize_product(p: dict) -> dict:
     classifications = p.get("Classifications") or {}
     media = p.get("MediaLinks") or []
 
+    # V4: the orderable DigiKey numbers and their price breaks sit in
+    # ProductVariations (cut tape, reel, Digi-Reel); the first is the default.
+    variation = (p.get("ProductVariations") or [{}])[0] or {}
+    breaks = sorted(
+        ({"qty": int(b["BreakQuantity"]), "unit_price": float(b["UnitPrice"])}
+         for b in variation.get("StandardPricing") or []
+         if b.get("BreakQuantity") is not None and b.get("UnitPrice") is not None),
+        key=lambda b: b["qty"])
+
     return {
         "source": "digikey",
         "mpn": mpn,
+        "sku": variation.get("DigiKeyProductNumber") or "",
+        "price_breaks": breaks,
         "manufacturer": mfr,
         "description": description,
         "stock": stock,

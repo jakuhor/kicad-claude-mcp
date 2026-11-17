@@ -76,6 +76,25 @@ def _make_synth_fp_def() -> list:
     return ed.fetch_footprint_def(FIXTURES / "MiniFP.pretty" / "Mini_R_0603.kicad_mod")
 
 
+def test_placing_a_footprint_twice_gives_unique_uuids(blank_project):
+    """`library_create` footprints carry pad and graphic uuids; two placements
+    must not share them."""
+    from kicad_claude.adapters import library_create
+
+    fp_def = library_create.build_footprint_node(
+        qualified_lib_id="My:R_test",
+        pads=[{"number": "1", "x_mm": -0.8, "y_mm": 0, "size_x_mm": 0.8, "size_y_mm": 0.9},
+              {"number": "2", "x_mm": 0.8, "y_mm": 0, "size_x_mm": 0.8, "size_y_mm": 0.9}],
+    )
+    assert len(sch_io.find_deep(fp_def, "uuid")) > 2  # the case under test
+    tree = sch_io.parse_file(blank_project["pcb"])
+    for i, ref in enumerate(("R1", "R2")):
+        ed.add_footprint(tree, qualified_lib_id="My:R_test", reference=ref, value="10k",
+                         x_mm=10 + 5 * i, y_mm=10, fp_def_node=fp_def)
+    uuids = [n[1] for n in sch_io.find_deep(tree, "uuid")]
+    assert len(uuids) == len(set(uuids))
+
+
 def test_add_footprint_via_editor(blank_project):
     tree = sch_io.parse_file(blank_project["pcb"])
     fp_def = _make_synth_fp_def()

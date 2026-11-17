@@ -12,6 +12,8 @@ Callers snap to the 1.27 mm grid before calling (see `tools/schematic.py`).
 
 from __future__ import annotations
 
+import copy
+import fnmatch
 import re
 import uuid
 from pathlib import Path
@@ -1893,19 +1895,80 @@ def _items_at_point(tree: list, point: tuple[float, float], tol: float = 1e-4) -
     return found
 
 
-def _move_items_at_point(
-    tree: list, old: tuple[float, float], new: tuple[float, float]
-) -> int:
-    """Drag everything attached at `old` to `new`. Returns how many moved."""
-    items = _items_at_point(tree, old)
-    if old == new:
-        return len(items)
-    for item in items:
-        if "xy" in item:
-            item["xy"][1], item["xy"][2] = round_mm(new[0]), round_mm(new[1])
-        else:
-            item["at"][1], item["at"][2] = round_mm(new[0]), round_mm(new[1])
-    return len(items)
+def _symbol_pin_points(tree: list, skip: list) -> list[tuple[list, tuple[float, float]]]:
+    """(symbol node, pin point) for every placed symbol except `skip`."""
+    from kicad_claude.adapters import sch_netlist
+
+    return [(s, p["point"]) for s in iter_instance_symbols(tree) if s is not skip
+            for p in sch_netlist.pins_of_instance(tree, s)]
+
+
+def _shift_symbol(node: list, dx: float, dy: float) -> None:
+    """Move a placed symbol and its fields by (dx, dy)."""
+    ats = [find_child(node, "at")] + [find_child(p, "at") for p in find_children(node, "property")]
+    for at in ats:
+        if at and len(at) >= 3:
+            at[1], at[2] = round_mm(float(at[1]) + dx), round_mm(float(at[2]) + dy)
+
+
+def _on_segment(p, a, b, tol: float = 1e-4) -> bool:
+    """`p` on the axis-aligned segment a-b, ends excluded."""
+    if _same_point(p, a, tol) or _same_point(p, b, tol):
+        return False
+    if abs(a[0] - b[0]) <= tol:
+        return abs(p[0] - a[0]) <= tol and min(a[1], b[1]) - tol <= p[1] <= max(a[1], b[1]) + tol
+    if abs(a[1] - b[1]) <= tol:
+        return abs(p[1] - a[1]) <= tol and min(a[0], b[0]) - tol <= p[0] <= max(a[0], b[0]) + tol
+    return False
+
+
+def _jog_wire(tree: list, wire: list, moved_xy: list, horizontal: bool,
+              points: list, segments: list) -> bool:
+    """Turn a wire that a pin move made diagonal into an L. The segment at the
+    pin keeps its old direction when that corner is free. Returns False when
+    both corners would touch another connection (the wire stays diagonal)."""
+    xys = find_children(find_child(wire, "pts"), "xy")
+    far = next(xy for xy in xys if xy is not moved_xy)
+    f = (float(far[1]), float(far[2]))
+    n = (float(moved_xy[1]), float(moved_xy[2]))
+    if abs(f[0] - n[0]) < 1e-4 or abs(f[1] - n[1]) < 1e-4:
+        return True
+    corners = [(f[0], n[1]), (n[0], f[1])]
+    if not horizontal:
+        corners.reverse()
+    for c in corners:
+        if any(_same_point(c, q, 1e-4) or _on_segment(q, f, c) or _on_segment(q, c, n)
+               for q in points):
+            continue
+        if any(_on_segment(c, a, b) for w, a, b in segments if w is not wire):
+            continue
+        moved_xy[1], moved_xy[2] = round_mm(c[0]), round_mm(c[1])
+        tail = copy.deepcopy(wire)
+        t_xys = find_children(find_child(tail, "pts"), "xy")
+        t_xys[0][1], t_xys[0][2] = round_mm(c[0]), round_mm(c[1])
+        t_xys[1][1], t_xys[1][2] = round_mm(n[0]), round_mm(n[1])
+        find_child(tail, "uuid")[1] = str(uuid.uuid4())
+        tree.insert(tree.index(wire) + 1, tail)
+        return True
+    return False
+
+
+def _footprint_warning(footprint: str, lib_def: list) -> str | None:
+    """Say when the kept Footprint does not fit the new part's own footprint
+    or its footprint filters."""
+    if not footprint:
+        return None
+    default = get_property(lib_def, "Footprint") or ""
+    filters = (get_property(lib_def, "ki_fp_filters") or "").split()
+    name = footprint.split(":", 1)[-1]
+    if default and default != footprint:
+        return (f"Footprint {footprint!r} was kept; the new part's own footprint is "
+                f"{default!r}. Set Footprint if the package changed.")
+    if filters and not any(fnmatch.fnmatchcase(footprint if ":" in f else name, f)
+                           for f in filters):
+        return (f"Footprint {footprint!r} was kept but matches none of the new part's "
+                f"footprint filters {filters}. Set Footprint if the package changed.")
+    return None
 
 
 def replace_symbol(
@@ -1916,160 +1979,159 @@ def replace_symbol(
     sym_def_node: list,
     pin_map: dict[str, str] | None = None,
     value: str | None = None,
-    footprint: str | None = None,
-    datasheet: str | None = None,
-    description: str | None = None,
 ) -> dict:
     """Swap a placed symbol's library part, keeping what identifies it.
 
-    Kept: reference, position, rotation, mirror, unit, uuid and the whole
-    `(instances ...)` block — so the symbol stays the same symbol to KiCAD and
-    to the PCB. Kept unless overridden: Value, Footprint, Datasheet,
-    Description.
+    The placement node is edited in place: only `lib_id`, the pin entries,
+    Datasheet and Description (taken from the new part) change, plus Value
+    when given. Reference, position, rotation, mirror, unit, uuid,
+    `(instances ...)`, flags, every user field (MPN, Manufacturer, ...),
+    Footprint and the KiCAD node layout stay as they were. A Footprint that
+    does not fit the new part is reported (`footprint_warning`), not changed.
 
-    `pin_map` maps old pin number to new pin number. Wires, junctions,
-    no-connects and labels sitting on a mapped pin move to where that pin is on
-    the new part. An unmapped old pin keeps whatever was attached to it exactly
-    where it is, which usually leaves it dangling — the caller gets told, it is
-    not silently dropped. Omitting `pin_map` maps every pin number that exists
-    on both parts to itself.
+    `pin_map` maps old pin number to new pin number. What sat on each mapped
+    old pin (wire ends, junctions, no-connects, labels, power ports) is
+    collected for every pin first and then moved once, so two mappings never
+    move the same item twice. A wire made diagonal by the move gets an L jog
+    (`diagonal_wires` lists any that could not be jogged). An unmapped old pin
+    keeps its items where they are (`left_dangling`). Omitting `pin_map` maps
+    every pin number that exists on both parts.
 
-    Mappings are applied in pin-number order, and a point is consumed by the
-    first pin that claims it. Where two pins of the old part sat on the same
-    point — which KiCAD allows — only the first mapping moves what was there.
-
-    Returns a report: which pins moved, which were left, and which pins of the
-    new part nothing reached.
+    Where two pins of the old part sat on the same point — which KiCAD allows —
+    only the first mapping (pin-number order) moves what was there.
     """
     from kicad_claude.adapters import sch_netlist
 
-    old_node = find_symbol_by_reference(tree, reference)
-    if old_node is None:
+    node = find_symbol_by_reference(tree, reference)
+    if node is None:
         raise KeyError(f"no symbol with reference {reference!r}")
 
-    old_lib_node = find_child(old_node, "lib_id")
-    old_lib_id = old_lib_node[1] if old_lib_node and len(old_lib_node) > 1 else ""
+    lib_id_node = find_child(node, "lib_id")
+    old_lib_id = lib_id_node[1] if lib_id_node and len(lib_id_node) > 1 else ""
+    old_lib_name = find_child(node, "lib_name")
+    old_key = old_lib_name[1] if old_lib_name else old_lib_id
+    old_pins = {p["number"]: p["point"] for p in sch_netlist.pins_of_instance(tree, node)}
+    snapshot = copy.deepcopy(node)
 
-    old_pins = {
-        p["number"]: p["point"] for p in sch_netlist.pins_of_instance(tree, old_node)
-    }
-
-    # Everything that makes this symbol *this* symbol stays.
-    at_node = find_child(old_node, "at")
-    if not at_node or len(at_node) < 3:
-        raise ValueError(f"symbol {reference!r} has malformed (at ...)")
-    keep_at = [at_node[1], at_node[2], at_node[3] if len(at_node) > 3 else 0]
-    keep_uuid = get_uuid(old_node)
-    keep_instances = find_child(old_node, "instances")
-    keep_mirror = find_child(old_node, "mirror")
-    keep_unit = find_child(old_node, "unit")
-    keep_flags = {f: get_symbol_flag(old_node, f) for f in SYMBOL_FLAGS}
-
-    old_props = {}
-    for prop in find_children(old_node, "property"):
-        i = property_name_index(prop)
-        if len(prop) > i + 1 and isinstance(prop[i], str):
-            old_props[prop[i]] = prop[i + 1]
-
-    # Build the replacement.
     lib_entry_def = make_lib_symbol_entry(sym_def_node, qualified_lib_id)
     inject_lib_symbol(tree, lib_entry_def)
     new_pin_numbers = collect_pin_numbers(lib_entry_def)
 
-    new_node = build_symbol_instance(
-        field_offsets=library_field_offsets(lib_entry_def),
-        qualified_lib_id=qualified_lib_id,
-        reference=reference,
-        value=value if value is not None else old_props.get("Value", ""),
-        x_mcp=float(keep_at[0]),
-        y_mcp=float(keep_at[1]),
-        rotation_deg=normalize_rotation(float(keep_at[2])),
-        pin_numbers=new_pin_numbers,
-        project_name="",
-        instance_path="/",
-        footprint=footprint if footprint is not None else old_props.get("Footprint", ""),
-        datasheet=datasheet if datasheet is not None else old_props.get("Datasheet", "~"),
-        description=(
-            description if description is not None else old_props.get("Description", "")
-        ),
-    )
-
-    # Restore identity onto the new node.
-    if keep_uuid:
-        u = find_child(new_node, "uuid")
-        if u and len(u) >= 2:
-            u[1] = keep_uuid
-    new_instances = find_child(new_node, "instances")
-    if keep_instances is not None and new_instances is not None:
-        new_node[new_node.index(new_instances)] = keep_instances
-    if keep_unit is not None:
-        n_unit = find_child(new_node, "unit")
-        if n_unit is not None and len(n_unit) >= 2 and len(keep_unit) >= 2:
-            n_unit[1] = keep_unit[1]
-    if keep_mirror is not None:
-        # `(mirror ...)` follows `(at ...)` in KiCAD's order.
-        n_at = find_child(new_node, "at")
-        new_node.insert(new_node.index(n_at) + 1, list(keep_mirror))
-    for flag, on in keep_flags.items():
-        set_symbol_flag(new_node, flag, on)
-
-    # Swap it in place, so the file's ordering does not churn.
-    tree[tree.index(old_node)] = new_node
-
-    new_pins = {
-        p["number"]: p["point"] for p in sch_netlist.pins_of_instance(tree, new_node)
-    }
+    lib_id_node[1] = qualified_lib_id
+    if old_lib_name is not None:
+        node.remove(old_lib_name)  # it named the old part's cache entry
+    new_pins = {p["number"]: p["point"] for p in sch_netlist.pins_of_instance(tree, node)}
 
     if pin_map is None:
         pin_map = {num: num for num in old_pins if num in new_pins}
-
     unknown_old = sorted(set(pin_map) - set(old_pins))
     unknown_new = sorted(set(pin_map.values()) - set(new_pins))
     if unknown_old or unknown_new:
         # Put the original back before complaining — a rejected call must not
         # leave a half-swapped symbol behind.
-        tree[tree.index(new_node)] = old_node
+        tree[tree.index(node)] = snapshot
         if unknown_old:
             raise KeyError(
-                f"pin_map names pins {unknown_old} that {old_lib_id!r} does not have"
-            )
+                f"pin_map names pins {unknown_old} that {old_lib_id!r} does not have")
         raise KeyError(
-            f"pin_map names pins {unknown_new} that {qualified_lib_id!r} does not have"
-        )
+            f"pin_map names pins {unknown_new} that {qualified_lib_id!r} does not have")
 
-    reconnected: list[dict] = []
+    # Pin entries: keep the uuid of a pin number both parts have.
+    old_pin_nodes = find_children(node, "pin")
+    keep = {n[1]: n for n in old_pin_nodes if len(n) > 1}
+    at_index = node.index(old_pin_nodes[0]) if old_pin_nodes else len(node) - 1
+    for n in old_pin_nodes:
+        node.remove(n)
+    for i, num in enumerate(dict.fromkeys(new_pin_numbers)):
+        node.insert(at_index + i,
+                    keep.get(num) or [sym("pin"), num, [sym("uuid"), str(uuid.uuid4())]])
+
+    for name in ("Datasheet", "Description"):
+        lib_val = get_property(lib_entry_def, name)
+        if lib_val is not None and get_property(node, name) is not None:
+            set_symbol_property(node, name, lib_val)
+    if value is not None:
+        set_symbol_property(node, "Value", value)
+
+    # Collect what sits on every mapped pin before anything moves.
+    others = _symbol_pin_points(tree, node)
+    claimed: set[int] = set()
+    plan = []
     for old_num, new_num in sorted(pin_map.items()):
-        old_point, new_point = old_pins[old_num], new_pins[new_num]
-        moved = _move_items_at_point(tree, old_point, new_point)
-        reconnected.append(
-            {
-                "from_pin": old_num,
-                "to_pin": new_num,
-                "items_moved": moved,
-                "from_mm": list(old_point),
-                "to_mm": list(new_point),
-            }
-        )
+        point = old_pins[old_num]
+        items = [i for i in _items_at_point(tree, point)
+                 if id(i.get("xy") or i["node"]) not in claimed]
+        ports = [s for s, q in others if _same_point(point, q, 1e-4) and id(s) not in claimed
+                 and (get_symbol_property(s, "Reference") or "").startswith("#")]
+        had = bool(items) or any(_same_point(point, q, 1e-4) for _s, q in others)
+        claimed.update(id(i.get("xy") or i["node"]) for i in items)
+        claimed.update(id(s) for s in ports)
+        plan.append((old_num, new_num, point, new_pins[new_num], items, ports, had))
 
-    # Old pins nobody mapped: whatever sat on them stays put and now dangles.
+    jogs = []
+    for _o, _n, old, new, items, ports, _h in plan:
+        for item in items:
+            target = item.get("xy") or item["at"]
+            target[1], target[2] = round_mm(new[0]), round_mm(new[1])
+            if "xy" in item:
+                xys = find_children(find_child(item["node"], "pts"), "xy")
+                other = next((xy for xy in xys if xy is not item["xy"]), None)
+                horizontal = other is not None and abs(float(other[2]) - old[1]) < 1e-4
+                jogs.append((item["node"], item["xy"], horizontal))
+        for s in ports:
+            _shift_symbol(s, new[0] - old[0], new[1] - old[1])
+
+    points = [q for _s, q in _symbol_pin_points(tree, node)] + list(new_pins.values())
+    segments = []
+    for n in tree[1:]:
+        head = head_of(n)
+        if head in ("wire", "bus", "junction", "no_connect") + sch_netlist.LABEL_KINDS:
+            pts = node_points(n)
+            points.extend(pts)
+            if head in ("wire", "bus") and len(pts) == 2:
+                segments.append((n, pts[0], pts[1]))
+    diagonal = [get_uuid(w) for w, xy, horizontal in jogs
+                if len(find_children(find_child(w, "pts"), "xy")) == 2
+                and not _jog_wire(tree, w, xy, horizontal, points, segments)]
+
+    others = _symbol_pin_points(tree, node)
+    reconnected: list[dict] = []
+    lost: set[str] = set()
+    for old_num, new_num, old, new, items, ports, had in plan:
+        entry = {"from_pin": old_num, "to_pin": new_num,
+                 "items_moved": len(items) + len(ports),
+                 "from_mm": list(old), "to_mm": list(new)}
+        reached = bool(_items_at_point(tree, new)) or any(
+            _same_point(new, q, 1e-4) for _s, q in others)
+        if had and not reached:
+            # e.g. a part placed pin-to-pin stays where it was.
+            entry["not_reached"] = True
+            lost.add(new_num)
+        reconnected.append(entry)
+
     left_behind: list[dict] = []
-    mapped_targets = set(pin_map.values())
     for old_num, old_point in sorted(old_pins.items()):
         if old_num in pin_map:
             continue
         attached = _items_at_point(tree, old_point)
         if attached:
-            left_behind.append(
-                {
-                    "pin": old_num,
-                    "position_mm": list(old_point),
-                    "items": sorted({i["kind"] for i in attached}),
-                }
-            )
+            left_behind.append({"pin": old_num, "position_mm": list(old_point),
+                                "items": sorted({i["kind"] for i in attached})})
 
-    unconnected_new = sorted(num for num in new_pins if num not in mapped_targets)
+    mapped_targets = set(pin_map.values())
+    unconnected_new = sorted(num for num in new_pins
+                             if num not in mapped_targets or num in lost)
 
-    return {
+    # Drop the old part's cache entry when nothing on this sheet uses it.
+    if old_key != qualified_lib_id and not any(
+        (find_child(s, "lib_name") or find_child(s, "lib_id"))[1] == old_key
+        for s in iter_instance_symbols(tree)
+    ):
+        stale = find_lib_symbol_def(tree, old_key)
+        if stale is not None:
+            find_child(tree, "lib_symbols").remove(stale)
+
+    result = {
         "reference": reference,
         "from_lib_id": old_lib_id,
         "to_lib_id": qualified_lib_id,
@@ -2077,6 +2139,12 @@ def replace_symbol(
         "left_dangling": left_behind,
         "new_pins_unconnected": unconnected_new,
     }
+    if diagonal:
+        result["diagonal_wires"] = diagonal
+    warning = _footprint_warning(get_property(node, "Footprint") or "", lib_entry_def)
+    if warning:
+        result["footprint_warning"] = warning
+    return result
 
 
 # --------------------------------------------------------------------------- #

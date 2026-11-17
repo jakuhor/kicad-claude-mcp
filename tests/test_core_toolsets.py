@@ -33,7 +33,8 @@ SET_BUDGET = {  # ~5-10 % above the sizes after the v2.0 merges (2026-11-11)
     "review": 9950,
     "emc_si": 8940,  # +1140: OP-17 B3 analyze_board_thermal (measured 1085, + 5 %)
     "sim": 2800, "datasheets": 3300,
-    "sourcing": 5800, "fab": 2600,
+    # sourcing +470: OP-40 search_distributors, OP-42 qty / boards (measured 5977, + 5 %)
+    "sourcing": 6270, "fab": 2600,
 }
 
 
@@ -294,7 +295,8 @@ def test_argument_literals_match_the_adapters():
 def test_list_arguments_are_lists(everything):
     """No comma-joined string lists are left in the v2.0 schemas."""
     for name in ("analyze_emc", "review_circuits", "review_connectivity",
-                 "simulate_subcircuits", "check_availability", "sync_datasheets"):
+                 "simulate_subcircuits", "check_availability", "sync_datasheets",
+                 "search_distributors"):
         props = everything[name].inputSchema["properties"]
         listy = [p for p, s in props.items() if s.get("type") == "array"]
         assert listy, name

@@ -120,6 +120,21 @@ class TestWriteVerification:
         assert safe_write.save_tree(target, tree) is None
         assert target.is_file()
 
+    def test_a_broken_external_write_is_rolled_back(self, blank_project):
+        pcb = Path(blank_project["pcb"])
+        good = pcb.read_bytes()
+        with pytest.raises(RuntimeError, match="restored from"):
+            safe_write.guard_external(
+                pcb, lambda: pcb.write_text("(kicad_pcb (version", encoding="utf-8"))
+        assert pcb.read_bytes() == good
+
+    def test_a_broken_new_file_from_an_external_write_is_removed(self, tmp_path):
+        target = tmp_path / "fresh.kicad_pcb"
+        with pytest.raises(RuntimeError, match="new file was removed"):
+            safe_write.guard_external(
+                target, lambda: target.write_text("(kicad_pcb (version", encoding="utf-8"))
+        assert not target.exists()
+
     def test_an_unparseable_write_is_rolled_back(self, blank_project, monkeypatch):
         """The guard that issue 1 needed: a corrupt file never survives."""
         sch = Path(blank_project["sch"])
@@ -206,6 +221,19 @@ class TestBackupRetention:
 
         safe_write.prune_backups(backups, sch.name, keep=2)
         assert len(list(backups.glob("*_other.kicad_pcb"))) == 8
+
+    def test_a_name_ending_in_another_name_is_not_pruned(self, blank_project):
+        """Pruning `amp.kicad_sch` must leave `pre_amp.kicad_sch` alone."""
+        backups = Path(blank_project["sch"]).parent / ".backups"
+        backups.mkdir(exist_ok=True)
+        for i in range(8):
+            (backups / f"2026010{i}-000000_amp.kicad_sch").write_text("x", encoding="utf-8")
+            (backups / f"2026010{i}-000000_pre_amp.kicad_sch").write_text("x", encoding="utf-8")
+
+        safe_write.prune_backups(backups, "amp.kicad_sch", keep=2)
+        assert len(list(backups.glob("*_pre_amp.kicad_sch"))) == 8
+        assert len([p for p in backups.iterdir()
+                    if p.name.split("_", 1)[1] == "amp.kicad_sch"]) == 2
 
     def test_keep_zero_prunes_nothing(self, blank_project):
         sch = Path(blank_project["sch"])
@@ -400,3 +428,36 @@ def test_save_trees_checks_every_lock_before_writing(tmp_path: Path):
     with pytest.raises(safe_write.ProjectLockedError):
         safe_write.save_trees([(a, sch_io.parse_file(a)), (b, sch_io.parse_file(b))])
     assert a.read_bytes() == before
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_number_is_refused_before_writing(blank_project, bad):
+    """`nan` parses back as a symbol, so only this stops KiCAD from refusing the file."""
+    sch = Path(blank_project["sch"])
+    good = sch.read_bytes()
+    tree = sch_io.parse_file(sch)
+    tree.append([sexpdata.Symbol("x"), bad])
+    with pytest.raises(ValueError, match="cannot write"):
+        safe_write.save_tree(sch, tree)
+    assert sch.read_bytes() == good
+
+
+@pytest.mark.parametrize("failures, renames", [(2, 3), (99, 5)])
+def test_atomic_write_survives_a_refused_rename(tmp_path: Path, monkeypatch, failures, renames):
+    """WinError 5 on the rename (indexer / antivirus holding the temp file):
+    retry, then fall back to a plain copy; no temp file is left behind."""
+    real, calls = sch_io.os.replace, []
+
+    def flaky(src, dst):
+        calls.append(src)
+        if len(calls) <= failures:
+            raise PermissionError(5, "Access is denied")
+        real(src, dst)
+
+    monkeypatch.setattr(sch_io.os, "replace", flaky)
+    monkeypatch.setattr(sch_io.time, "sleep", lambda s: None)
+    target = tmp_path / "part.pdf"
+    sch_io.atomic_write_bytes(target, b"%PDF-1.7 body")
+    assert target.read_bytes() == b"%PDF-1.7 body"
+    assert len(calls) == renames
+    assert list(tmp_path.iterdir()) == [target]

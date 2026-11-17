@@ -667,20 +667,28 @@ def register(mcp) -> None:
 
         Details:
 
-        Kept: reference, position, rotation, mirror, unit, uuid, the
-        `(instances ...)` block and the dnp / in_bom / on_board flags. The
-        symbol stays the same symbol to KiCAD, so the PCB keeps its footprint
-        association. Value, Footprint, Datasheet and Description carry over
-        unless `value` overrides.
+        The placement is edited in place. Kept: reference, position, rotation,
+        mirror, unit, uuid, the `(instances ...)` block, the flags, every user
+        field (MPN, Manufacturer, ...), Footprint and the field layout, so the
+        PCB keeps its footprint association. Datasheet and Description come
+        from the new part; Value changes only with `value`. A kept Footprint
+        that fits neither the new part's footprint nor its filters is named in
+        `footprint_warning`. The old part's cached definition is dropped when
+        nothing else on the sheet uses it.
 
         `pin_map` maps old pin number to new pin number, e.g. `{"1": "2"}`.
-        Wires, junctions, no-connects and labels on a mapped pin move to that
-        pin's new position. Omit it to map every pin number the two parts share.
+        Wires, junctions, no-connects, labels and power ports on a mapped pin
+        move to that pin's new position; everything is collected before
+        anything moves, so no item is moved twice. A wire end that would run
+        diagonal gets an L jog (`diagonal_wires` lists any that could not).
+        Omit `pin_map` to map every pin number the two parts share.
 
         An old pin with no mapping keeps whatever was attached where it is,
         which normally leaves it dangling — the result lists those under
         `left_dangling` rather than dropping them. `new_pins_unconnected` lists
-        pins of the new part nothing reached. Check both, then `run_erc`.
+        pins of the new part nothing reached; a mapped pin whose connection did
+        not follow (a part placed pin-to-pin) is marked `not_reached`. Check
+        both, then `run_erc`.
         """
         tree, path = _load_active_schematic()
         lib_path, sym_name, meta = _resolve_lib_symbol(lib_id)

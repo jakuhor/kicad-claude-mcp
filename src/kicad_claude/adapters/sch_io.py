@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -188,7 +190,20 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
     tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
     try:
         tmp.write_bytes(data)
-        os.replace(tmp, p)
+        for delay in (0.05, 0.1, 0.2, 0.4):
+            try:
+                os.replace(tmp, p)
+                return
+            except PermissionError:
+                # Windows: an indexer or antivirus briefly holds the fresh
+                # temp file, and the rename fails with WinError 5 (OP-43).
+                time.sleep(delay)
+        try:
+            os.replace(tmp, p)
+        except PermissionError:
+            # shortcut: last resort is a plain copy, not atomic; callers that
+            # need a whole file (save_tree) re-parse and restore the backup.
+            shutil.copyfile(tmp, p)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -253,7 +268,9 @@ def _format_float(x: float) -> str:
     as `-0`, both of which KiCAD writes.
     """
     if math.isnan(x) or math.isinf(x):
-        return repr(x)
+        # `nan` / `inf` parse back as symbols, so the post-write check passes,
+        # but KiCAD refuses to load the file. Fail before writing instead.
+        raise ValueError(f"cannot write {x!r} to a KiCAD file")
     if x != 0.0 and abs(x) <= 0.0001:
         buf = f"{x:.10f}".rstrip("0")
         return buf[:-1] if buf.endswith(".") else buf

@@ -209,6 +209,16 @@ def _prices_and_stocks(symbols: list[str]) -> dict[str, dict]:
 # --------------------------------------------------------------------------- #
 
 
+def _breaks(rows: list[dict], qty_key: str, price_key: str) -> list[dict]:
+    out = []
+    for b in rows:
+        try:
+            out.append({"qty": int(b[qty_key]), "unit_price": float(b[price_key])})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return sorted(out, key=lambda b: b["qty"])
+
+
 def _summarize_part(p: dict, price: dict) -> dict:
     prices = price.get("prices") or {}
     breaks = prices.get("elements") or []
@@ -240,6 +250,8 @@ def _summarize_part(p: dict, price: dict) -> dict:
             else ""
         ),
         "tme_symbol": symbol,
+        "sku": symbol,
+        "price_breaks": _breaks(breaks, "amount", "price"),
         # GROSS prices include VAT at `vat_rate`; NET ones do not.
         "price_type": prices.get("type", ""),
         "vat_rate": (prices.get("tax") or {}).get("rate"),
