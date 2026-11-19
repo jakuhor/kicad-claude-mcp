@@ -6,7 +6,7 @@
 > review against the parts' datasheets, sourcing, manufacturing outputs,
 > signal-integrity calculations, RF design, and more.
 
-**154 MCP tools in 11 on-demand sets · 1073 tests (995 fast, 72 acceptance, 6 network) · headless from idea to gerbers**
+**154 MCP tools in 11 on-demand sets · 1074 tests (996 fast, 72 acceptance, 6 network) · headless from idea to gerbers**
 
 The server edits `.kicad_sch` / `.kicad_pcb` / `.kicad_pro` files directly, in
 KiCAD 10's own formatting — one added wire is a ten-line git diff, not a
@@ -61,6 +61,30 @@ mkdir -p third_party
 curl -L https://github.com/freerouting/freerouting/releases/download/v2.5.0/freerouting-2.5.0.jar \
   -o third_party/freerouting.jar
 ```
+
+### Install as a Claude Code plugin
+
+The repo is also a Claude Code plugin and its own marketplace. In Claude Code:
+
+```
+/plugin marketplace add jakuhor/kicad-claude-mcp
+/plugin install kicad-claude@kicad-claude
+```
+
+The install dialog asks for the distributor keys (Mouser, TME token and
+secret, Farnell, DigiKey client ID and secret). All are optional and marked
+sensitive: Claude Code masks them and keeps them in the OS credential store,
+not in `settings.json`. Change them later under `/plugin` → Installed →
+kicad-claude → Configure options. The plugin passes them to the server as the
+same environment variables `.env` uses; a blank option falls back to `.env`.
+
+The plugin starts the server with `uv run --frozen` in the plugin folder, so
+`uv` must be on `PATH`; the first start installs the dependencies and takes
+longer. Remove a `kicad` server you registered by hand
+(`claude mcp remove kicad -s user`) so the tools do not appear twice.
+
+To try a local checkout as a plugin: `claude --plugin-dir .`, then
+`/plugin configure kicad-claude` (the dialog does not open for `--plugin-dir`).
 
 ### Install from a local clone on a branch
 

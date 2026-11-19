@@ -1,0 +1,11 @@
+{
+  "name": "kicad-claude",
+  "owner": { "name": "Jakub Horáček" },
+  "plugins": [
+    {
+      "name": "kicad-claude",
+      "source": "./",
+      "description": "KiCad 10 design, review and sourcing MCP server."
+    }
+  ]
+}

@@ -7,10 +7,17 @@ the startup sets (`all` to register everything).
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+
+# A plugin option left blank arrives as "" (or as an unsubstituted
+# placeholder); unset it so .env can still supply the value.
+for _name, _value in list(os.environ.items()):
+    if _value == "" or _value.startswith("${user_config."):
+        del os.environ[_name]
 
 # Load .env early so adapters can read API credentials at import/use time.
 load_dotenv(Path(__file__).parent / ".env")

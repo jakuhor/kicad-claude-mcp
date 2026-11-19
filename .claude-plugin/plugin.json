@@ -1,0 +1,64 @@
+{
+  "name": "kicad-claude",
+  "version": "2.0.0",
+  "description": "MCP server that reads, edits and reviews KiCad 10 schematics and boards, with live part sourcing.",
+  "license": "MIT",
+  "userConfig": {
+    "mouser_api_key": {
+      "type": "string",
+      "title": "Mouser API key",
+      "description": "Mouser Search API key (https://www.mouser.com/api-hub/). Leave empty to skip Mouser.",
+      "sensitive": true,
+      "default": ""
+    },
+    "tme_app_token": {
+      "type": "string",
+      "title": "TME app token",
+      "description": "TME API v2 app token (https://developers.tme.eu). Needs the TME app secret too.",
+      "sensitive": true,
+      "default": ""
+    },
+    "tme_app_secret": {
+      "type": "string",
+      "title": "TME app secret",
+      "description": "TME API v2 app secret, paired with the TME app token.",
+      "sensitive": true,
+      "default": ""
+    },
+    "farnell_api_key": {
+      "type": "string",
+      "title": "Farnell API key",
+      "description": "Farnell / element14 Product Search API key (https://partner.element14.com). Leave empty to skip Farnell.",
+      "sensitive": true,
+      "default": ""
+    },
+    "digikey_client_id": {
+      "type": "string",
+      "title": "DigiKey client ID",
+      "description": "DigiKey OAuth2 client ID (https://developer.digikey.com). Needs the DigiKey client secret too.",
+      "sensitive": true,
+      "default": ""
+    },
+    "digikey_client_secret": {
+      "type": "string",
+      "title": "DigiKey client secret",
+      "description": "DigiKey OAuth2 client secret, paired with the DigiKey client ID.",
+      "sensitive": true,
+      "default": ""
+    }
+  },
+  "mcpServers": {
+    "kicad": {
+      "command": "uv",
+      "args": ["run", "--frozen", "--directory", "${CLAUDE_PLUGIN_ROOT}", "python", "server.py"],
+      "env": {
+        "MOUSER_API_KEY": "${user_config.mouser_api_key}",
+        "TME_APP_TOKEN": "${user_config.tme_app_token}",
+        "TME_APP_SECRET": "${user_config.tme_app_secret}",
+        "FARNELL_API_KEY": "${user_config.farnell_api_key}",
+        "DIGIKEY_CLIENT_ID": "${user_config.digikey_client_id}",
+        "DIGIKEY_CLIENT_SECRET": "${user_config.digikey_client_secret}"
+      }
+    }
+  }
+}

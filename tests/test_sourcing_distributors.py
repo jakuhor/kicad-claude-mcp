@@ -969,3 +969,20 @@ def test_adapters_report_minimum_order():
     mo = mouser._summarize_part({"Min": "10", "Mult": "10", "PriceBreaks": []})
     assert mo["min_qty"] == 10 and mo["order_multiple"] == 10
     assert mouser._summarize_part({})["min_qty"] is None
+
+
+def test_plugin_passes_every_distributor_key_as_a_sensitive_option():
+    import json
+    import re
+
+    root = Path(__file__).resolve().parents[1]
+    manifest = json.loads((root / ".claude-plugin" / "plugin.json").read_text("utf-8"))
+    options = manifest["userConfig"]
+    env = manifest["mcpServers"]["kicad"]["env"]
+    keys = {"MOUSER_API_KEY", "TME_APP_TOKEN", "TME_APP_SECRET", "FARNELL_API_KEY",
+            "DIGIKEY_CLIENT_ID", "DIGIKEY_CLIENT_SECRET"}
+    assert set(env) == keys
+    for name, value in env.items():
+        option = re.fullmatch(r"\$\{user_config\.(\w+)\}", value).group(1)
+        assert options[option]["sensitive"] is True, name
+        assert not options[option].get("required"), name  # every source is optional
