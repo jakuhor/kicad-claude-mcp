@@ -22,26 +22,34 @@ from collections import defaultdict
 from kicad_claude.adapters import sch_editor as ed
 from kicad_claude.adapters import sch_geometry as g
 from kicad_claude.adapters.sch_io import find_child, find_children, head_of, is_call, sym
+from kicad_claude.adapters.sch_netlist import label_joined_nets
 
 SIDES = ("right", "top", "left", "bottom")
 PAD = 0.635          # KiCAD's field padding, 25 mil
 PITCH = 2.0          # × font size between stacked fields (2.54 at 1.27)
 
 
-def _wire_hits(tree: list, fields: list, places: list, horizontal: str, size: float) -> int:
-    """Wire segments that would cross the field texts placed at `places`."""
-    boxes = [g.text_box(x, y, *g.text_extent(str(f[2]) if len(f) > 2 else "", size), 0,
-                        horizontal, "center") for f, (x, y) in zip(fields, places)]
+def _field_boxes(fields: list, places: list, horizontal: str, size: float) -> list:
+    return [g.text_box(x, y, *g.text_extent(str(f[2]) if len(f) > 2 else "", size), 0,
+                       horizontal, "center") for f, (x, y) in zip(fields, places)]
+
+
+def _others(tree: list, ref: str) -> dict:
+    """What a symbol's fields must not land on: everything not its own."""
+    items = _items(tree)
+    return {"texts": [t["box"] for t in items["texts"] if t["owner"] != ref],
+            "bodies": [b["box"] for b in items["bodies"] if b["ref"] != ref],
+            "wires": items["wires"]}
+
+
+def _collisions(boxes: list, others: dict) -> int:
+    """Other texts, bodies (ports too) and wires that the field boxes touch."""
     hits = 0
-    for node in tree[1:]:
-        if not g.is_wire(node):
-            continue
-        xys = find_children(find_child(node, "pts"), "xy")
-        if len(xys) < 2:
-            continue
-        a = (float(xys[0][1]), float(xys[0][2]))
-        b = (float(xys[-1][1]), float(xys[-1][2]))
-        hits += sum(1 for bx in boxes if g.segment_hits_box(a, b, bx))
+    for bx in boxes:
+        inner = g.shrink(bx, 0.1)
+        hits += sum(g.overlap_area(bx, t) > 0.15 for t in others["texts"])
+        hits += sum(g.overlap_area(inner, g.shrink(b, 0.1)) > 0 for b in others["bodies"])
+        hits += sum(g.segment_hits_box(a, c, inner) for a, c in others["wires"])
     return hits
 
 
@@ -95,6 +103,11 @@ def autoplace_fields(tree: list, s_node: list, force: bool = False,
     if counts[side] and not force:
         return {"reference": ref, "placed": False, "side": side,
                 "reason": f"every side has pins ({counts}); library placement kept"}
+    # KiCAD's choice first (fewest pins, then right / top / left / bottom),
+    # then the other sides; pin-free sides only unless forced.
+    order = ([side] if side_given else
+             sorted((sd for sd in SIDES if force or not counts[sd]),
+                    key=lambda sd: (counts[sd], SIDES.index(sd))))
 
     fr = g.Frame(s_node)
     size = max(g.text_size(f) for f in fields)
@@ -116,11 +129,28 @@ def autoplace_fields(tree: list, s_node: list, force: bool = False,
         y_first = g.round_away(box[3] + PAD + size / 2, fr.y)
         return [(cx, round(y_first + i * pitch, 4)) for i in range(n)], "center"
 
-    if force and counts[side] and not side_given:
-        # Pins on every side: put the fields where the fewest wires cross them.
-        side = min(SIDES, key=lambda sd: (_wire_hits(tree, fields, *places_for(sd), size),
-                                          counts[sd], SIDES.index(sd)))
-    places, horizontal = places_for(side)
+    def shifted(sd: str, k: int) -> tuple[list[tuple[float, float]], str]:
+        pts, hz = places_for(sd)
+        d = round(k * 1.27, 4)
+        if sd in ("right", "left"):
+            return [(x, round(y + d, 4)) for x, y in pts], hz
+        return [(round(x + d, 4), y) for x, y in pts], hz
+
+    # Keep KiCAD's spot when it is clear; otherwise the side and grid offset
+    # along it whose texts land on the fewest other texts, bodies and wires.
+    others = _others(tree, ref)
+    best = None
+    for rank, sd in enumerate(order):
+        for k in (0, 1, -1, 2, -2, 3, -3):
+            pts, hz = shifted(sd, k)
+            hits = _collisions(_field_boxes(fields, pts, hz, size), others)
+            if best is None or (hits, rank, abs(k)) < best[0]:
+                best = ((hits, rank, abs(k)), sd, pts, hz)
+            if hits == 0:
+                break
+        if best[0][0] == 0:
+            break
+    (collisions, _, _), side, places, horizontal = best
 
     # The stored angle is relative to the symbol: pick the one that reads
     # horizontally, then pre-flip the justification KiCAD will flip back.
@@ -139,8 +169,11 @@ def autoplace_fields(tree: list, s_node: list, force: bool = False,
         at[1], at[2], at[3] = x, y, file_angle
         _set_justify(prop, stored)
     _mark_autoplaced(s_node)
-    return {"reference": ref, "placed": True, "side": side,
-            "fields": [str(f[1]) for f in fields]}
+    out = {"reference": ref, "placed": True, "side": side,
+           "fields": [str(f[1]) for f in fields]}
+    if collisions:
+        out["collisions"] = collisions
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -167,6 +200,7 @@ def _items(tree: list) -> dict:
         b = g.body_box(tree, s)
         if b is not None:
             bodies.append({"ref": ref, "box": b, "power": power, "node": s,
+                           "parts": g.body_part_boxes(tree, s),
                            "net": ed.get_symbol_property(s, "Value") if power else None})
         for prop in g.visible_fields(s):
             fb = g.field_box(s, prop)
@@ -196,7 +230,8 @@ def _items(tree: list) -> dict:
     return {"bodies": bodies, "texts": texts, "wires": wires}
 
 
-def check_readability(tree: list, max_findings: int = 60) -> dict:
+def check_readability(tree: list, max_findings: int = 60,
+                      short_label_mm: float = 15.0) -> dict:
     items = _items(tree)
     bodies, texts, wires = items["bodies"], items["texts"], items["wires"]
     findings: list[dict] = []
@@ -252,9 +287,16 @@ def check_readability(tree: list, max_findings: int = 60) -> dict:
                 if a["power"] and b["power"]:
                     add("SR-OVERLAP", f"ports {a['ref']} and {b['ref']} are stacked",
                         centre(a["box"]), [a["ref"], b["ref"]],
-                        "move one port, or join the pins with a wire and one port")
+                        "move one port, or `join_power` the pins (one wire, one port)")
                     continue
                 rule = "SR-PORT-INTO-BODY" if (a["power"] or b["power"]) else "SR-OVERLAP"
+                if rule == "SR-PORT-INTO-BODY":
+                    port, part = (a, b) if a["power"] else (b, a)
+                    pb_ = g.shrink(port["box"], 0.1)
+                    if not any(min(pb_[2], pb[2]) >= max(pb_[0], pb[0])
+                               and min(pb_[3], pb[3]) >= max(pb_[1], pb[1])
+                               for pb in part["parts"]):
+                        continue  # only the part's decoration box is touched
                 add(rule, f"{a['ref']} and {b['ref']} overlap", centre(a["box"]),
                     [a["ref"], b["ref"]],
                     "rotate the power port away from the body" if rule == "SR-PORT-INTO-BODY"
@@ -278,7 +320,10 @@ def check_readability(tree: list, max_findings: int = 60) -> dict:
         for body in bodies:
             if body["power"]:
                 continue
-            if g.segment_hits_box(p, q, g.inset(body["box"], 0.3)):
+            # The body's box spans decoration (an LED's emission arrows);
+            # a hit counts only on one of its graphics.
+            if g.segment_hits_box(p, q, g.inset(body["box"], 0.3)) and any(
+                    g.segment_hits_box(p, q, g.shrink(part, 0.3)) for part in body["parts"]):
                 add("SR-WIRE-THROUGH-BODY", f"wire {p}->{q} crosses {body['ref']}",
                     ((p[0] + q[0]) / 2, (p[1] + q[1]) / 2), [body["ref"]],
                     "route around the symbol")
@@ -307,7 +352,7 @@ def check_readability(tree: list, max_findings: int = 60) -> dict:
     for net, anchors in by_net.items():
         if 2 <= len(anchors) <= 3:
             span = max(math.dist(a, b) for a in anchors for b in anchors)
-            if span <= 15.0:
+            if span <= short_label_mm:
                 add("SR-SHORT-LABEL-NET",
                     f"net {net}: {len(anchors)} labels within {span:.1f} mm",
                     anchors[0], [net], "a wire between the pins reads better")
@@ -324,8 +369,11 @@ def check_readability(tree: list, max_findings: int = 60) -> dict:
         counts[f["rule"]] += 1
     order = {"warning": 0, "info": 1}
     findings.sort(key=lambda f: (order[f["severity"]], f["rule"]))
+    joined, multi = label_joined_nets(tree)
     return {
         "counts": dict(sorted(counts.items())),
+        "label_only_nets": {"label_joined": joined, "signal_nets": multi,
+                            "ratio": round(joined / multi, 2) if multi else 0.0},
         "total": len(findings),
         "findings": findings[:max_findings],
         "truncated": len(findings) > max_findings,
@@ -517,6 +565,69 @@ def move_symbol(tree: list, reference: str, x_mm: float, y_mm: float,
         out["dragged"] = moved
         if broken:
             out["contacts_broken"] = sorted(set(broken))
+    return out
+
+
+_ANCHORED = ("label", "global_label", "hierarchical_label", "no_connect", "junction", "text")
+
+
+def _shift_at(node: list, dx: float, dy: float) -> None:
+    at = find_child(node, "at")
+    if at is not None and len(at) >= 3:
+        at[1], at[2] = round(float(at[1]) + dx, 4), round(float(at[2]) + dy, 4)
+
+
+def move_region(tree: list, box: tuple[float, float, float, float],
+                dx: float, dy: float) -> dict:
+    """Translate everything inside `box` by (dx, dy).
+
+    Symbols go when their origin is inside (fields with them); labels,
+    no-connects, junctions and notes when their anchor is. Wire ends inside
+    the box move, except an end on the pin of a symbol that stays; a wire
+    with one moving end is rubber-banded (bent as a drag bends it), and a
+    power port outside the box on a moved pin follows. Returns counts and
+    the other parts' pins a moved pin left (`contacts_broken`)."""
+    x1, y1, x2, y2 = min(box[0], box[2]), min(box[1], box[3]), max(box[0], box[2]), max(box[1], box[3])
+
+    def inside(pt) -> bool:
+        return x1 - 1e-4 <= pt[0] <= x2 + 1e-4 and y1 - 1e-4 <= pt[1] <= y2 + 1e-4
+
+    symbols, staying_pins = [], set()
+    for s_node in ed.iter_instance_symbols(tree):
+        fr = g.Frame(s_node)
+        if inside((fr.x, fr.y)):
+            symbols.append(s_node)
+        else:
+            staying_pins |= {p["point"] for p in g.pins(tree, s_node)}
+    points = {p["point"] for s_node in symbols for p in g.pins(tree, s_node)}
+    for node in tree[1:]:
+        if g.is_wire(node):
+            for xy in find_children(find_child(node, "pts"), "xy"):
+                pt = (round(float(xy[1]), 4), round(float(xy[2]), 4))
+                if inside(pt) and pt not in staying_pins:
+                    points.add(pt)
+    loose = []
+    for node in tree[1:]:
+        if head_of(node) in _ANCHORED:
+            at = find_child(node, "at")
+            if at is not None and len(at) >= 3 and inside((float(at[1]), float(at[2]))):
+                loose.append((node, (float(at[1]), float(at[2]))))
+
+    for s_node in symbols:
+        _shift_at(s_node, dx, dy)
+        for prop in find_children(s_node, "property"):
+            _shift_at(prop, dx, dy)
+    moves = [(pt, (round(pt[0] + dx, 4), round(pt[1] + dy, 4))) for pt in sorted(points)]
+    dragged, broken = _drag(tree, moves, skip=symbols) if moves else (0, [])
+    shifted = 0
+    for node, old in loose:
+        at = find_child(node, "at")
+        if _same((float(at[1]), float(at[2])), old):  # not carried by the drag
+            _shift_at(node, dx, dy)
+            shifted += 1
+    out = {"symbols": len(symbols), "wires_and_items": dragged + shifted}
+    if broken:
+        out["contacts_broken"] = sorted(set(broken))
     return out
 
 

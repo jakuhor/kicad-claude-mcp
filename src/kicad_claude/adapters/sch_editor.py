@@ -1759,10 +1759,10 @@ def list_labels(tree: list, net: str = "") -> list[dict]:
 
 
 def remove_labels(tree: list, net: str, point: tuple[float, float] | None = None,
-                  tolerance_mm: float = POINT_TOLERANCE_MM) -> int:
+                  tolerance_mm: float = POINT_TOLERANCE_MM) -> list[tuple[float, float]]:
     """Remove the labels of `net` on the sheet (only the one at `point` when
-    given). Returns how many went."""
-    gone = 0
+    given). Returns the anchor point of each label removed."""
+    gone = []
     for node in list(tree[1:]):
         if head_of(node) not in _LABEL_KINDS or len(node) < 2 or not isinstance(node[1], str):
             continue
@@ -1772,7 +1772,7 @@ def remove_labels(tree: list, net: str, point: tuple[float, float] | None = None
                                          for q in node_points(node)):
             continue
         tree.remove(node)
-        gone += 1
+        gone.append(node_points(node)[0])
     return gone
 
 

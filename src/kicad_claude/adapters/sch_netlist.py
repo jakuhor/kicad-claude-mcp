@@ -24,6 +24,7 @@ Connection rules, matching KiCAD's own connectivity:
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -417,11 +418,9 @@ def _unit_suffix(tree: list, s_node: list) -> str:
     return letters
 
 
-def build_sheet_nets(tree: list, path: Path | None = None) -> SheetNets:
-    """Build the named nets of one sheet."""
-    graph = build_sheet_graph(tree)
+def _wire_groups(graph: dict) -> dict[Any, dict]:
+    """One entry per drawn wire group: its pins, labels, ports, flags."""
     uf: _Union = graph["uf"]
-
     members: dict[Any, dict] = {}
     for point, group in uf.groups().items():
         members[point] = {
@@ -441,6 +440,32 @@ def build_sheet_nets(tree: list, path: Path | None = None) -> SheetNets:
         members[uf.find(p)]["no_connect"] = True
     for p, name in graph["power_names"].items():
         members[uf.find(p)].setdefault("power_names", []).append(name)
+    return members
+
+
+def label_joined_nets(tree: list) -> tuple[int, int]:
+    """(label-joined, multi-pin) signal nets of one sheet.
+
+    A net is label-joined when its pins sit in two or more wire groups that
+    only a shared label name connects. Nets carrying a power port are left
+    out: ports are the normal way to draw those.
+    """
+    groups: dict[str, list[int]] = defaultdict(list)
+    for data in _wire_groups(build_sheet_graph(tree)).values():
+        if data.get("power_names"):
+            groups.setdefault(_name_for(data), []).append(-1)  # marks a power net
+            continue
+        real = sum(1 for pin in data["pins"] if not pin["power"])
+        if real:
+            groups[_name_for(data)].append(real)
+    signal = {n: g for n, g in groups.items() if -1 not in g and sum(g) >= 2}
+    return sum(1 for g in signal.values() if len(g) >= 2), len(signal)
+
+
+def build_sheet_nets(tree: list, path: Path | None = None) -> SheetNets:
+    """Build the named nets of one sheet."""
+    graph = build_sheet_graph(tree)
+    members = _wire_groups(graph)
 
     result = SheetNets(path)
     for root, data in members.items():

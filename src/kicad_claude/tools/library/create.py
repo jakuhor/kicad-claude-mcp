@@ -38,8 +38,8 @@ def register(mcp) -> None:
         """Create a symbol in `<project>/lib/<lib_name>.kicad_sym`, placeable with
         `add_symbol` at once. `pins`: list of dicts with `number`, `name`,
         `x_mm`, `y_mm` (electrical end, symbol-local), `length_mm` (2.54),
-        `angle_deg` (0/90/180/270, the direction the pin points away from the
-        body), `type` (input/output/passive/power_in/...), `shape`. `fields`
+        `angle_deg` (KiCAD's pin angle, from the electrical end toward the
+        body: 0 left-side pin, 180 right, 270 top, 90 bottom), `type` (input/output/passive/power_in/...), `shape`. `fields`
         adds library properties (MPN, Manufacturer) that every placement
         inherits.
 

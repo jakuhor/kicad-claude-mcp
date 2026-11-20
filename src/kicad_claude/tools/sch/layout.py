@@ -104,24 +104,32 @@ def register(mcp) -> None:
 
     @mcp.tool()
     @on_sheet
-    def check_schematic_readability(max_findings: int = 40) -> dict:
-        """Read-only layout review (`SR-*`): overlapping texts and bodies,
-        labels or ports drawn into parts, frame / title-block hits, wires
-        through parts or texts, label nets a wire would show better. Run
-        after placing, fix, re-run.
+    def check_schematic_readability(max_findings: int = 40,
+                                    short_label_mm: float = 15.0) -> dict:
+        """Read-only layout review (`SR-*`): overlaps, labels or ports drawn
+        into parts, frame / title-block hits, wires through parts or texts,
+        label nets a wire would show better.
 
         Details:
+
+        Run after placing, fix, re-run.
 
         Rules: SR-OVERLAP, SR-TEXT-ON-BODY (a field spilling over its own
         symbol; text fully inside the body is deliberate and not reported),
         SR-LABEL-INTO-BODY, SR-PORT-INTO-BODY, SR-FRAME, SR-TITLE-BLOCK,
         SR-WIRE-THROUGH-BODY, SR-TEXT-OVER-WIRE, SR-SHORT-LABEL-NET (2-3
-        local labels within 15 mm), SR-CROSSINGS (more than 4 X crossings),
-        SR-OFF-GRID. Each finding has `at_mm`, `items` and a `fix` hint.
+        local labels within `short_label_mm`, default 15), SR-CROSSINGS (more
+        than 4 X crossings), SR-OFF-GRID. Each finding has `at_mm`, `items`
+        and a `fix` hint. A wire or port counts as hitting a body only on one
+        of its graphics, not on the box that spans decoration (an LED's
+        emission arrows). `label_only_nets` gives the signal nets with 2+
+        pins (no power port) whose pins sit in 2+ wire groups joined only by
+        a label name, and their ratio: one number for label overuse.
         Text extents are estimated from KiCAD's stroke font (0.9 x size per
         character), so a near miss can be reported; confirm by eye.
         """
         tree, _ = sch._load_active_schematic()
-        result = layout.check_readability(tree, max_findings=max_findings)
+        result = layout.check_readability(tree, max_findings=max_findings,
+                                          short_label_mm=short_label_mm)
         result["sheet"] = state.get_active_sheet_filename() or "root"
         return result

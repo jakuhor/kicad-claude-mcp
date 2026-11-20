@@ -231,15 +231,16 @@ def side_of(out: tuple[int, int]) -> str:
         tuple(out), "right")
 
 
-def body_box(tree: list, s_node: list) -> Box | None:
-    """Sheet box of the symbol's drawn body (graphics, not pins or fields)."""
+def body_part_boxes(tree: list, s_node: list) -> list[Box]:
+    """Sheet box of each graphic of the symbol's body, one per primitive."""
     sym_def = _lib_def(tree, s_node)
     if sym_def is None:
-        return None
+        return []
     fr = Frame(s_node)
-    pts: list[tuple[float, float]] = []
+    boxes: list[Box] = []
     for unit in _unit_nodes(sym_def, s_node):
         for g in unit[2:]:
+            pts: list[tuple[float, float]] = []
             h = head_of(g)
             if h == "rectangle":
                 s, e = find_child(g, "start"), find_child(g, "end")
@@ -259,7 +260,24 @@ def body_box(tree: list, s_node: list) -> Box | None:
                     n = find_child(g, k)
                     if n:
                         pts.append(fr.point(float(n[1]), float(n[2])))
-    return box_of_points(pts)
+            if (b := box_of_points(pts)) is not None:
+                boxes.append(b)
+    return boxes
+
+
+def body_box(tree: list, s_node: list) -> Box | None:
+    """Sheet box of the symbol's drawn body (graphics, not pins or fields)."""
+    b = None
+    for part in body_part_boxes(tree, s_node):
+        b = union(b, part)
+    return b
+
+
+def shrink(b: Box, d: float) -> Box:
+    """`inset` that never turns a box inside out (a thin line stays a line)."""
+    dx = min(d, (b[2] - b[0]) / 2)
+    dy = min(d, (b[3] - b[1]) / 2)
+    return b[0] + dx, b[1] + dy, b[2] - dx, b[3] - dy
 
 
 def body_and_pins_box(tree: list, s_node: list) -> Box | None:

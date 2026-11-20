@@ -331,8 +331,8 @@ def test_create_symbol_writes_lib_and_table(tmp_path: Path):
         tmp_path / "p",
         lib_name="custom", symbol_name="WIDGET",
         pins=[
-            {"number": "1", "name": "A", "x_mm": -3, "y_mm": 0, "angle_deg": 180, "type": "passive"},
-            {"number": "2", "name": "B", "x_mm": 3,  "y_mm": 0, "angle_deg": 0,   "type": "passive"},
+            {"number": "1", "name": "A", "x_mm": -3, "y_mm": 0, "angle_deg": 0, "type": "passive"},
+            {"number": "2", "name": "B", "x_mm": 3,  "y_mm": 0, "angle_deg": 180, "type": "passive"},
         ],
     )
     assert res["lib_id"] == "custom:WIDGET"
@@ -347,6 +347,10 @@ def test_create_symbol_writes_lib_and_table(tmp_path: Path):
     # sym-lib-table registered
     sym_table = (tmp_path / "p" / "sym-lib-table").read_text()
     assert "custom" in sym_table
+    # angle_deg is KiCAD's pin angle: a pin at x<0 with angle 0 sits on the left
+    from kicad_claude.indexer.kicad_libs import get_symbol_pins
+    sides = {p["name"]: p["side"] for p in get_symbol_pins(lib_path, "WIDGET")}
+    assert sides == {"A": "left", "B": "right"}
     state.clear_active()
 
 
@@ -354,7 +358,7 @@ def test_create_symbol_rejects_duplicate(tmp_path: Path):
     state.clear_active()
     write_blank_project(tmp_path / "p", "p")
     state.set_active(tmp_path / "p", "p")
-    pins = [{"number": "1", "name": "A", "x_mm": -3, "y_mm": 0, "angle_deg": 180, "type": "passive"}]
+    pins = [{"number": "1", "name": "A", "x_mm": -3, "y_mm": 0, "angle_deg": 0, "type": "passive"}]
     lc.create_symbol(tmp_path / "p", lib_name="lib", symbol_name="S", pins=pins)
     with pytest.raises(FileExistsError):
         lc.create_symbol(tmp_path / "p", lib_name="lib", symbol_name="S", pins=pins)
@@ -548,11 +552,11 @@ def test_acceptance_custom_symbol_and_footprint_parse(tmp_path: Path):
         tmp_path / "p",
         lib_name="custom", symbol_name="OPAMP",
         pins=[
-            {"number": "1", "name": "OUT", "x_mm": 5, "y_mm": 0, "angle_deg": 0, "type": "output"},
+            {"number": "1", "name": "OUT", "x_mm": 5, "y_mm": 0, "angle_deg": 180, "type": "output"},
             {"number": "2", "name": "VCC", "x_mm": 0, "y_mm": 5, "angle_deg": 270, "type": "power_in"},
             {"number": "3", "name": "GND", "x_mm": 0, "y_mm": -5, "angle_deg": 90, "type": "power_in"},
-            {"number": "4", "name": "IN+", "x_mm": -5, "y_mm": 1.27, "angle_deg": 180, "type": "input"},
-            {"number": "5", "name": "IN-", "x_mm": -5, "y_mm": -1.27, "angle_deg": 180, "type": "input"},
+            {"number": "4", "name": "IN+", "x_mm": -5, "y_mm": 1.27, "angle_deg": 0, "type": "input"},
+            {"number": "5", "name": "IN-", "x_mm": -5, "y_mm": -1.27, "angle_deg": 0, "type": "input"},
         ],
         description="Test opamp", keywords="test custom",
     )

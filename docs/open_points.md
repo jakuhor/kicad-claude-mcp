@@ -10,28 +10,6 @@ The one live queue for this server. **Only open items live here.**
 - Mark decisions taken with the user *(decided, date)* so they are not
   re-asked.
 
-The current epic is **R7 — one tool**: absorb what kicad-happy does that this
-server does not, so the user runs one tool under their control *(decided,
-2026-11-08)*. kicad-happy stays installed until parity; removing it is the
-user's call (OP-8). Phase order *(decided, 2026-11-08)*: P-C and P-A done,
-P-D (EMC, `analyze_emc`), P-E (`simulate_subcircuits`, incl. vendor op-amp
-models), P-F (release tools, assembly review with 3D heights), P-B (BOM
-diff, fab BOM + CPL, field write-back), the circuit detectors (P-C
-remainder: power, analog, digital, misc) and the datasheet consumers
-(`review_part_ratings`), the DC operating-point model (`dc_model`: switch
-scenarios, pin clamps, zeners), their refinements and the remaining
-detector groups (OP-9 … OP-12) done 2026-11-09.
-
----
-
-## OP-8 — Retire kicad-happy (user decision)
-
-OP-1 … OP-12 and OP-17 are done: the retire condition decided on
-2026-11-11 is met (review checks, layout thermal + DFM, SPICE + datasheet
-quality; inputs and workflow were not required). Remaining step, the
-user's: uninstall the plugin (`/plugin` → uninstall `kicad-happy@kicad-happy`),
-then delete this item.
-
 ## OP-13 — Accepted limits of the estimators (no work planned)
 
 Kept so they stay visible; each is stated in the tool output.
@@ -89,3 +67,40 @@ says `courtyard_is_box: false`).
 Field test 4, 2026-11-17: add a `Mouser` field (Mouser part number) to every
 symbol of `~/github/JH_LED_control/hardware`, cost-optimise its BOM and swap
 U1. All its server items (OP-40 … OP-44) are done (README).
+
+---
+
+IPC review, 2026-11-19 *(decided)*: no "IPC Class 3 verdict". Class 3 is a
+fab acceptance class (IPC-6012 / IPC-A-600) ordered from the fab, not a
+layout property; findings say "design margin for Class 3", never
+"compliant". IPC values are cited by section and table, not copied in bulk.
+
+## OP-45 — IPC-2221B voltage spacing per net pair
+
+KiCAD's DRC does not know net voltages; this server does (rail voltages,
+`analyze_power_tree`). For each pair of nets on one layer, take the voltage
+difference, look up the IPC-2221B minimum conductor spacing for the
+conductor category (B1 internal, B2 external uncoated, B3 external coated,
+A6 / A7 assembly; altitude above 3050 m noted) and flag copper closer than
+that. Inputs: `rail_voltages`, category per layer or a coated flag. Report
+the cited table row. Fits beside `CERT-ISO` (which only names IEC 62368-1
+creepage). New rule ID in the README table.
+
+## OP-46 — IPC-D-356 and IPC-2581 export
+
+Add both to `export(kind=…)` through `kicad-cli pcb export ipcd356` /
+`ipc2581` (check the exact subcommands and options in KiCAD 10.0.8's
+`kicad-cli pcb export --help`). D-356 is the netlist the fab uses for
+electrical test; put it in `export_fab_package` too (option, default on).
+`analyze_gerbers` may cross-check that the D-356 net count matches the board.
+
+## OP-47 — IPC class presets (annular ring, holes)
+
+Add presets to `src/kicad_claude/data/fab_presets.json` for IPC-2221 / 2222
+producibility level B with Class 2 and Class 3 ring targets (e.g.
+`ipc_class2_level_b`, `ipc_class3_level_b`): `min_via_annular_width`,
+`min_via_diameter` / `min_via_drill`, `min_through_hole_diameter`,
+`min_hole_to_hole`, `min_clearance`, with `source` naming the standard and
+section. No code: `DFM-RING` / `DFM-DRILL` and DRC enforce them. Description
+says "design margin", not acceptance. Values need the user's copy of the
+standard to verify before they ship.

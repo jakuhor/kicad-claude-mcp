@@ -1981,6 +1981,7 @@ def test_move_symbol_carries_fields(blank_project, tmp_path, monkeypatch):
     _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R9",
           value="10k", x_mm=49.53, y_mm=59.69, rotation=90)
     want = fields("R9")
+    _call(mcp, "remove_symbol", reference="R9")  # its fields would push R1's aside
 
     _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
           value="10k", x_mm=100.33, y_mm=100.33)

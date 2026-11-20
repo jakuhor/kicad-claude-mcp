@@ -24,7 +24,7 @@ from kicad_claude.tools.sch import register as register_sch
 from kicad_claude.utils.kicad_paths import find_kicad_cli, find_symbol_lib_dirs
 
 DEMOS = Path("C:/Program Files/KiCad/10.0/share/kicad/demos")
-WANTED = {"Device": ["R", "C"], "power": ["GND", "+5V", "VCC", "PWR_FLAG"],
+WANTED = {"Device": ["R", "C", "LED"], "power": ["GND", "+5V", "VCC", "PWR_FLAG"],
           "Transistor_FET": ["2N7002"]}
 
 
@@ -511,12 +511,9 @@ def test_forced_autoplace_keeps_fields_off_wires(mcp):
     _call(mcp, "edit_schematic", ops=ops)
     tree = _tree()
     q = ed.find_symbol_by_reference(tree, "Q1")
-    fields = g.visible_fields(q)
-    from kicad_claude.adapters import sch_layout as lay
-    places = [(float(sch_io.find_child(f, "at")[1]), float(sch_io.find_child(f, "at")[2]))
-              for f in fields]
-    assert lay._wire_hits(tree, fields, places, "left", 1.27) == 0 or \
-        lay._wire_hits(tree, fields, places, "right", 1.27) == 0
+    boxes = [g.field_box(q, f) for f in g.visible_fields(q)]
+    wires = layout._items(tree)["wires"]
+    assert not any(g.segment_hits_box(u, v, g.shrink(bx, 0.1)) for bx in boxes for u, v in wires)
 
 
 @pytest.mark.slow
@@ -640,7 +637,7 @@ def test_readability_sees_ports_flags_and_the_border_band(mcp):
 
 def test_labels_list_and_bulk_remove_and_multi_ref_remove(mcp):
     _call(mcp, "edit_schematic", ops=TWO_R + [
-        {"op": "connect", "pins": ["R1.1", "R2.1"], "net": "SIG"},
+        {"op": "connect", "pins": ["R1.1", "R2.1"], "net": "SIG", "join": False},
         {"op": "connect", "pins": ["R1.2", "R2.2"], "net": "GND"}])
     labels = _call(mcp, "list_texts", kind="labels", net="SIG")
     assert len(labels) == 2 and {lab["orientation"] for lab in labels} == {"up"}
@@ -651,7 +648,7 @@ def test_labels_list_and_bulk_remove_and_multi_ref_remove(mcp):
     res = _call(mcp, "edit_schematic", ops=[{"op": "remove", "label": "SIG"},
                                             {"op": "remove", "pattern": "#PWR*"}])
     assert _call(mcp, "list_texts", kind="labels") == []
-    assert res["results"] == [{"i": 1, "wires": 2}]
+    assert res["results"] == [{"i": 0, "wires": 1}, {"i": 1, "wires": 2}]
     assert not any((ed.get_symbol_property(s, "Reference") or "").startswith("#PWR")
                    for s in ed.iter_instance_symbols(_tree()))
     _call(mcp, "edit_schematic", ops=[{"op": "remove", "refs": ["R1", "R2"]}])
@@ -678,3 +675,237 @@ def test_unknown_lib_ids_are_refused_up_front_with_a_hint(mcp):
             {"op": "symbol", "lib_id": "Devices:R", "ref": "R2", "value": "1k",
              "x_mm": 76.2, "y_mm": 50.8}])
     assert list(ed.iter_instance_symbols(_tree())) == []
+
+
+def test_removing_a_label_takes_its_stub_unless_told_otherwise(mcp):
+    _call(mcp, "edit_schematic", ops=TWO_R + [{"op": "connect", "pin": "R1.1", "net": "A"},
+                                              {"op": "connect", "pin": "R2.1", "net": "B"}])
+    assert _wire_count() == 2
+    res = _call(mcp, "edit_schematic", ops=[{"op": "remove", "label": "A"}])
+    assert res["results"][0]["wires"] == 1
+    assert _wire_count() == 1
+    _call(mcp, "edit_schematic", ops=[{"op": "remove", "label": "B", "wires": False}])
+    assert _wire_count() == 1
+
+
+def test_led_arrows_do_not_count_as_body_for_wires(mcp):
+    led = [{"op": "symbol", "lib_id": "Device:LED", "ref": "D1", "value": "red",
+            "x_mm": 50.8, "y_mm": 50.8}]
+    # K pin end at x 46.99: a wire going left runs under the arrows' box only
+    _call(mcp, "edit_schematic", ops=led + [
+        {"op": "wire", "x1_mm": 46.99, "y1_mm": 50.8, "x2_mm": 39.37, "y2_mm": 50.8}])
+    res = _call(mcp, "check_schematic_readability")
+    assert "SR-WIRE-THROUGH-BODY" not in res["counts"], res["findings"]
+    # a wire straight through the diode triangle still counts
+    _call(mcp, "edit_schematic", ops=[
+        {"op": "wire", "x1_mm": 50.8, "y1_mm": 43.18, "x2_mm": 50.8, "y2_mm": 58.42}])
+    res = _call(mcp, "check_schematic_readability")
+    assert res["counts"].get("SR-WIRE-THROUGH-BODY") == 1
+
+
+def test_label_only_ratio_and_short_label_distance(mcp):
+    _call(mcp, "edit_schematic", ops=TWO_R + [
+        {"op": "connect", "pins": ["R1.1", "R2.1"], "net": "SIG", "join": False},
+        {"op": "wire", "from": "R1.2", "to": "R2.2"}])
+    res = _call(mcp, "check_schematic_readability")
+    assert res["label_only_nets"] == {"label_joined": 1, "signal_nets": 2, "ratio": 0.5}
+    assert "SR-SHORT-LABEL-NET" not in res["counts"]  # 25.4 mm apart
+    res = _call(mcp, "check_schematic_readability", short_label_mm=30)
+    assert res["counts"].get("SR-SHORT-LABEL-NET") == 1
+
+
+def test_mirrored_symbol_returns_pin_positions(mcp):
+    res = _call(mcp, "edit_schematic", ops=[
+        {"op": "symbol", "lib_id": "Device:LED", "ref": "D1", "value": "red",
+         "x_mm": 50.8, "y_mm": 50.8, "mirror": "y"}])
+    pins = res["results"][0]["pins"]
+    assert pins["1"][0] > 50.8 > pins["2"][0]  # mirror y: K moves to the right
+    res = _call(mcp, "edit_schematic", ops=[
+        {"op": "move", "ref": "D1", "x_mm": 50.8, "y_mm": 50.8, "rotation": 180,
+         "mirror": "x"}])
+    assert res["results"][0]["pins"] == pins  # rot 180 + mirror x == mirror y
+
+
+def test_connect_puts_one_label_on_the_wire_not_on_a_stub(mcp):
+    ops = R1_ONLY + [{"op": "symbol", "lib_id": "Device:R", "ref": "R2", "value": "1k",
+                      "x_mm": 58.42, "y_mm": 50.8},
+                     {"op": "connect", "pins": ["R1.1", "R2.1"], "net": "SIG"}]
+    res = _call(mcp, "edit_schematic", ops=ops, verbose=True)
+    assert res["results"][-1]["labels"] == 1
+    assert _wire_count() == 1  # the pin-to-pin wire, no stub
+    (lab,) = _call(mcp, "list_texts", kind="labels", net="SIG")
+    x, y = lab["position_mm"]
+    assert abs(y - 46.99) < 1e-3 and 50.8 <= x <= 58.42
+    assert _nets(mcp)["SIG"] == ["R1.1", "R2.1"]
+
+
+def test_connect_name_false_wires_without_a_label(mcp):
+    res = _call(mcp, "edit_schematic", ops=TWO_R + [
+        {"op": "connect", "pins": ["R1.1", "R2.1"], "net": "SIG", "name": False}],
+        verbose=True)
+    assert res["results"][-1]["labels"] == 0
+    assert _call(mcp, "list_texts", kind="labels") == []
+    assert ["R1.1", "R2.1"] in _nets(mcp).values()
+
+
+def test_name_net_labels_a_wired_net_on_its_wire(mcp):
+    _call(mcp, "edit_schematic", ops=TWO_R + [{"op": "wire", "from": "R1.2", "to": "R2.2"}])
+    res = _call(mcp, "edit_schematic", ops=[{"op": "name_net", "pin": "R1.2", "net": "MID"}])
+    spot = res["results"][0]
+    assert spot.get("collisions", 0) == 0 and spot["orientation"] == "right"
+    assert _wire_count() == 1
+    assert _nets(mcp)["MID"] == ["R1.2", "R2.2"]
+    # a pin on no wire falls back to a stub and a label
+    res = _call(mcp, "edit_schematic", ops=[{"op": "name_net", "pin": "R1.1", "net": "TOP"}])
+    assert res["results"][0]["stub"] is True and _wire_count() == 2
+    with pytest.raises(ValueError, match="no wire end"):
+        _call(mcp, "edit_schematic", ops=[{"op": "name_net", "x_mm": 10, "y_mm": 10,
+                                           "net": "X"}])
+
+
+def test_autoplace_moves_fields_off_a_neighbour(mcp):
+    # R2 sits where R1's fields go by default (right of its body)
+    _call(mcp, "edit_schematic", ops=R1_ONLY + [
+        {"op": "symbol", "lib_id": "Device:R", "ref": "R2", "value": "1k",
+         "x_mm": 54.61, "y_mm": 50.8},
+        {"op": "autoplace", "refs": ["R1"], "force": True}])
+    r1 = ed.find_symbol_by_reference(_tree(), "R1")
+    r2_body = g.body_box(_tree(), ed.find_symbol_by_reference(_tree(), "R2"))
+    for f in g.visible_fields(r1):
+        assert g.overlap_area(g.field_box(r1, f), r2_body) == 0
+        assert float(sch_io.find_child(f, "at")[1]) < 50.8  # went to the left side
+
+
+def test_field_justify_reads_as_asked_on_a_rotated_symbol(mcp):
+    res = _call(mcp, "edit_schematic", ops=[
+        {"op": "symbol", "lib_id": "Device:R", "ref": "R1", "value": "10k",
+         "x_mm": 50.8, "y_mm": 50.8, "rotation": 180},
+        {"op": "field", "ref": "R1", "field": "Value", "x_mm": 60.96, "y_mm": 50.8,
+         "angle": 0, "justify": "left"}])
+    x1, _y1, x2, _y2 = res["results"][-1]["bbox_mm"]
+    assert x1 == pytest.approx(60.96, abs=1e-3) and x2 > x1  # starts at the anchor
+    r1 = ed.find_symbol_by_reference(_tree(), "R1")
+    prop = next(f for f in g.visible_fields(r1) if f[1] == "Value")
+    assert g.justify_of(prop)[0] == "right"  # stored pre-flipped for rotation 180
+
+
+def test_move_region_shifts_a_block_and_keeps_its_nets(mcp):
+    _call(mcp, "edit_schematic", ops=TWO_R + [
+        {"op": "connect", "pin": "R1.1", "net": "IN"},
+        {"op": "wire", "from": "R1.2", "to": "R2.2"},
+        {"op": "text", "text": "block", "x_mm": 45.72, "y_mm": 58.42}])
+    before = _nets(mcp)
+    res = _call(mcp, "edit_schematic", ops=[
+        {"op": "move_region", "x1_mm": 38.1, "y1_mm": 38.1, "x2_mm": 63.5, "y2_mm": 63.5,
+         "dx_mm": 0, "dy_mm": 10.16}])
+    assert res["results"][0]["symbols"] == 1
+    assert _nets(mcp) == before
+    r1 = ed.find_symbol_by_reference(_tree(), "R1")
+    assert g.Frame(r1).y == pytest.approx(60.96)
+    (lab,) = _call(mcp, "list_texts", kind="labels", net="IN")
+    assert lab["position_mm"][1] == pytest.approx(46.99 - 2.54 + 10.16)
+    # dropping R1 onto R2 puts IN on OUT: refused
+    _call(mcp, "edit_schematic", ops=[{"op": "connect", "pin": "R2.1", "net": "OUT"}])
+    with pytest.raises(ValueError, match="merges nets"):
+        _call(mcp, "edit_schematic", ops=[
+            {"op": "move_region", "x1_mm": 38.1, "y1_mm": 38.1, "x2_mm": 63.5,
+             "y2_mm": 73.66, "dx_mm": 25.4, "dy_mm": -10.16}])
+
+
+def _ports(net: str) -> list:
+    return [s for s in ed.iter_instance_symbols(_tree())
+            if g.is_power(_tree(), s) and ed.get_symbol_property(s, "Value") == net]
+
+
+def test_join_power_replaces_per_pin_ports_with_one(mcp):
+    _call(mcp, "edit_schematic", ops=TWO_R + [
+        {"op": "connect", "pins": ["R1.2", "R2.2"], "net": "GND"}])
+    assert len(_ports("GND")) == 2
+    res = _call(mcp, "edit_schematic", ops=[
+        {"op": "join_power", "pins": ["R1.2", "R2.2"], "net": "GND"}])
+    assert res["results"][0]["ports_removed"] == 2
+    assert len(_ports("GND")) == 1
+    assert _nets(mcp)["GND"] == ["R1.2", "R2.2"]
+
+
+def test_join_power_on_one_side_puts_the_port_atop_the_spine(mcp):
+    _call(mcp, "edit_schematic", ops=[
+        {"op": "symbol", "lib_id": "Device:R", "ref": "R1", "value": "1k",
+         "x_mm": 50.8, "y_mm": 50.8, "rotation": 90},
+        {"op": "symbol", "lib_id": "Device:R", "ref": "R2", "value": "1k",
+         "x_mm": 50.8, "y_mm": 58.42, "rotation": 90},
+        {"op": "join_power", "pins": ["R1.2", "R2.2"], "net": "+5V"}])
+    (port,) = _ports("+5V")
+    p1 = ed.get_pin_position(_tree(), "R1", "2")
+    (pp,) = [p["point"] for p in g.pins(_tree(), port)]
+    assert pp[1] == pytest.approx(p1[1])  # at the top end, level with R1.2
+    assert _nets(mcp)["+5V"] == ["R1.2", "R2.2"]
+    counts = _call(mcp, "check_schematic_readability")["counts"]
+    assert "SR-OVERLAP" not in counts and "SR-PORT-INTO-BODY" not in counts
+
+
+def test_place_chain_builds_a_wired_filter(mcp):
+    res = _call(mcp, "edit_schematic", ops=[
+        {"op": "place_chain", "x_mm": 50.8, "y_mm": 50.8,
+         "parts": [{"lib_id": "Device:R", "ref": "R1", "value": "1k"},
+                   {"lib_id": "Device:R", "ref": "R2", "value": "1k"}],
+         "shunts": {"1": [{"lib_id": "Device:C", "ref": "C1", "value": "1n", "to": "GND"},
+                          {"lib_id": "Device:C", "ref": "C2", "value": "1n", "to": "GND"}],
+                    "2": [{"lib_id": "Device:C", "ref": "C3", "value": "1n", "to": "GND"}]},
+         "nets": {"0": "IN", "1": "MID", "2": "OUT"}}])
+    nets = _nets(mcp)
+    assert nets["IN"] == ["R1.1"]
+    assert nets["MID"] == ["C1.1", "C2.1", "R1.2", "R2.1"]
+    assert nets["OUT"] == ["C3.1", "R2.2"]
+    assert nets["GND"] == ["C1.2", "C2.2", "C3.2"]
+    r1, r2 = (ed.find_symbol_by_reference(_tree(), r) for r in ("R1", "R2"))
+    assert ed.get_pin_position(_tree(), "R1", "1")[1] == pytest.approx(50.8)
+    assert g.Frame(r2).x > g.Frame(r1).x  # laid out left to right
+    counts = _call(mcp, "check_schematic_readability")["counts"]
+    for rule in ("SR-WIRE-THROUGH-BODY", "SR-PORT-INTO-BODY", "SR-OVERLAP", "SR-OFF-GRID"):
+        assert rule not in counts, (rule, counts)
+    assert set(res["results"][0]["nodes"]) == {"0", "1", "2"}
+
+
+@pytest.mark.slow
+def test_new_layout_ops_pass_erc_and_match_kicad_nets(mcp, tmp_path):
+    """OP-50/52/54/55/57 output, proven by kicad-cli: ERC clean, same nets."""
+    cli = find_kicad_cli()
+    if cli is None:
+        pytest.skip("kicad-cli not found")
+    _call(mcp, "edit_schematic", ops=[
+        {"op": "place_chain", "x_mm": 50.8, "y_mm": 50.8,
+         "parts": [{"lib_id": "Device:R", "ref": "R1", "value": "1k"},
+                   {"lib_id": "Device:R", "ref": "R2", "value": "1k"}],
+         "shunts": {"1": [{"lib_id": "Device:C", "ref": "C1", "value": "1n", "to": "GND"},
+                          {"lib_id": "Device:C", "ref": "C2", "value": "1n", "to": "GND"}],
+                    "2": [{"lib_id": "Device:C", "ref": "C3", "value": "1n", "to": "GND"}]},
+         "nets": {"0": "IN", "2": "OUT"}},
+        {"op": "pwr_flag", "pin": "C1.2"},
+        {"op": "symbol", "lib_id": "Device:R", "ref": "R3", "value": "1k",
+         "x_mm": 50.8, "y_mm": 88.9, "rotation": 90},
+        {"op": "symbol", "lib_id": "Device:R", "ref": "R4", "value": "1k",
+         "x_mm": 50.8, "y_mm": 96.52, "rotation": 90},
+        {"op": "connect", "pins": ["R3.2", "R4.2"], "net": "+5V"},
+        {"op": "join_power", "pins": ["R3.2", "R4.2"], "net": "+5V"},
+        {"op": "pwr_flag", "pin": "R3.2"},
+        {"op": "connect", "pins": ["R3.1", "R4.1"], "net": "IN", "join": False},
+        {"op": "move_region", "x1_mm": 40.64, "y1_mm": 83.82, "x2_mm": 63.5, "y2_mm": 101.6,
+         "dx_mm": 0, "dy_mm": 12.7}])
+    ours = _nets(mcp)
+    sch = state.get_active().sch_path
+    out = tmp_path / "erc.json"
+    subprocess.run([str(cli), "sch", "erc", "--format", "json", "-o", str(out), str(sch)],
+                   check=True, capture_output=True)
+    import json
+    report = json.loads(out.read_text(encoding="utf-8"))
+    violations = [v for s in report["sheets"] for v in s["violations"]]
+    assert not violations, json.dumps(violations)
+    net = tmp_path / "n.net"
+    subprocess.run([str(cli), "sch", "export", "netlist", "--format", "kicadsexpr",
+                    "-o", str(net), str(sch)], check=True, capture_output=True)
+    from kicad_claude.adapters import kicad_python
+    theirs = {n["name"].lstrip("/"): sorted(f"{r}.{p}" for r, p in n["nodes"])
+              for n in kicad_python.netlist_pad_map(net)["nets"]}
+    for name in ("IN", "OUT", "GND", "+5V"):
+        assert theirs[name] == [p for p in ours[name] if not p.startswith("#")], name

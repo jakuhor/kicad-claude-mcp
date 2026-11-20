@@ -25,8 +25,9 @@ from kicad_claude.utils.geometry import normalize_rotation
 logger = logging.getLogger("kicad-claude.tools.sch.batch")
 
 _DIR_TO_ORIENT = {(1, 0): "right", (-1, 0): "left", (0, -1): "up", (0, 1): "down"}
-OPS = ("symbol", "wire", "label", "power", "pwr_flag", "connect", "no_connect",
-       "junction", "text", "move", "remove", "property", "field", "autoplace")
+OPS = ("symbol", "wire", "label", "power", "pwr_flag", "connect", "name_net", "no_connect",
+       "junction", "text", "move", "move_region", "join_power", "place_chain", "remove",
+       "property", "field", "autoplace")
 
 
 class OpError(ValueError):
@@ -245,6 +246,12 @@ def _junction_if_tee(tree: list, pt) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _pin_positions(tree: list, ref: str) -> dict[str, list[float]]:
+    """Pin number -> sheet position, returned after a mirror so the caller
+    sees where the pins landed."""
+    return {p["number"]: p["position_mm"] for p in ed.list_pins_for_symbol(tree, ref)}
+
+
 def _op_symbol(b: _Batch, op: dict) -> dict:
     x, y = b.point(op)
     rot = normalize_rotation(op.get("rotation", 0))
@@ -254,6 +261,8 @@ def _op_symbol(b: _Batch, op: dict) -> dict:
     if op.get("autoplace", bool(rot) or mirrored):
         layout.autoplace_fields(b.tree, node, force=bool(op.get("autoplace") == "force"))
     ed.junction_mid_wire_pins(b.tree, node)
+    if op.get("mirror"):
+        return {"ref": op["ref"], "pins": _pin_positions(b.tree, op["ref"])}
     return {"ref": op["ref"]}
 
 
@@ -341,39 +350,120 @@ def _op_pwr_flag(b: _Batch, op: dict) -> dict:
                                               for side in sides])}
 
 
-JOIN_SPAN_MM = 15.0  # pins this close are wired together under one label
+JOIN_SPAN_MM = 25.4  # pins this close are wired together, not labelled
 
 
-def _wire_close_pins(b: _Batch, pins: list[str]) -> tuple[list[str], int]:
-    """Wire pins that sit within `JOIN_SPAN_MM` of each other: each one to
-    its nearest already-wired pin of its group, by a clean straight / L
-    path. Returns the pins that still need a label of their own (one per
-    group, and any with no clean path) and the wires drawn."""
+def _wire_close_pins(b: _Batch, pins: list[str],
+                     span_mm: float = JOIN_SPAN_MM) -> list[list[str]]:
+    """Wire pins that sit within `span_mm` of each other: each one to its
+    nearest already-wired pin of its group, by a clean straight / L path.
+    Returns the groups, first pin first; a pin with no clean path is a group
+    of its own."""
     pts = {a: b.pin(a) for a in pins}
-    rest, own, wires = list(pins), [], 0
+    rest, groups = list(pins), []
     while rest:
         group = [rest.pop(0)]
-        own.append(group[0])
+        groups.append(group)
         while True:
             near = [(w, r) for w in group for r in rest
-                    if math.dist(pts[w]["point"], pts[r]["point"]) <= JOIN_SPAN_MM]
+                    if math.dist(pts[w]["point"], pts[r]["point"]) <= span_mm + 1e-6]
             if not near:
                 break
             a, c = min(near, key=lambda e: math.dist(pts[e[0]]["point"], pts[e[1]]["point"]))
             rest.remove(c)
             path, hits = _l_route(b, pts[a], pts[c])
             if hits:
-                own.append(c)  # no clean path: its own stub and label
+                groups.append([c])  # no clean path: its own stub and label
                 continue
-            wires += _add_path(b, path)
+            _add_path(b, path)
             group.append(c)
-    return own, wires
+    return groups
+
+
+def _group_segments(tree: list, start: tuple[float, float]) -> list[tuple]:
+    """The wire segments connected to `start` (a wire end), as (a, c)."""
+    from kicad_claude.adapters import sch_netlist
+
+    key = sch_netlist._pt(*start)
+    segs = sch_netlist._wire_segments(tree)
+    if not any(key in (a, c) for a, c, _ in segs):
+        return []
+    uf = sch_netlist.build_sheet_graph(tree)["uf"]
+    root = uf.find(key)
+    return [(a, c) for a, c, _ in segs if uf.find(a) == root]
+
+
+def _label_spot(b: _Batch, segs: list[tuple], net: str, kind: str = "label",
+                shape: str = "bidirectional"):
+    """Where one label for a wired net collides least: on its longest
+    horizontal segment first, stepping 1.27 mm along it. Returns
+    (point, orientation, collisions), or None for a net with no straight
+    segment."""
+    items = layout._items(b.tree)
+    cands = []
+    for a, c in segs:
+        if abs(a[1] - c[1]) < 1e-4:
+            cands.append((0, -abs(a[0] - c[0]), min(a, c), (1, 0), "right"))
+        elif abs(a[0] - c[0]) < 1e-4:
+            low = a if a[1] > c[1] else c  # the text runs up from the lower end
+            cands.append((1, -abs(a[1] - c[1]), low, (0, -1), "up"))
+    best = None
+    for _vert, neg_len, start, step, orient in sorted(cands):
+        for k in range(int(round(-neg_len / 1.27)) + 1):
+            pt = (round(start[0] + step[0] * 1.27 * k, 4),
+                  round(start[1] + step[1] * 1.27 * k, 4))
+            node = (ed.add_global_label(b.tree, net, pt[0], pt[1], orient, shape)
+                    if kind == "global" else ed.add_label(b.tree, net, pt[0], pt[1], orient))
+            box = g.label_box(node)
+            b.tree.remove(node)
+            hits = (sum(g.overlap_area(box, t["box"]) > 0.15 for t in items["texts"])
+                    + sum(g.overlap_area(g.shrink(box, 0.15), bd["box"]) > 0
+                          for bd in items["bodies"])
+                    + sum(g.segment_hits_box(u, v, g.shrink(box, 0.3))
+                          for u, v in items["wires"]))
+            if best is None or hits < best[2]:
+                best = (pt, orient, hits)
+            if hits == 0:
+                return best
+    return best
+
+
+def _place_name(b: _Batch, start, net: str, kind: str, shape: str,
+                only_if_clear: bool = False) -> dict | None:
+    """Put one label on the wired net at `start`, on its clearest segment.
+    None when `start` is on no wire (or, with `only_if_clear`, when every
+    spot collides)."""
+    segs = _group_segments(b.tree, start)
+    spot = _label_spot(b, segs, net, kind, shape) if segs else None
+    if spot is None or (only_if_clear and spot[2]):
+        return None
+    pt, orient, hits = spot
+    if kind == "global":
+        ed.add_global_label(b.tree, net, pt[0], pt[1], orient, shape)
+    else:
+        ed.add_label(b.tree, net, pt[0], pt[1], orient)
+    return {"at": list(pt), "orientation": orient, "collisions": hits}
+
+
+def _stub_label(b: _Batch, addr: str, net: str, kind: str, stub: float, shape: str) -> None:
+    """A stub out of the pin and a label at its end, facing away from the body."""
+    p = b.pin(addr)
+    o = p["out"]
+    end = (round(p["point"][0] + o[0] * stub, 4), round(p["point"][1] + o[1] * stub, 4))
+    if stub > 0:
+        ed.add_wire(b.tree, p["point"][0], p["point"][1], end[0], end[1])
+    orient = _DIR_TO_ORIENT[tuple(o)]
+    if kind == "global":
+        ed.add_global_label(b.tree, net, end[0], end[1], orient, shape)
+    else:
+        ed.add_label(b.tree, net, end[0], end[1], orient)
 
 
 def _op_connect(b: _Batch, op: dict) -> dict:
-    """Tie pins to a net: a stub wire out of each pin, then a label or a
-    power port at its end, facing away from the body. Label-style pins
-    close together are wired to each other under one label instead."""
+    """Tie pins to a net. Label style: pins close together are wired to each
+    other and each wired group gets one label on its clearest segment; a lone
+    pin gets a stub and a label facing away from the body. Power style: a
+    stub and a port per pin."""
     pins = op.get("pins") or ([op["pin"]] if "pin" in op else [])
     if not pins:
         raise OpError("connect needs pin or pins")
@@ -381,18 +471,19 @@ def _op_connect(b: _Batch, op: dict) -> dict:
     style = op.get("style", "auto")
     if style == "auto":
         style = "power" if b.is_power_net(net) else "label"
+    if style not in ("label", "global", "power"):
+        raise OpError(f"style must be auto, label, global or power, got {style!r}")
     stub = float(op.get("stub_mm", 2.54))
+    shape = op.get("shape", "bidirectional")
     made = []
-    labelled = pins
-    if style in ("label", "global") and len(pins) > 1 and op.get("join", True):
-        labelled, _wires = _wire_close_pins(b, list(pins))
-    for addr in labelled:
-        p = b.pin(addr)
-        o = p["out"]
-        end = (round(p["point"][0] + o[0] * stub, 4), round(p["point"][1] + o[1] * stub, 4))
-        if stub > 0:
-            ed.add_wire(b.tree, p["point"][0], p["point"][1], end[0], end[1])
-        if style == "power":
+    out: dict = {"style": style, "pins": len(pins)}
+    if style == "power":
+        for addr in pins:
+            p = b.pin(addr)
+            o = p["out"]
+            end = (round(p["point"][0] + o[0] * stub, 4), round(p["point"][1] + o[1] * stub, 4))
+            if stub > 0:
+                ed.add_wire(b.tree, p["point"][0], p["point"][1], end[0], end[1])
             if o[1] == 0 and stub > 0:
                 # A side pin: the port upright (as KiCAD draws them) unless
                 # pointing it along the stub collides less.
@@ -401,23 +492,44 @@ def _op_connect(b: _Batch, op: dict) -> dict:
             else:
                 made.append(b.power_port(net, end[0], end[1], None, o,
                                          op.get("base_symbol", "")))
-        elif style in ("label", "global"):
-            orient = _DIR_TO_ORIENT[tuple(o)]
-            if style == "global":
-                ed.add_global_label(b.tree, net, end[0], end[1], orient,
-                                    op.get("shape", "bidirectional"))
-            else:
-                ed.add_label(b.tree, net, end[0], end[1], orient)
-        else:
-            raise OpError(f"style must be auto, label, global or power, got {style!r}")
+    else:
+        kind = "global" if style == "global" else "label"
+        groups = [[a] for a in pins]
+        if len(pins) > 1 and op.get("join", True):
+            groups = _wire_close_pins(b, list(pins), float(op.get("join_mm", JOIN_SPAN_MM)))
+        if len(groups) == 1 and len(groups[0]) > 1 and op.get("name", True) is False:
+            groups = []  # all wired and no name wanted: KiCAD names the net
+        for group in groups:
+            # A crowded wired group falls back to the stub at its first pin.
+            if len(group) < 2 or _place_name(b, b.pin(group[0])["point"], net, kind,
+                                              shape, only_if_clear=True) is None:
+                _stub_label(b, group[0], net, kind, stub, shape)
+        out["groups"] = max(len(groups), 1)
+        out["labels"] = len(groups)
     if op.get("flag") and not b.flagged(net):
         # One flag marks the whole net as driven.
         made.append(_op_pwr_flag(b, {"pin": pins[0]})["ref"])
         b._flagged.add(net)
-    out = {"style": style, "pins": len(pins)}
     if made:
         out["refs"] = made
     return out
+
+
+def _op_name_net(b: _Batch, op: dict) -> dict:
+    """One label on an already-wired net, on its clearest segment."""
+    start = b.pin(op["pin"])["point"] if "pin" in op else b.point(op)
+    kind = "global" if op.get("label_type", "local") == "global" else "label"
+    shape = op.get("shape", "bidirectional")
+    placed = _place_name(b, start, op["net"], kind, shape)
+    if placed is None:
+        if "pin" not in op:
+            raise OpError(f"no wire end at {start}: give a pin, or a wire end point")
+        _stub_label(b, op["pin"], op["net"], kind, float(op.get("stub_mm", 2.54)), shape)
+        return {"stub": True}
+    if placed["collisions"]:
+        b.warnings.append(f"name_net {op['net']!r}: no clear spot on its wires; the label "
+                          f"at {placed['at']} touches {placed['collisions']} item(s)")
+    return placed
 
 
 def _op_no_connect(b: _Batch, op: dict) -> dict:
@@ -478,11 +590,196 @@ def _op_move(b: _Batch, op: dict) -> dict:
                           f"allow_merge: true")
         if merged:
             res["nets_merged"] = merged
+        if op.get("mirror"):
+            res["pins"] = _pin_positions(b.tree, op["ref"])
         return res
     if op.get("uuid"):
         ed.move_item(b.tree, op["uuid"], x, y)
         return {}
     raise OpError("move needs ref or uuid")
+
+
+def _op_move_region(b: _Batch, op: dict) -> dict:
+    x1, y1 = b.point(op, "1")
+    x2, y2 = b.point(op, "2")
+    grid = 1.27  # the sheet grid: a shift off it puts every pin off grid
+    dx = round(round(float(op.get("dx_mm", 0)) / grid) * grid, 4)
+    dy = round(round(float(op.get("dy_mm", 0)) / grid) * grid, 4)
+    if not dx and not dy:
+        raise OpError("move_region needs dx_mm and / or dy_mm (snapped to 1.27 mm)")
+    before = _pin_nets(b.tree)
+    res = layout.move_region(b.tree, (x1, y1, x2, y2), dx, dy)
+    merged = _merged_nets(before, _pin_nets(b.tree))
+    if merged and not op.get("allow_merge"):
+        raise OpError(f"moving the region merges nets "
+                      f"{'; '.join(' + '.join(m) for m in merged)}; move elsewhere, or "
+                      f"pass allow_merge: true")
+    if merged:
+        res["nets_merged"] = merged
+    return res
+
+
+def _ports_on(b: _Batch, net: str, pt, out) -> list[str]:
+    """Power ports of `net` drawn on the pin at `pt`: on it, or at the end of
+    its straight stub."""
+    spots = [pt] + ([far] if (far := _stub_from(b, pt, out)) else [])
+    refs = []
+    for s_node in ed.iter_instance_symbols(b.tree):
+        if not g.is_power(b.tree, s_node) or ed.get_symbol_property(s_node, "Value") != net:
+            continue
+        if any(layout._same(p["point"], q) for p in g.pins(b.tree, s_node) for q in spots):
+            refs.append(ed.get_symbol_property(s_node, "Reference"))
+    return refs
+
+
+def _op_join_power(b: _Batch, op: dict) -> dict:
+    """Pins of one power net (VEE on 1 / 4 / 9 / 12 / EP): ports already on
+    them go, the pins of each side get stubs to one spine wire, and the spine
+    gets one port (ground-like nets at its bottom end, others at its top)."""
+    from kicad_claude.adapters.pcb_geometry import is_ground_net
+
+    pins = op.get("pins") or []
+    if len(pins) < 2:
+        raise OpError("join_power needs pins (two or more)")
+    net = op["net"]
+    stub = float(op.get("stub_mm", 2.54))
+    if stub <= 0:
+        raise OpError("join_power needs stub_mm > 0 (the spine sits beyond the pins)")
+    resolved = [b.pin(a) for a in pins]
+    removed = 0
+    for p in resolved:
+        for ref in _ports_on(b, net, p["point"], p["out"]):
+            ed.remove_symbol_with_wires(b.tree, ref, remove_connected_wires=True)
+            b.refs = [x for x in b.refs if x != ref]
+            removed += 1
+    sides: dict[tuple, list] = {}
+    for p in resolved:
+        sides.setdefault(tuple(p["out"]), []).append(p["point"])
+    ground = is_ground_net(net)
+    ports = []
+    for out, points in sides.items():
+        axis = 0 if out[0] else 1  # the coordinate the stubs run along
+        reach = [pt[axis] + out[axis] * stub for pt in points]
+        spine = max(reach) if out[axis] > 0 else min(reach)
+        ends = []
+        for pt in points:
+            end = (spine, pt[1]) if axis == 0 else (pt[0], spine)
+            end = (round(end[0], 4), round(end[1], 4))
+            ed.add_wire(b.tree, pt[0], pt[1], end[0], end[1])
+            ends.append(end)
+        ends.sort(key=lambda e: (e[1 - axis], e[axis]))
+        if len(ends) > 1:
+            ed.add_wire(b.tree, ends[0][0], ends[0][1], ends[-1][0], ends[-1][1])
+            for e in ends:
+                _junction_if_tee(b.tree, e)
+        if axis == 0:  # a vertical spine: the port at its bottom or top end
+            at, direction = (ends[-1], (0, 1)) if ground else (ends[0], (0, -1))
+        else:          # a horizontal spine: the port at its first end, outward
+            at, direction = ends[0], out
+        ports.append(b.power_port(net, at[0], at[1], None, direction, op.get("base_symbol", "")))
+        ed.junction_mid_wire_pins(b.tree, ed.find_symbol_by_reference(b.tree, ports[-1]))
+    out_res = {"refs": ports, "sides": len(sides)}
+    if removed:
+        out_res["ports_removed"] = removed
+    return out_res
+
+
+_DIRS = {"right": (1, 0), "left": (-1, 0), "down": (0, 1), "up": (0, -1)}
+SHUNT_PITCH_MM = 7.62  # between the shunts hung from one node
+
+
+def _step(pt, vec, d: float) -> tuple[float, float]:
+    return round(pt[0] + vec[0] * d, 4), round(pt[1] + vec[1] * d, 4)
+
+
+def _place_along(b: _Batch, spec: dict, at, vec) -> tuple[tuple, tuple]:
+    """Place a part with its in pin on `at` and its out pin along `vec`
+    (rotation found by trying the four). Returns (in point, out point)."""
+    for key in ("lib_id", "ref"):
+        if key not in spec:
+            raise OpError(f"chain part needs {key}: {spec}")
+    ref, pin_in, pin_out = spec["ref"], str(spec.get("in_pin", "1")), str(spec.get("out_pin", "2"))
+    node = b.place(spec["lib_id"], ref, spec.get("value", ""), at[0], at[1], 0,
+                   spec.get("footprint", ""), spec.get("fields"))
+    fr = g.Frame(node)
+    for rot in (0, 90, 180, 270):
+        ed.move_symbol(b.tree, ref, fr.x, fr.y, rot)
+        a, c = b.pin(f"{ref}.{pin_in}")["point"], b.pin(f"{ref}.{pin_out}")["point"]
+        d = (c[0] - a[0], c[1] - a[1])
+        if (d[0] * vec[0] + d[1] * vec[1]) > 1e-4 and abs(d[0] * vec[1] - d[1] * vec[0]) < 1e-4:
+            break
+    else:
+        ed.move_symbol(b.tree, ref, fr.x, fr.y, 0)
+        b.warnings.append(f"{ref}: pins {pin_in} -> {pin_out} cannot lie along the chain")
+    a = b.pin(f"{ref}.{pin_in}")["point"]
+    fr = g.Frame(node)
+    ed.move_symbol(b.tree, ref, round(fr.x + at[0] - a[0], 4), round(fr.y + at[1] - a[1], 4))
+    layout.autoplace_fields(b.tree, node)
+    return b.pin(f"{ref}.{pin_in}")["point"], b.pin(f"{ref}.{pin_out}")["point"]
+
+
+def _op_place_chain(b: _Batch, op: dict) -> dict:
+    """Series parts inline, shunts hung from the nodes, all wired."""
+    parts = op.get("parts") or []
+    if not parts:
+        raise OpError("place_chain needs parts (the series parts, in order)")
+    direction = op.get("direction", "right")
+    if direction not in _DIRS:
+        raise OpError(f"direction must be one of {list(_DIRS)}, got {direction!r}")
+    vec = _DIRS[direction]
+    side = op.get("shunt_side") or ("below" if vec[1] == 0 else "right")
+    perp = {"below": (0, 1), "above": (0, -1), "right": (1, 0), "left": (-1, 0)}.get(side)
+    if perp is None or abs(perp[0] * vec[0] + perp[1] * vec[1]) > 0:
+        raise OpError(f"shunt_side {side!r} is not across a {direction} chain")
+    shunts = {int(k): v for k, v in (op.get("shunts") or {}).items()}
+    names = {int(k): v for k, v in (op.get("nets") or {}).items()}
+    n = len(parts)
+    if any(k < 0 or k > n for k in list(shunts) + list(names)):
+        raise OpError(f"node numbers run 0 (input) .. {n} (output)")
+    gap_mm = float(op.get("gap_mm", 5.08))
+    drop = float(op.get("shunt_offset_mm", 5.08))
+
+    def layout_of(k: int) -> tuple[float, float]:
+        """(wire length, first tap offset) of node k. An end node's free end
+        must carry something, or ERC calls it dangling: its label when the
+        node is named, else its outermost shunt's tap."""
+        m = len(shunts.get(k, []))
+        span = (m - 1) * SHUNT_PITCH_MM if m else 0.0
+        if k in (0, n) and k not in names:
+            if not m:
+                return 0.0, 0.0  # an end with nothing on it: no lead wire
+            return span + 2.54, (0.0 if k == 0 else 2.54)
+        return (max(gap_mm, 2 * 2.54 + span) if m else gap_mm), 2.54
+
+    refs, nodes = [], {}
+    a = b.point(op)
+    for k in range(n + 1):
+        length, first = layout_of(k)
+        end = _step(a, vec, length)
+        if length:
+            ed.add_wire(b.tree, a[0], a[1], end[0], end[1])
+        nodes[k] = (a, end)
+        for j, spec in enumerate(shunts.get(k, [])):
+            tap = _step(a, vec, first + j * SHUNT_PITCH_MM)
+            top, _bottom = _place_along(b, spec, _step(tap, perp, drop), perp)
+            ed.add_wire(b.tree, tap[0], tap[1], top[0], top[1])
+            _junction_if_tee(b.tree, tap)
+            refs.append(spec["ref"])
+            if spec.get("to"):
+                res = _op_connect(b, {"pin": f"{spec['ref']}.{spec.get('out_pin', '2')}",
+                                      "net": spec["to"]})
+                refs += res.get("refs", [])
+        if k < n:
+            _in, a = _place_along(b, parts[k], end, vec)
+            refs.append(parts[k]["ref"])
+    back = (-vec[0], -vec[1])
+    for k, net in sorted(names.items()):
+        if k in (0, n):  # on the lead's free end, facing out of the chain
+            pt, facing = (nodes[0][0], back) if k == 0 else (nodes[n][1], vec)
+            ed.add_label(b.tree, net, pt[0], pt[1], _DIR_TO_ORIENT[facing])
+        elif _place_name(b, nodes[k][0], net, "label", "bidirectional") is None:
+            b.warnings.append(f"place_chain: node {k} has no wire to name {net!r} on")
+    return {"refs": refs, "nodes": {str(k): list(v[0]) for k, v in nodes.items()}}
 
 
 def _op_remove(b: _Batch, op: dict) -> dict:
@@ -507,10 +804,12 @@ def _op_remove(b: _Batch, op: dict) -> dict:
         return {"wires": wires, "removed": len(refs)}
     if op.get("label"):
         pt = b.point(op) if "x_mm" in op else None
-        n = ed.remove_labels(b.tree, op["label"], pt)
-        if not n:
+        points = ed.remove_labels(b.tree, op["label"], pt)
+        if not points:
             raise OpError(f"no label {op['label']!r}" + (f" at {pt}" if pt else ""))
-        return {"removed": n}
+        wires = (ed.remove_stub_chains(b.tree, points, keep_pin_links=False)
+                 if op.get("wires", True) else 0)
+        return {"removed": len(points), "wires": wires}
     uuids = list(op.get("uuids") or ([op["uuid"]] if op.get("uuid") else []))
     if uuids:
         for u in uuids:
@@ -533,10 +832,22 @@ def _op_property(b: _Batch, op: dict) -> dict:
 
 
 def _op_field(b: _Batch, op: dict) -> dict:
-    ed.set_field_placement(b.symbol_node(op["ref"]), op["field"], x_mm=op.get("x_mm"),
+    node = b.symbol_node(op["ref"])
+    ed.set_field_placement(node, op["field"], x_mm=op.get("x_mm"),
                            y_mm=op.get("y_mm"), angle=op.get("angle"),
                            visible=op.get("visible"))
-    return {}
+    prop = ed._find_field(node, op["field"])
+    if op.get("justify"):
+        if op["justify"] not in ("left", "right", "center"):
+            raise OpError(f"justify must be left, right or center, got {op['justify']!r}")
+        # `justify` is how it reads on the sheet; KiCAD flips the stored
+        # one on a rotated / mirrored symbol, so store it pre-flipped.
+        at = find_child(prop, "at")
+        flipped = g.is_text_flipped(g.Frame(node), float(at[3]) if len(at) > 3 else 0.0)[1]
+        layout._set_justify(prop, {"left": "right", "right": "left"}.get(op["justify"])
+                            if flipped and op["justify"] != "center" else op["justify"])
+    box = g.field_box(node, prop)
+    return {"bbox_mm": [round(v, 3) for v in box]} if box else {}
 
 
 def _op_autoplace(b: _Batch, op: dict) -> dict:
@@ -544,7 +855,11 @@ def _op_autoplace(b: _Batch, op: dict) -> dict:
     nodes = (list(ed.iter_instance_symbols(b.tree)) if refs == "all"
              else [b.symbol_node(r) for r in refs])
     done = [layout.autoplace_fields(b.tree, n, force=op.get("force", False)) for n in nodes]
-    return {"placed": sum(1 for d in done if d["placed"])}
+    out = {"placed": sum(1 for d in done if d["placed"])}
+    crowded = {d["reference"]: d["collisions"] for d in done if d.get("collisions")}
+    if crowded:
+        out["collisions"] = crowded  # no clear spot found for these
+    return out
 
 
 _DISPATCH = {name: globals()[f"_op_{name}"] for name in OPS}
@@ -604,8 +919,12 @@ def _driver_reminders(tree: list, ported: set[str]) -> list[str]:
 
 # Result keys the caller cannot know from its own op.
 _NEW_INFO = {"power": ("ref",), "pwr_flag": ("ref",), "connect": ("refs",),
-             "text": ("uuid",), "remove": ("wires",),
-             "move": ("contacts_broken", "nets_merged")}
+             "text": ("uuid",), "remove": ("wires",), "symbol": ("pins",),
+             "field": ("bbox_mm",), "autoplace": ("collisions",),
+             "name_net": ("at", "orientation", "collisions", "stub"),
+             "move": ("contacts_broken", "nets_merged", "pins"),
+             "move_region": ("symbols", "wires_and_items", "contacts_broken", "nets_merged"),
+             "join_power": ("refs", "ports_removed"), "place_chain": ("refs", "nodes")}
 
 
 def _new_info(ops: list[dict], results: list[dict]) -> list[dict]:
@@ -638,7 +957,8 @@ def register(mcp) -> None:
         Ops (keys; coordinates `x_mm`, `y_mm`, snapped to 1.27 mm):
           symbol      lib_id, ref, value, x_mm, y_mm, rotation, mirror (x / y),
                       footprint, fields {name: value}, autoplace (default:
-                      when rotated or mirrored; "force" also for large parts)
+                      when rotated or mirrored; "force" also for large parts);
+                      mirrored: the result lists `pins` {number: [x, y]}
           wire        x1_mm, y1_mm, x2_mm, y2_mm | points [[x, y], ...] |
                       from "REF.PIN", to "REF.PIN" (straight or L route that
                       leaves each pin outward and avoids symbol bodies);
@@ -653,8 +973,17 @@ def register(mcp) -> None:
                       (auto: power port for GND / stock power nets / nets
                       already drawn with ports, else label), stub_mm (2.54;
                       0 = on the pin), flag (one PWR_FLAG for the net),
-                      shape, join (default true: label pins within 15 mm
-                      are wired together under one label)
+                      shape, join (default true: label pins within join_mm,
+                      default 25.4, are wired pin to pin by a clean L route
+                      and each wired group gets one label on its clearest
+                      segment; a lone pin, or a group with no clear spot,
+                      gets a stub and label), name (false: all pins wired
+                      into one group get no label, KiCAD names the net)
+          name_net    net, pin | x_mm, y_mm (a wire end), label_type
+                      local|global, shape: one label on an already-wired
+                      net, on its longest free segment (horizontal first);
+                      a pin on no wire gets a stub and label; no clear spot
+                      places the least-colliding one and warns
           no_connect  pin | pins | x_mm, y_mm
           junction    x_mm, y_mm
           text        text, x_mm, y_mm, size_mm, rotation (multi-line text
@@ -662,14 +991,52 @@ def register(mcp) -> None:
           move        ref | uuid, x_mm, y_mm, rotation, mirror (x / y / ""
                       clears), drag (default true: wires, labels, ports on
                       the pins follow); a move that joins two nets is
-                      refused unless allow_merge: true
+                      refused unless allow_merge: true; with mirror the
+                      result lists `pins` {number: [x, y]}
+          move_region x1_mm, y1_mm, x2_mm, y2_mm (the box), dx_mm, dy_mm
+                      (snapped to 1.27): symbols whose origin is inside,
+                      labels, no-connects, junctions, notes and wire ends
+                      inside move; wires crossing the edge are rubber-banded,
+                      ports on moved pins follow; a shift that merges nets
+                      is refused unless allow_merge: true
+          join_power  pins [...], net, stub_mm (2.54), base_symbol: pins of
+                      one power net drawn with one port: ports of that net
+                      already on them go, each side's pins get stubs to one
+                      spine wire, and each side one port (ground-like nets
+                      at the spine's bottom, others at its top); the fix for
+                      SR-OVERLAP "ports ... are stacked"
+          place_chain x_mm, y_mm (the input end), parts [{lib_id, ref, value,
+                      footprint, fields, in_pin "1", out_pin "2"}] in series,
+                      direction right|left|down|up, shunts {node: [part +
+                      to NET]}, nets {node: NAME}, gap_mm (5.08),
+                      shunt_side, shunt_offset_mm (5.08): parts inline (the
+                      rotation that lays in -> out along the chain), node k
+                      is the wire before part k (0 input, len(parts)
+                      output), shunts hang from taps on it 7.62 apart and
+                      their far pin goes to `to` as `connect` would; each
+                      named node gets one label on its wire
           remove      ref | refs [...] | pattern ("#PWR*", fnmatch on
                       references; wires: remove their pin stubs, default
-                      true) | label NET (+ x_mm, y_mm: only that one) |
+                      true) | label NET (+ x_mm, y_mm: only that one;
+                      wires: also its stub, default true) |
                       uuid | uuids [...]
           property    ref, name, value, create
-          field       ref, field, x_mm, y_mm, angle, visible
-          autoplace   refs [...] | "all", force
+          field       ref, field, x_mm, y_mm, angle, visible, justify
+                      left|right|center (as it reads on the sheet, flip of a
+                      rotated / mirrored symbol handled); returns `bbox_mm`
+                      [x1, y1, x2, y2] of the rendered text (estimate)
+          autoplace   refs [...] | "all", force (KiCAD's side when it is
+                      clear, else the side and grid offset whose texts hit
+                      the fewest other texts, bodies, ports and wires;
+                      `collisions` names parts with no clear spot)
+
+        Mirror, as KiCAD writes `(mirror x|y)`: applied after the rotation,
+        about the sheet axes. `x` flips about the horizontal axis (pins above
+        and below the body swap, left / right stay); `y` flips about the
+        vertical axis (left and right pins swap). So rotation 180 + mirror x
+        equals mirror y, and rotation 180 + mirror y equals mirror x. A
+        symbol whose pins are symmetric about one axis looks unchanged under
+        the matching mirror; read the returned `pins` rather than predict.
 
         Returns `applied` (op count), `by_op` (count per kind), `results`
         only for what the caller did not pass (auto-assigned `#PWR` / `#FLG`

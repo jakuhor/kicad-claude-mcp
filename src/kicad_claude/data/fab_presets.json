@@ -1,0 +1,147 @@
+{
+  "jlcpcb_2l_default": {
+    "description": "JLCPCB 2-layer cheap default (≥0.127 mm, 6/6 mil)",
+    "rules": {
+      "min_clearance": 0.127,
+      "min_track_width": 0.127,
+      "min_via_diameter": 0.45,
+      "min_via_drill": 0.2,
+      "min_through_hole_diameter": 0.3,
+      "min_hole_clearance": 0.254,
+      "min_hole_to_hole": 0.5,
+      "min_silk_clearance": 0.1,
+      "min_text_height": 1.0,
+      "min_text_thickness": 0.15,
+      "min_copper_edge_clearance": 0.3,
+      "allow_blind_buried_vias": false,
+      "allow_microvias": false
+    },
+    "source": "https://jlcpcb.com/capabilities/pcb-capabilities"
+  },
+  "jlcpcb_2l_advanced": {
+    "description": "JLCPCB 2-layer fine (≥0.0762 mm / 3 mil) — costlier",
+    "rules": {
+      "min_clearance": 0.0762,
+      "min_track_width": 0.0762,
+      "min_via_diameter": 0.3,
+      "min_via_drill": 0.15,
+      "min_through_hole_diameter": 0.2,
+      "min_hole_clearance": 0.2,
+      "min_hole_to_hole": 0.3,
+      "min_silk_clearance": 0.1,
+      "min_text_height": 0.8,
+      "min_text_thickness": 0.13,
+      "min_copper_edge_clearance": 0.25
+    },
+    "source": "https://jlcpcb.com/capabilities/pcb-capabilities"
+  },
+  "jlcpcb_4l": {
+    "description": "JLCPCB 4-layer standard (≥0.127 mm, 0.2 mm via drill)",
+    "rules": {
+      "min_clearance": 0.127,
+      "min_track_width": 0.127,
+      "min_via_diameter": 0.4,
+      "min_via_drill": 0.2,
+      "min_through_hole_diameter": 0.2,
+      "min_hole_clearance": 0.2,
+      "min_hole_to_hole": 0.5,
+      "min_silk_clearance": 0.1,
+      "min_text_height": 1.0,
+      "min_text_thickness": 0.15,
+      "min_copper_edge_clearance": 0.3,
+      "allow_blind_buried_vias": false,
+      "allow_microvias": false
+    },
+    "source": "https://jlcpcb.com/capabilities/pcb-capabilities"
+  },
+  "aisler_2l": {
+    "description": "AISLER 2-layer (≥0.2 mm track, 0.15 mm clearance, 0.3 mm drill)",
+    "rules": {
+      "min_clearance": 0.15,
+      "min_track_width": 0.2,
+      "min_via_diameter": 0.7,
+      "min_via_drill": 0.3,
+      "min_through_hole_diameter": 0.5,
+      "min_hole_clearance": 0.25,
+      "min_hole_to_hole": 0.3,
+      "min_silk_clearance": 0.125,
+      "min_text_height": 0.8,
+      "min_text_thickness": 0.15,
+      "min_copper_edge_clearance": 0.3,
+      "allow_blind_buried_vias": false,
+      "allow_microvias": false
+    }
+  },
+  "aisler_4l": {
+    "description": "AISLER 4-layer Precision (≥0.125 mm, 0.25 mm drill)",
+    "rules": {
+      "min_clearance": 0.125,
+      "min_track_width": 0.125,
+      "min_via_diameter": 0.45,
+      "min_via_drill": 0.25,
+      "min_through_hole_diameter": 0.5,
+      "min_hole_clearance": 0.25,
+      "min_hole_to_hole": 0.5,
+      "min_silk_clearance": 0.125,
+      "min_text_height": 0.8,
+      "min_text_thickness": 0.15,
+      "min_copper_edge_clearance": 0.3,
+      "allow_blind_buried_vias": false,
+      "allow_microvias": false
+    }
+  },
+  "pcbway_default": {
+    "description": "PCBWay default capabilities (similar to JLCPCB default)",
+    "rules": {
+      "min_clearance": 0.127,
+      "min_track_width": 0.127,
+      "min_via_diameter": 0.45,
+      "min_via_drill": 0.2,
+      "min_through_hole_diameter": 0.3,
+      "min_hole_clearance": 0.254,
+      "min_silk_clearance": 0.15
+    }
+  },
+  "circuitninja_2l": {
+    "description": "CircuitNinja 2-layer (>=0.2 mm track/space, 0.3 mm drill, 0.12 mm ring)",
+    "source": "https://circuitninja.com/developers/guides/kicad-pcb-design-rules",
+    "rules": {
+      "min_clearance": 0.2,
+      "min_track_width": 0.2,
+      "min_connection": 0.2,
+      "min_via_annular_width": 0.12,
+      "min_via_diameter": 0.54,
+      "min_via_drill": 0.3,
+      "min_through_hole_diameter": 0.3,
+      "min_hole_to_hole": 0.2,
+      "min_text_height": 1.0,
+      "min_text_thickness": 0.15,
+      "min_copper_edge_clearance": 0.01,
+      "allow_blind_buried_vias": false,
+      "allow_microvias": false
+    }
+  },
+  "oshpark_4l": {
+    "description": "OSH Park 4-layer process (≥0.127 mm trace, ≥0.2 mm drill)",
+    "rules": {
+      "min_clearance": 0.127,
+      "min_track_width": 0.127,
+      "min_via_diameter": 0.508,
+      "min_via_drill": 0.254,
+      "min_through_hole_diameter": 0.33,
+      "min_hole_clearance": 0.3,
+      "min_silk_clearance": 0.15
+    }
+  },
+  "permissive_prototype": {
+    "description": "Permissive defaults for hand-soldered prototypes",
+    "rules": {
+      "min_clearance": 0.2,
+      "min_track_width": 0.25,
+      "min_via_diameter": 0.6,
+      "min_via_drill": 0.3,
+      "min_through_hole_diameter": 0.4,
+      "min_hole_clearance": 0.4
+    }
+  }
+}

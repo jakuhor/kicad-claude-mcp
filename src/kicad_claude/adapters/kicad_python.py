@@ -214,6 +214,40 @@ for net_name in sorted(all_nets):
         added_nets += 1
 
 fps = list(board.GetFootprints())
+
+# Net renames. A board net that the schematic no longer has, whose pads all
+# move to one new net that takes pads from no other net, was renamed: its
+# tracks, vias and zones follow. Splits and merges are reported, not guessed.
+old_pads = {}   # old net -> {(ref, pad)}
+new_from = {}   # new net -> {old nets its pads come from}
+for fp in fps:
+    ref = fp.GetReference()
+    for pad in fp.Pads():
+        old, num = pad.GetNetname(), pad.GetNumber()
+        new = ref_to_pad_nets.get(ref, {}).get(num)
+        if not old or new is None:
+            continue
+        old_pads.setdefault(old, set()).add((ref, num))
+        new_from.setdefault(new, set()).add(old)
+renames, rename_skipped = {}, []
+for old, pads in sorted(old_pads.items()):
+    if old in all_nets:
+        continue
+    targets = sorted({ref_to_pad_nets[r][n] for r, n in pads})
+    if len(targets) != 1:
+        rename_skipped.append({"net": old, "reason": "split", "into": targets})
+    elif new_from[targets[0]] != {old}:
+        rename_skipped.append({"net": old, "reason": "merge", "into": targets[0],
+                               "with": sorted(new_from[targets[0]] - {old})})
+    else:
+        renames[old] = targets[0]
+copper_renamed = 0
+for item in list(board.GetTracks()) + list(board.Zones()):
+    target = renames.get(item.GetNetname())
+    if target is not None:
+        item.SetNet(board.FindNet(target))
+        copper_renamed += 1
+
 schematic_refs = set(ref_to_pad_nets.keys())
 pcb_refs = {fp.GetReference() for fp in fps}
 missing_in_pcb = sorted(schematic_refs - pcb_refs)
@@ -237,7 +271,7 @@ for fp in fps:
                     pad.SetNet(net_obj)
                     pad_changes += 1
 
-if added_nets or pad_changes:
+if added_nets or pad_changes or copper_renamed:
     pcbnew.SaveBoard(pcb_path, board)
 
 result = {
@@ -246,7 +280,10 @@ result = {
     "missing_in_pcb": missing_in_pcb,
     "pad_assignments_made": pad_assignments,
     "pad_nets_changed": pad_changes,
-    "board_saved": bool(added_nets or pad_changes),
+    "board_saved": bool(added_nets or pad_changes or copper_renamed),
+    "nets_renamed": renames,
+    "copper_items_renamed": copper_renamed,
+    "renames_skipped": rename_skipped,
     "schematic_references": len(schematic_refs),
     "pcb_references": len(pcb_refs),
     "schematic_nets": len(all_nets),
@@ -310,8 +347,12 @@ def apply_netlist(pcb_path: Path, netlist_path: Path, timeout: float = 90.0) -> 
     `netlist_path` is a `kicadsexpr` netlist (preferred: it keeps escaped net
     names exactly as the board stores them) or a `kicadxml` one. Footprints in
     the schematic that aren't on the PCB are listed as `missing_in_pcb` — call
-    `add_footprint` for each, then re-run. The board is only saved when a net
-    was added or a pad changed net.
+    `add_footprint` for each, then re-run. A board net the schematic dropped
+    whose pads all moved to one new net (and that net took no other pads) is
+    a rename: its tracks, arcs, vias and zones move too (`nets_renamed`,
+    `copper_items_renamed`); splits and merges are listed in
+    `renames_skipped` and their copper is left alone. The board is only
+    saved when something changed.
     """
     import json
     import tempfile

@@ -386,6 +386,61 @@ def test_acceptance_full_flow_routes_real_track(tmp_path: Path):
     state.clear_active()
 
 
+@pytest.mark.slow
+def test_net_rename_carries_routed_copper(tmp_path: Path):
+    """OP-49: naming a wired net in the schematic renames its tracks too."""
+    from kicad_claude.utils.kicad_paths import find_kicad_cli
+    if find_kicad_cli() is None:
+        pytest.skip("kicad-cli not available")
+    cached = kicad_libs.load_cache()
+    if cached is None:
+        pytest.skip("library index not built")
+    state.clear_active()
+    lib_tools._index = cached
+    files = write_blank_project(tmp_path / "div", "div")
+    state.set_active(tmp_path / "div", "div")
+
+    from mcp.server.fastmcp import FastMCP
+    from kicad_claude.adapters import kicad_python
+    from kicad_claude.tools.pcb import layout as pcb
+    from kicad_claude.tools.sch import schematic as schematic
+    from kicad_claude.tools.sch import sync as sync
+    mcp = FastMCP("t")
+    for mod in (pcb, schematic, sync):
+        mod.register(mcp)
+
+    def call(name, **kw):
+        return mcp._tool_manager.get_tool(name).fn(**kw)
+
+    call("add_symbol", lib_id="Device:R", reference="R1", value="10k", x_mm=100, y_mm=130)
+    call("add_symbol", lib_id="Device:R", reference="R2", value="1k", x_mm=100, y_mm=80)
+    a = call("get_pin_position", reference="R1", pin="2")["position_mm"]
+    b = call("get_pin_position", reference="R2", pin="1")["position_mm"]
+    call("add_wire", x1_mm=a[0], y1_mm=a[1], x2_mm=b[0], y2_mm=b[1])
+    call("set_board_outline", width_mm=50, height_mm=30)
+    call("add_footprint", lib_id="Resistor_SMD:R_0603_1608Metric",
+         reference="R1", value="10k", x_mm=20, y_mm=15)
+    call("add_footprint", lib_id="Resistor_SMD:R_0603_1608Metric",
+         reference="R2", value="1k", x_mm=35, y_mm=15)
+    upd = call("update_pcb_from_schematic")
+
+    def net_of(ref, pin):
+        nets = kicad_python.netlist_pad_map(Path(upd["netlist_path"]))["nets"]
+        return next(n["name"] for n in nets if [ref, pin] in n["nodes"])
+
+    old = net_of("R1", "2")
+    call("add_track", x1_mm=21, y1_mm=15, x2_mm=34, y2_mm=15, net=old)
+    call("add_label", net="MID", x_mm=a[0], y_mm=(a[1] + b[1]) / 2)
+    upd = call("update_pcb_from_schematic")
+    assert net_of("R1", "2") == "/MID"  # a local label: sheet path prefix
+    assert upd["nets_renamed"] == {old: "/MID"}
+    assert upd["copper_items_renamed"] == 1
+    text = files["pcb"].read_text(encoding="utf-8")
+    seg = text[text.index("(segment"):]
+    assert '(net "/MID")' in seg[:seg.index("(uuid")]
+    state.clear_active()
+
+
 # ===== Component sync: place, copy fields, delete ========================= #
 
 
@@ -610,6 +665,25 @@ def test_aisler_presets_match_the_published_process():
 
     for name in ("aisler_2l", "aisler_4l"):
         assert ps.FAB_PRESETS[name]["rules"]["allow_microvias"] is False
+
+
+def test_circuitninja_preset_matches_the_published_process():
+    """CircuitNinja KiCad guide: 0.2/0.2 mm, 0.3 mm drill, 0.12 mm ring, flush copper."""
+    r = ps.FAB_PRESETS["circuitninja_2l"]["rules"]
+    assert (r["min_track_width"], r["min_clearance"]) == (0.2, 0.2)
+    assert (r["min_via_drill"], r["min_through_hole_diameter"]) == (0.3, 0.3)
+    assert r["min_connection"] == 0.2 and r["min_via_annular_width"] == 0.12
+    assert round((r["min_via_diameter"] - r["min_via_drill"]) / 2, 3) == 0.12
+    assert r["min_hole_to_hole"] == 0.2
+    assert r["min_copper_edge_clearance"] == 0.01
+
+
+def test_fab_presets_load_from_the_data_file():
+    """Presets live in data/fab_presets.json so a fab is added without code."""
+    import json
+    assert ps.FAB_PRESETS == json.loads(ps.FAB_PRESETS_PATH.read_text(encoding="utf-8"))
+    for preset in ps.FAB_PRESETS.values():
+        assert set(preset) <= {"description", "source", "rules"}
 
 
 # ----- apply_fab_preset: preset vs existing project rules ------------------ #

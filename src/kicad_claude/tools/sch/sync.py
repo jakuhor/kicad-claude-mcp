@@ -136,7 +136,11 @@ def register(mcp) -> None:
         4. Export the schematic netlist (kicadsexpr, which keeps net names in
            KiCAD's escaped form such as `Net-(U5-NR{slash}SS)`) and use KiCAD's
            Python (`pcbnew`) to add the missing nets and assign every pad's
-           net. The board is re-saved only if a net was added or a pad changed.
+           net. A board net the schematic renamed (all its pads now on one new
+           net that took no other pads) keeps its copper: tracks, vias and
+           zones move to the new name (`nets_renamed`). Splits and merges are
+           listed in `renames_skipped`, their copper untouched. The board is
+           re-saved only if something changed.
            The netlist stays at `fab/<project>-netlist.net`, where the review
            tools read it.
 
