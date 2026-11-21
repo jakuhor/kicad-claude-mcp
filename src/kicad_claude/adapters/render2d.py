@@ -106,18 +106,56 @@ def render_board(pcb: Path, out_png: Path, *, layers: list[str] | None = None,
     return result
 
 
-def render_sheet(sch: Path, out_png: Path, *, page: int = 1,
+def _pdf_pages(pdf_doc, sch: Path) -> list[dict]:
+    """Page -> sheet, from the outline KiCAD writes into its schematic PDF
+    (`<sheet name> (Page N)` per page) and the sheet files of the hierarchy."""
+    import re
+
+    from kicad_claude.adapters import sch_editor as ed
+    from kicad_claude.adapters import sch_io
+
+    files = {}
+    for path in ed.hierarchy_sch_paths(sch):
+        for entry in ed.list_sheets(sch_io.parse_file(path)):
+            files.setdefault(entry["name"], entry["filename"])
+    pages = []
+    for item in pdf_doc.get_toc(max_depth=16):
+        m = re.fullmatch(r"(.*) \(Page [^()]*\)", item.get_title())
+        dest = item.get_dest()
+        if not m or dest is None:
+            continue
+        name = m.group(1)
+        pages.append({"page": dest.get_index() + 1, "name": name,
+                      "file": Path(sch).name if item.level == 0 else files.get(name, "")})
+    return sorted(pages, key=lambda e: e["page"])
+
+
+def render_sheet(sch: Path, out_png: Path, *, page: int = 1, sheet: str = "",
                  region_mm: tuple[float, float, float, float] | None = None,
                  dpi: float = 150) -> dict:
-    """Schematic page `page` (1-based, the PDF's page order) to PNG."""
+    """Schematic page `page` (1-based, the PDF's page order), or the page of
+    `sheet` (its name or file), to PNG; the result names the sheet."""
     with tempfile.TemporaryDirectory(prefix="kc-render-") as tmp:
         pdf = Path(tmp) / "sheet.pdf"
         kicad_cli._run(["sch", "export", "pdf", "--exclude-pdf-property-popups",
                         "-o", str(pdf), str(sch)], timeout=120)
         import pypdfium2 as pdfium
-        n = len(pdfium.PdfDocument(str(pdf)))
+        doc = pdfium.PdfDocument(str(pdf))
+        n = len(doc)
+        pages = _pdf_pages(doc, sch)
+        doc.close()
+        if sheet:
+            hits = [e for e in pages if sheet in (e["name"], e["file"])
+                    or (sheet.lower() == "root" and e["page"] == 1)]
+            if not hits:
+                raise ValueError(f"no page for sheet {sheet!r}; pages: "
+                                 f"{[(e['page'], e['name']) for e in pages]}")
+            page = hits[0]["page"]
         if not 1 <= page <= n:
             raise ValueError(f"page {page} out of range: the schematic has {n} page(s)")
         result = rasterize(pdf, out_png, page=page - 1, dpi=dpi, region_mm=region_mm)
-    result.update(page=page, region_mm=list(region_mm) if region_mm else None)
+    this = next((e for e in pages if e["page"] == page), {})
+    result.update(page=page, pages=n, sheet_name=this.get("name", ""),
+                  sheet_file=this.get("file", ""),
+                  region_mm=list(region_mm) if region_mm else None)
     return result

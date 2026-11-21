@@ -564,6 +564,60 @@ class TestComponentSync:
         # Idempotent: a second pass has nothing left to write.
         assert sc.sync_footprint_fields(tree, components) == []
 
+    def test_footprints_are_linked_to_their_symbol_by_reference(self, project):
+        """OP-48: the footprint gets the symbol's `path` / `sheetname` /
+        `sheetfile`, so a part moved to another sheet (remove + re-add, new
+        UUID) is re-linked by reference on the next update."""
+        from kicad_claude.adapters import pcb_editor as ped
+        from kicad_claude.adapters import sch_editor as sed
+        from kicad_claude.tools.pcb import layout as pcb_tools
+        from kicad_claude.adapters import sch_sync as sc
+
+        mcp = self._mcp()
+        self._build_schematic(mcp)
+
+        def call(_tool, **kw):
+            return mcp._tool_manager.get_tool(_tool).fn(**kw)
+
+        def link(fp, key):
+            n = sch_io.find_child(fp, key)
+            return str(n[1]) if n else None
+
+        tree = sch_io.parse_file(project / "s.kicad_pcb")
+        paths = lambda: sed.hierarchy_sch_paths(project / "s.kicad_sch")  # noqa: E731
+        components = sc.collect_schematic_components(paths())
+        sc.place_missing_footprints(tree, components, pcb_tools._resolve_footprint)
+        changed = sc.sync_footprint_fields(tree, components)
+        r1 = ped.find_footprint_by_reference(tree, "R1")
+        r1_uuid = sch_io.find_child(sed.find_symbol_by_reference(
+            sch_io.parse_file(project / "s.kicad_sch"), "R1"), "uuid")[1]
+        assert link(r1, "path") == f"/{r1_uuid}"
+        assert link(r1, "sheetname") == "/"
+        assert link(r1, "sheetfile") == "s.kicad_sch"
+        assert any("link" in c["fields"] for c in changed)
+        # After the properties, in KiCAD's order.
+        heads = [sch_io.head_of(c) for c in r1]
+        assert heads.index("path") > max(i for i, h in enumerate(heads) if h == "property")
+        assert heads.index("path") < heads.index("sheetname") < heads.index("sheetfile")
+        assert sc.sync_footprint_fields(tree, components) == []
+
+        # Move R1 into a child sheet: remove + re-add, new UUID and path.
+        call("add_sheet", sheet_name="Child", x_mm=150, y_mm=50)
+        call("remove_symbol", reference="R1")
+        call("set_active_sheet", sheet="Child")
+        call("add_symbol", lib_id="Device:R", reference="R1", value="10k",
+             x_mm=100, y_mm=100)
+        call("set_active_sheet", sheet="root")
+        child = sch_io.parse_file(project / "child.kicad_sch")
+        new_uuid = sch_io.find_child(sed.find_symbol_by_reference(child, "R1"), "uuid")[1]
+        sheet_uuid = sed.get_sheet_uuid(sed.find_sheet_by_name(
+            sch_io.parse_file(project / "s.kicad_sch"), "Child"))
+        components = sc.collect_schematic_components(paths())
+        sc.sync_footprint_fields(tree, components)
+        assert link(r1, "path") == f"/{sheet_uuid}/{new_uuid}"
+        assert link(r1, "sheetname") == "/Child/"
+        assert link(r1, "sheetfile") == "child.kicad_sch"
+
     def test_bom_dnp_and_board_flags_follow_the_symbol(self, project):
         """OP-21: KiCAD's update copies in_bom / dnp / exclude_from_sim onto the
         footprint `attr` (DRC parity compares them) and skips on_board=no."""

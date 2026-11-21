@@ -128,7 +128,11 @@ def register(mcp) -> None:
         2. Copy `Value` and the symbol's other fields (`MPN`, `Manufacturer`,
            …) onto the matching footprint (`sync_fields`). This is what
            `run_drc(schematic_parity=True)` compares, and what an assembly BOM
-           taken from the board needs.
+           taken from the board needs. Footprints match symbols by
+           reference, and each gets its symbol's `path` / `sheetname` /
+           `sheetfile` (`link` in `fields_synced`), so a part re-added on
+           another sheet (new UUID) is re-linked, as KiCAD's "Re-associate
+           footprints by reference".
         3. Delete footprints whose symbol is gone (`remove_extra`, off by
            default). A board also carries footprints no symbol knows about —
            mounting holes, fiducials, logos — and they would go too, so they

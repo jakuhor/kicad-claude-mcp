@@ -343,7 +343,10 @@ def register(mcp) -> None:
             commercial 50 / 80 / 80 / 50 %, industrial 50 / 75 / 70 / 50,
             automotive 50 / 70 / 60 / 50, military 40 / 60 / 50 / 40 - policy
             values, `adapters/derating.py`), CR-CAP-FIELD when the field
-            disagrees with the datasheet.
+            disagrees with the datasheet;
+          - `part_fields`: CR-MPN-STALE when a part's Value names a specific
+            part and neither it nor the footprint shares a token with the
+            MPN (an MPN / Manufacturer left over from a part swap).
 
         The pin -> rail map is returned so it can be checked against each
         datasheet; whether a rail is the *right* one is not judged here.

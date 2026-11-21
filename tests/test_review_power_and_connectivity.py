@@ -331,3 +331,30 @@ def test_unsourced_rail_names_a_mistyped_output(tmp_path):
     assert [f["ref"] for f in un] == ["U15", "U16"]
     assert all("U16.MLDO_OUT looks like the source" in f["message"] for f in un)
     assert "MLDO_OUT, VDD_IO on +1.8V" in un[1]["message"]
+
+
+def test_mpn_left_over_from_a_part_swap(tmp_path):
+    """OP-57: J4 became an etherCON (Value, footprint) but kept the RJ45's
+    MPN; generic values and matching MPNs pass."""
+    from kicad_claude.adapters import connectivity_review as crv
+
+    nl = pr.Netlist()
+
+    def part(ref, value, fp, mpn, lib="Connector:RJ45_Shielded"):
+        nl.components[ref] = {"ref": ref, "value": value, "footprint": fp, "lib_id": lib,
+                              "fields": {"MPN": mpn, "Manufacturer": "Amphenol"}}
+
+    part("J4", "NE8FBH", "Connector_Neutrik:Neutrik_NE8FBH", "RJHSE-5380")
+    part("J5", "NE8FBH", "Connector_Neutrik:Neutrik_NE8FBH", "NE8FBH")
+    part("J6", "RJ45_Shielded", "Connector_RJ:RJ45_Amphenol_RJHSE538X", "RJHSE-5380")
+    part("J7", "Conn_01x04", "Connector_JST:JST_XH_B4B-XH-A", "1935161",
+         lib="Connector_Generic:Conn_01x04")
+    part("U1", "TLV76133", "Package_TO_SOT_SMD:SOT-223-3_TabPin2", "TLV76133DCYR",
+         lib="Regulator_Linear:TLV76133")
+    part("R1", "10k", "Resistor_SMD:R_0603_1608Metric", "RC0603FR-0710KL", lib="Device:R")
+    findings: list = []
+    out = crv.check_part_fields(nl, findings)
+    assert [f["ref"] for f in findings] == ["J4"]
+    assert findings[0]["rule"] == "CR-MPN-STALE" and "Amphenol" in findings[0]["message"]
+    assert out == {"checked": 2, "stale": ["J4"]}  # U1: Value is its symbol name
+    assert "part_fields" in crv.CHECKS

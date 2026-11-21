@@ -44,6 +44,7 @@ def collect_schematic_components(sch_paths: list[Path]) -> dict[str, dict]:
     marked `(on_board no)`.
     """
     out: dict[str, dict] = {}
+    sheets = _sheet_instances(sch_paths[0]) if sch_paths else {}
     for path in sch_paths:
         tree = sch_io.parse_file(path)
         for symbol in sed.iter_instance_symbols(tree):
@@ -68,8 +69,61 @@ def collect_schematic_components(sch_paths: list[Path]) -> dict[str, dict]:
                 "properties": props,
                 "attrs": _symbol_attrs(symbol),
                 "sheet": path.name,
+                "link": _footprint_link(symbol, ref, sheets),
             }
     return out
+
+
+def _sheet_instances(root: Path) -> dict[str, tuple[str, str]]:
+    """Every sheet instance of the hierarchy: its instance path as a symbol's
+    `(instances (path ...))` spells it (`/<root uuid>/<sheet uuid>...`) ->
+    (KiCAD's human sheet path `/A/B/`, sheet file name)."""
+    root = Path(root)
+    tree = sch_io.parse_file(root)
+    u = sch_io.find_child(tree, "uuid")
+    if not u or len(u) < 2:
+        return {}
+    out: dict[str, tuple[str, str]] = {}
+    stack = [(root, tree, f"/{u[1]}", "/")]
+    while stack:
+        path, node, inst, human = stack.pop()
+        if inst in out:
+            continue
+        out[inst] = (human, path.name)
+        for sheet in sch_io.find_children(node, "sheet"):
+            fname = sed.get_sheet_filename(sheet) or ""
+            child = path.parent / fname
+            if not fname or not child.is_file():
+                continue
+            try:
+                stack.append((child, sch_io.parse_file(child),
+                              f"{inst}/{sed.get_sheet_uuid(sheet)}",
+                              f"{human}{sed.get_property(sheet, 'Sheetname') or ''}/"))
+            except Exception:  # noqa: BLE001 — an unreadable sheet links nothing
+                continue
+    return out
+
+
+def _footprint_link(symbol: list, ref: str, sheets: dict) -> dict | None:
+    """The footprint's `path` / `sheetname` / `sheetfile` that tie it to this
+    symbol, as KiCAD's own update writes them. The footprint path drops the
+    root uuid: `/<sheet uuids...>/<symbol uuid>`. A reused sheet has one
+    instance per use; the one carrying `ref` wins."""
+    u = sch_io.find_child(symbol, "uuid")
+    if not u or len(u) < 2:
+        return None
+    found = []
+    for project in sch_io.find_children(sch_io.find_child(symbol, "instances") or [], "project"):
+        for p in sch_io.find_children(project, "path"):
+            r = sch_io.find_child(p, "reference")
+            found.append((str(p[1]), str(r[1]) if r and len(r) > 1 else ""))
+    match = next((p for p, r in found if r == ref), None)
+    if match is None or match not in sheets:
+        return None
+    human, sheetfile = sheets[match]
+    sheet_part = match.split("/", 2)[2] if match.count("/") > 1 else ""
+    return {"path": f"/{sheet_part}/{u[1]}" if sheet_part else f"/{u[1]}",
+            "sheetname": human, "sheetfile": sheetfile}
 
 
 def _flag(symbol: list, name: str, default: bool) -> bool:
@@ -184,6 +238,8 @@ def sync_footprint_fields(tree: list, components: dict[str, dict]) -> list[dict]
                 fields.append(name)
         if comp.get("attrs"):
             fields += [f"attr:{a}" for a in ped.set_footprint_attr_flags(fp, comp["attrs"])]
+        if comp.get("link") and ped.set_footprint_link(fp, comp["link"]):
+            fields.append("link")
         if fields:
             changed.append({"reference": ref, "fields": fields})
     return changed

@@ -434,6 +434,54 @@ def test_sheet_argument_edits_that_sheet_and_keeps_the_active_one(blank_project)
     assert state.get_active_sheet_filename() is None
 
 
+def test_sheet_edits_name_their_sheet_and_warn_on_an_implicit_child(blank_project):
+    """OP-49: every sheet-level result names the sheet it acted on; with no
+    `sheet` while a child is active, it warns."""
+    mcp, call = _sch_pcb_mcp()
+    call("add_sheet", sheet_name="Power", sheet_filename="power.kicad_sch")
+    out = call("add_label", net="A", x_mm=50.8, y_mm=50.8)
+    assert out["sheet"] == "root" and "warnings" not in out
+    call("set_active_sheet", sheet="Power")
+    out = call("add_label", net="B", x_mm=63.5, y_mm=50.8)
+    assert out["sheet"] == "power.kicad_sch"
+    assert any("active sheet power.kicad_sch" in w for w in out["warnings"])
+    out = call("add_label", net="C", x_mm=76.2, y_mm=50.8, sheet="root")
+    assert out["sheet"] == "root" and "warnings" not in out
+    call("set_active_sheet", sheet="")
+
+
+def test_hier_labels_and_sheet_pins_as_batch_ops(blank_project):
+    """OP-54: `hier_label` / `sheet_pin` ops in edit_schematic; a pin off
+    the block edge or a hier label on the root is refused."""
+    from kicad_claude.tools.sch import batch
+
+    mcp, call = _sch_pcb_mcp()
+    batch.register(mcp)
+    call("add_sheet", sheet_name="Power", sheet_filename="power.kicad_sch",
+         x_mm=50.8, y_mm=50.8, width_mm=25.4, height_mm=20.32)
+    call("edit_schematic", sheet="Power", ops=[
+        {"op": "hier_label", "net": "VIN", "x_mm": 25.4, "y_mm": 25.4, "shape": "input"},
+        {"op": "hier_label", "net": "VOUT", "x_mm": 76.2, "y_mm": 25.4,
+         "shape": "output", "orientation": "left"}])
+    child = sch_io.parse_file(blank_project["sch"].parent / "power.kicad_sch")
+    assert sorted(n[1] for n in sch_io.find_children(child, "hierarchical_label")) == [
+        "VIN", "VOUT"]
+    call("edit_schematic", sheet="root", ops=[
+        {"op": "sheet_pin", "sheet": "Power", "name": "VIN", "x_mm": 50.8, "y_mm": 55.88},
+        {"op": "sheet_pin", "sheet": "Power", "name": "VOUT", "shape": "output",
+         "x_mm": 76.2, "y_mm": 55.88}])
+    root = sch_io.parse_file(blank_project["sch"])
+    pins = {p[1]: sch_io.find_child(p, "at")[3]
+            for p in sch_io.find_children(root[[i for i, n in enumerate(root)
+                                                if sch_io.head_of(n) == "sheet"][0]], "pin")}
+    assert pins == {"VIN": 180, "VOUT": 0}
+    with pytest.raises(ValueError, match="not on the edge"):
+        call("edit_schematic", ops=[
+            {"op": "sheet_pin", "sheet": "Power", "name": "X", "x_mm": 60.96, "y_mm": 60.96}])
+    with pytest.raises(ValueError, match="child sheet"):
+        call("edit_schematic", ops=[{"op": "hier_label", "net": "X", "x_mm": 0, "y_mm": 0}])
+
+
 def test_board_argument_edits_that_board(blank_project):
     mcp, call = _sch_pcb_mcp()
     call("add_board", name="breakout")

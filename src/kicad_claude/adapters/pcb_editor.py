@@ -532,6 +532,34 @@ _AFTER_ATTR = ("fp_line", "fp_rect", "fp_circle", "fp_arc", "fp_poly", "fp_curve
                "embedded_fonts", "model")
 
 
+_LINK_KEYS = ("path", "sheetname", "sheetfile")
+
+
+def set_footprint_link(fp: list, link: dict[str, str]) -> bool:
+    """Tie a footprint to its schematic symbol: `(path ...)`, `(sheetname ...)`,
+    `(sheetfile ...)` where KiCAD writes them (after the properties). Returns
+    True when the file changed. Without them KiCAD's own Update PCB (matching
+    by UUID) and cross-probing do not know which symbol the footprint is."""
+    changed = False
+    after = max((i for i, c in enumerate(fp)
+                 if head_of(c) in ("property", "component_classes")), default=len(fp) - 1)
+    for key in _LINK_KEYS:
+        value = link.get(key)
+        if not value:
+            continue
+        node = find_child(fp, key)
+        if node is not None:
+            if str(node[1]) != value:
+                node[1] = value
+                changed = True
+            after = fp.index(node)
+            continue
+        after += 1
+        fp.insert(after, [sym(key), value])
+        changed = True
+    return changed
+
+
 def set_footprint_attr_flags(fp: list, flags: dict[str, bool]) -> list[str]:
     """Set or clear footprint attribute flags (`exclude_from_bom`, `dnp`, …).
 

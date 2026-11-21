@@ -138,9 +138,55 @@ def run_erc(
         )
 
     data = json.loads(output_json.read_text(encoding="utf-8"))
+    _reattribute_erc_sheets(data, sch_path)
     out = _shape_erc(data, output_json)
     out["cli_path"] = str(cli)
     return out
+
+
+def _reattribute_erc_sheets(data: dict, root_sch: Path) -> int:
+    """Move each violation to the sheet that holds its items.
+
+    kicad-cli 10.0.8 files some child-sheet violations (wire_dangling,
+    unconnected_wire_endpoint) under the root `/`, with child-sheet
+    coordinates. The item UUIDs say which file they are in; a violation
+    moves to the one report sheet showing that file (a sheet file used
+    twice is ambiguous and stays). Returns the count moved."""
+    import re
+
+    from kicad_claude.adapters.sch_sync import _sheet_instances
+
+    sheets = data.get("sheets")
+    if not isinstance(sheets, list) or len(sheets) < 2:
+        return 0
+    file_of_inst = {inst: f for inst, (_h, f) in _sheet_instances(root_sch).items()}
+    entry_of_file: dict[str, list[dict]] = {}
+    for sheet in sheets:
+        f = file_of_inst.get(sheet.get("uuid_path", ""))
+        if f:
+            entry_of_file.setdefault(f, []).append(sheet)
+    file_of_uuid: dict[str, str] = {}
+    for f in entry_of_file:
+        try:
+            text = (Path(root_sch).parent / f).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for u in re.findall(r'\(uuid "([0-9a-fA-F-]{36})"\)', text):
+            file_of_uuid.setdefault(u, f)
+    moved = 0
+    for sheet in sheets:
+        here = file_of_inst.get(sheet.get("uuid_path", ""))
+        keep = []
+        for v in sheet.get("violations") or []:
+            files = {file_of_uuid.get(i.get("uuid", "")) for i in v.get("items") or []} - {None}
+            target = entry_of_file.get(next(iter(files))) if len(files) == 1 else None
+            if here and files and here not in files and target and len(target) == 1:
+                target[0].setdefault("violations", []).append(v)
+                moved += 1
+            else:
+                keep.append(v)
+        sheet["violations"] = keep
+    return moved
 
 
 def _erc_violations(data: dict) -> tuple[list[dict], list[dict]]:

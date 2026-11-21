@@ -89,3 +89,24 @@ def test_render_sheet_and_page_range(project, tmp_path):
     assert info["page"] == 1 and info["width_px"] > info["height_px"]   # A4 landscape
     with pytest.raises(ValueError, match="out of range"):
         fn(page=2)
+
+
+@pytest.mark.slow
+def test_render_sheet_names_the_sheet_of_each_page(project, tmp_path):
+    """OP-56: the result names the sheet; `sheet=` picks its page."""
+    from kicad_claude.tools.sch import schematic as sch_tools
+
+    mcp = _mcp()
+    sch_tools.register(mcp)
+    mcp._tool_manager.get_tool("add_sheet").fn(sheet_name="Power",
+                                               sheet_filename="power.kicad_sch")
+    fn = mcp._tool_manager.get_tool("render_sheet").fn
+    _img, info = fn(out_path=str(tmp_path / "a.png"), dpi=30)
+    assert (info["page"], info["pages"], info["sheet_file"]) == (1, 2, "rd.kicad_sch")
+    _img, info = fn(sheet="Power", out_path=str(tmp_path / "b.png"), dpi=30)
+    assert (info["page"], info["sheet_name"], info["sheet_file"]) == (
+        2, "Power", "power.kicad_sch")
+    _img, info = fn(sheet="power.kicad_sch", out_path=str(tmp_path / "c.png"), dpi=30)
+    assert info["page"] == 2
+    with pytest.raises(ValueError, match="no page for sheet"):
+        fn(sheet="Nope")

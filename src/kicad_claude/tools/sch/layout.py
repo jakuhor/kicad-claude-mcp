@@ -21,11 +21,13 @@ def register(mcp) -> None:
         region_mm: list[float] | None = None,
         dpi: float = 150,
         out_path: str = "",
+        sheet: str = "",
     ):
         """2D PNG of one schematic page (kicad-cli plot of the whole
         hierarchy, page order as in KiCAD's PDF) returned as an image, to
-        check readability by eye. `region_mm=[x1, y1, x2, y2]` (sheet coords)
-        zooms in; raise `dpi` with it.
+        check readability by eye. `sheet` (name or file) picks its page
+        instead of `page`; the result names the sheet. `region_mm=[x1, y1,
+        x2, y2]` (sheet coords) zooms in; raise `dpi` with it.
 
         Details:
 
@@ -39,8 +41,9 @@ def register(mcp) -> None:
         if region_mm is not None and len(region_mm) != 4:
             raise ValueError("region_mm is [x1, y1, x2, y2]")
         proj = state.get_active()
-        png = render_out(out_path, f"{proj.name}-page{page}")
-        info = render2d.render_sheet(proj.sch_path, png, page=page, dpi=dpi,
+        tag = "".join(c if c.isalnum() else "_" for c in sheet) if sheet else f"page{page}"
+        png = render_out(out_path, f"{proj.name}-{tag}")
+        info = render2d.render_sheet(proj.sch_path, png, page=page, sheet=sheet, dpi=dpi,
                                      region_mm=tuple(region_mm) if region_mm else None)
         return [Image(path=png), info]
 

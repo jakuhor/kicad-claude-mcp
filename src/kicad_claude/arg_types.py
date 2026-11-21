@@ -14,7 +14,8 @@ EmcGroup = Literal["ground", "switching", "decoupling", "io", "thermal"]
 CircuitGroup = Literal["power", "analog", "digital", "misc", "interfaces",
                        "power_conversion", "drives", "rf"]
 ConnectivityCheck = Literal["power_pins", "decoupling", "open_drain", "i2c",
-                            "datasheet_pins", "pin_abs_max", "cap_voltage"]
+                            "datasheet_pins", "pin_abs_max", "cap_voltage",
+                            "part_fields"]
 SubcircuitType = Literal["divider", "rc", "lc", "opamp", "crystal"]
 DeratingProfile = Literal["commercial", "industrial", "automotive", "military"]
 ZonePadConnection = Literal["thermal", "solid", "thru_hole_only", "none"]

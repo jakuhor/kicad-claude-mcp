@@ -1387,14 +1387,20 @@ def remove_items_in_box(
     x2_mm: float,
     y2_mm: float,
     kinds: list[str] | None = None,
+    crossing: str = "keep",
 ) -> dict[str, int]:
     """Remove every item of `kinds` fully inside the box. Returns counts per kind.
 
     The box is given by two opposite corners in KiCAD coords. A segment is
-    removed only when BOTH endpoints are inside, so a wire crossing the box
-    survives. `kinds` defaults to every kind but `symbol` — removing symbols
-    by area is easy to do by accident.
+    removed only when BOTH endpoints are inside. A wire or bus crossing the
+    box edge survives (`crossing="keep"`), loses its part inside the box
+    (`"clip"`: the new end lies on the box edge; a segment passing right
+    through becomes two) or goes entirely (`"remove"`). Clipped segments
+    count as `<kind>_clipped`. `kinds` defaults to every kind but `symbol` —
+    removing symbols by area is easy to do by accident.
     """
+    if crossing not in ("keep", "clip", "remove"):
+        raise ValueError(f"crossing must be keep, clip or remove, got {crossing!r}")
     if kinds is None:
         kinds = [k for k in _BOX_KINDS if k != "symbol"]
     unknown = [k for k in kinds if k not in _BOX_KINDS]
@@ -1417,11 +1423,58 @@ def remove_items_in_box(
         if head == "symbol" and find_child(node, "lib_id") is None:
             continue  # lib_symbols container, never an instance
         pts = node_points(node)
-        if not pts or not all(inside(p) for p in pts):
+        if not pts:
             continue
+        if not all(inside(p) for p in pts):
+            span = (_clip_span(pts[0], pts[-1], x_lo, x_hi, y_lo, y_hi)
+                    if crossing != "keep" and head in ("wire", "bus") and len(pts) == 2
+                    else None)
+            if span is None:
+                continue
+            if crossing == "clip":
+                _clip_segment(tree, node, pts[0], pts[-1], *span)
+                removed[f"{head}_clipped"] = removed.get(f"{head}_clipped", 0) + 1
+                continue
         tree.remove(node)
         removed[head] = removed.get(head, 0) + 1
     return removed
+
+
+def _clip_span(a, c, x_lo, x_hi, y_lo, y_hi) -> tuple[float, float] | None:
+    """The part of segment a-c inside the box as (t0, t1), Liang-Barsky;
+    None when it misses the box or only touches it."""
+    t0, t1 = 0.0, 1.0
+    dx, dy = c[0] - a[0], c[1] - a[1]
+    for p, q in ((-dx, a[0] - x_lo), (dx, x_hi - a[0]), (-dy, a[1] - y_lo), (dy, y_hi - a[1])):
+        if p == 0:
+            if q < 0:
+                return None
+            continue
+        t = q / p
+        if p < 0:
+            t0 = max(t0, t)
+        else:
+            t1 = min(t1, t)
+    return (t0, t1) if t1 - t0 > 1e-9 else None
+
+
+def _clip_segment(tree: list, node: list, a, c, t0: float, t1: float) -> None:
+    """Keep the parts of `node` (segment a-c) outside [t0, t1]."""
+    def at(t: float) -> tuple[float, float]:
+        return round_mm(a[0] + (c[0] - a[0]) * t), round_mm(a[1] + (c[1] - a[1]) * t)
+
+    xys = find_children(find_child(node, "pts"), "xy")
+    pieces = [(a, at(t0))] if t0 > 1e-9 else []
+    if t1 < 1 - 1e-9:
+        pieces.append((at(t1), c))
+    (p, q), rest = pieces[0], pieces[1:]
+    xys[0][1:3], xys[-1][1:3] = [p[0], p[1]], [q[0], q[1]]
+    for p, q in rest:
+        twin = copy.deepcopy(node)
+        txy = find_children(find_child(twin, "pts"), "xy")
+        txy[0][1:3], txy[-1][1:3] = [p[0], p[1]], [q[0], q[1]]
+        find_child(twin, "uuid")[1] = str(uuid.uuid4())
+        tree.insert(tree.index(node) + 1, twin)
 
 
 def _connection_points(tree: list, *, skip: list | None = None) -> list[tuple[float, float]]:

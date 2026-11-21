@@ -599,6 +599,26 @@ def test_remove_items_in_box_keeps_crossing_wire(blank_project):
     assert len(sch_io.find_children(tree2, "label")) == 1
 
 
+def test_remove_items_in_box_clips_or_removes_crossing_wires(blank_project):
+    """OP-52: `crossing="clip"` cuts a crossing wire at the box edge (one
+    passing right through becomes two); `"remove"` drops it whole."""
+    sch_path = blank_project["sch"]
+    tree = sch_io.parse_file(sch_path)
+    ed.add_wire(tree, 50, 60, 200, 60)      # crosses the right edge
+    ed.add_wire(tree, 20, 70, 200, 70)      # passes right through
+    sch_io.write_file(sch_path, tree)
+    tool = _mcp_with_sch_tools()._tool_manager.get_tool("remove_items_in_box").fn
+    res = tool(x1_mm=40, y1_mm=40, x2_mm=100, y2_mm=100, crossing="clip")
+    assert res["removed"] == {"wire_clipped": 2}
+    segs = sorted(tuple(map(tuple, ed.node_points(w)))
+                  for w in sch_io.find_children(sch_io.parse_file(sch_path), "wire"))
+    assert segs == [((20.0, 70.0), (40.0, 70.0)), ((100.0, 60.0), (200.0, 60.0)),
+                    ((100.0, 70.0), (200.0, 70.0))]
+    res = tool(x1_mm=90, y1_mm=50, x2_mm=150, y2_mm=80, crossing="remove")
+    assert res["removed"] == {"wire": 2}
+    assert len(sch_io.find_children(sch_io.parse_file(sch_path), "wire")) == 1
+
+
 def test_remove_items_in_box_rejects_unknown_kind(blank_project):
     mcp = _mcp_with_sch_tools()
     with pytest.raises(ValueError, match="unknown kinds"):

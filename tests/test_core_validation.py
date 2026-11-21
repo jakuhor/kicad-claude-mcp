@@ -345,3 +345,34 @@ def test_drc_default_call_returns_everything():
     res = _condense_drc(_fake_drc_report(), summary=False, max_violations=0)
     assert len(res["violations"]) == 3
     assert "violations_omitted" not in res
+
+
+def test_erc_violations_move_to_the_sheet_holding_their_items(tmp_path: Path):
+    """OP-55: kicad-cli 10.0.8 files a child sheet's dangling wire under `/`;
+    the item UUID puts it back on the child."""
+    from kicad_claude.adapters import sch_editor as ed
+    from kicad_claude.adapters import sch_io
+    from kicad_claude.templates.blank import write_blank_schematic
+
+    files = write_blank_project(tmp_path / "p", "p")
+    root_path = Path(files["sch"])
+    root = sch_io.parse_file(root_path)
+    ed.add_sheet_node(root, sheet_name="Child", sheet_filename="child.kicad_sch", x_mm=50,
+                      y_mm=50, width_mm=20, height_mm=20, project_name="p")
+    sch_io.write_file(root_path, root)
+    write_blank_schematic(root_path.parent / "child.kicad_sch")
+    child = sch_io.parse_file(root_path.parent / "child.kicad_sch")
+    wire = ed.add_wire(child, 10, 10, 20, 10)
+    sch_io.write_file(root_path.parent / "child.kicad_sch", child)
+    wire_uuid = sch_io.find_child(wire, "uuid")[1]
+    root_uuid = sch_io.find_child(root, "uuid")[1]
+    sheet_uuid = ed.get_sheet_uuid(ed.find_sheet_by_name(root, "Child"))
+    violation = {"type": "wire_dangling", "severity": "error", "description": "x",
+                 "items": [{"uuid": wire_uuid, "pos": {"x": 10, "y": 10}}]}
+    data = {"sheets": [
+        {"path": "/", "uuid_path": f"/{root_uuid}", "violations": [violation]},
+        {"path": "/Child/", "uuid_path": f"/{root_uuid}/{sheet_uuid}", "violations": []}]}
+    assert kicad_cli._reattribute_erc_sheets(data, root_path) == 1
+    shaped = kicad_cli._shape_erc(data, tmp_path / "r.json")
+    assert [(s["sheet"], s["errors"]) for s in shaped["sheets"]] == [("/", 0), ("/Child/", 1)]
+    assert shaped["violations"][0]["sheet"] == "/Child/"

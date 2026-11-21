@@ -215,8 +215,29 @@ def _board(value: str):
 
 
 def on_sheet(fn):
-    """Give a sheet-level tool an optional `sheet` ("root", file or sheet name)."""
-    return _with_extra_arg(fn, "sheet", _sheet)
+    """Give a sheet-level tool an optional `sheet` ("root", file or sheet name).
+    A dict result names the sheet it acted on, and warns when no `sheet` was
+    given and the active sheet (`set_active_sheet`) is a child."""
+    @functools.wraps(fn)
+    def echo(*args, **kwargs):
+        out = fn(*args, **kwargs)
+        if isinstance(out, dict):
+            out.setdefault("sheet", state.get_active_sheet_filename() or "root")
+        return out
+
+    wrapped = _with_extra_arg(echo, "sheet", _sheet)
+
+    @functools.wraps(wrapped)
+    def warn(*args, **kwargs):
+        child = None if kwargs.get("sheet") else state.get_active_sheet_filename()
+        out = wrapped(*args, **kwargs)
+        if child and isinstance(out, dict):
+            out.setdefault("warnings", []).append(
+                f"no sheet given: acted on the active sheet {child} "
+                f"(set_active_sheet), not root; pass sheet= to be explicit")
+        return out
+
+    return warn
 
 
 def on_board(fn):

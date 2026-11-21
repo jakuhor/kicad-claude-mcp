@@ -368,6 +368,60 @@ def _build_courtyard_outline(pads: list[dict], inflate_mm: float = 0.25) -> list
     return lines
 
 
+_GRAPHIC_LAYERS = {"F.SilkS", "B.SilkS", "F.Fab", "B.Fab", "F.CrtYd", "B.CrtYd",
+                   "Dwgs.User", "Cmts.User", "Eco1.User", "Eco2.User"} | {
+                   f"User.{i}" for i in range(1, 10)}
+_GRAPHIC_KEYS = {
+    "rect": ("x1_mm", "y1_mm", "x2_mm", "y2_mm"),
+    "line": ("x1_mm", "y1_mm", "x2_mm", "y2_mm"),
+    "circle": ("x_mm", "y_mm", "r_mm"),
+    "text": ("text", "x_mm", "y_mm"),
+}
+_DEFAULT_WIDTH = {"SilkS": 0.12, "Fab": 0.1, "CrtYd": 0.05}
+
+
+def _build_graphic_node(g: dict, i: int) -> tuple[list, list[tuple[float, float]]]:
+    """One `graphics` entry -> (fp_* node, its extreme points for the body box)."""
+    kind = g.get("kind")
+    if kind not in _GRAPHIC_KEYS:
+        raise ValueError(f"graphics[{i}]: kind must be rect, line, circle or text, got {kind!r}")
+    _check_keys(g, _GRAPHIC_KEYS[kind], what=f"graphics[{i}]",
+                known=("kind", "layer", "width_mm", "fill", "size_mm", "rotation_deg")
+                + _GRAPHIC_KEYS[kind])
+    layer = g.get("layer", "F.Fab")
+    if layer not in _GRAPHIC_LAYERS:
+        raise ValueError(f"graphics[{i}]: layer {layer!r} is not a graphics layer "
+                         f"(copper goes in pads): {sorted(_GRAPHIC_LAYERS)}")
+    uid = [sym("uuid"), str(_uuid.uuid4())]
+    if kind == "text":
+        size = float(g.get("size_mm", 1.0))
+        x, y = float(g["x_mm"]), float(g["y_mm"])
+        return [sym("fp_text"), sym("user"), str(g["text"]),
+                [sym("at"), x, y, float(g.get("rotation_deg", 0))],
+                [sym("layer"), layer], uid,
+                [sym("effects"), [sym("font"), [sym("size"), size, size],
+                                  [sym("thickness"), round(size * 0.15, 3)]]]], []
+    width = float(g.get("width_mm", _DEFAULT_WIDTH.get(layer.split(".")[-1], 0.1)))
+    stroke = [sym("stroke"), [sym("width"), width], [sym("type"), sym("solid")]]
+    fill = [sym("fill"), sym("yes" if g.get("fill") else "no")]
+    if kind == "circle":
+        x, y, r = float(g["x_mm"]), float(g["y_mm"]), float(g["r_mm"])
+        if r <= 0:
+            raise ValueError(f"graphics[{i}]: r_mm must be > 0")
+        node = [sym("fp_circle"), [sym("center"), x, y], [sym("end"), x + r, y], stroke,
+                fill, [sym("layer"), layer], uid]
+        return node, [(x - r, y - r), (x + r, y + r)]
+    a = (float(g["x1_mm"]), float(g["y1_mm"]))
+    b = (float(g["x2_mm"]), float(g["y2_mm"]))
+    if kind == "rect":
+        node = [sym("fp_rect"), [sym("start"), *a], [sym("end"), *b], stroke,
+                fill, [sym("layer"), layer], uid]
+    else:
+        node = [sym("fp_line"), [sym("start"), *a], [sym("end"), *b], stroke,
+                [sym("layer"), layer], uid]
+    return node, [a, b]
+
+
 def build_footprint_node(
     *,
     qualified_lib_id: str,
@@ -376,8 +430,16 @@ def build_footprint_node(
     tags: str = "",
     add_courtyard: bool = True,
     add_silk_outline: bool = True,
+    graphics: list[dict] | None = None,
+    courtyard_from: str = "pads",
 ) -> list:
-    """Build a footprint node (top-level (footprint ...)) for writing to .kicad_mod."""
+    """Build a footprint node (top-level (footprint ...)) for writing to .kicad_mod.
+
+    `graphics`: extra rect / line / circle / text items (`_build_graphic_node`).
+    `courtyard_from="body"` sizes the courtyard over the pads and the F.Fab /
+    B.Fab graphics (the part body), not the pads alone."""
+    if courtyard_from not in ("pads", "body"):
+        raise ValueError(f"courtyard_from must be pads or body, got {courtyard_from!r}")
     pad_nodes: list[list] = []
     for i, pad in enumerate(pads):
         _check_keys(pad, ("x_mm", "y_mm", "size_x_mm", "size_y_mm"),
@@ -396,7 +458,19 @@ def build_footprint_node(
             rotation_deg=pad.get("rotation_deg", 0),
         ))
 
-    courtyard = _build_courtyard_outline(pads) if (add_courtyard and pads) else []
+    graphic_nodes: list[list] = []
+    body: list[dict] = []
+    for i, g in enumerate(graphics or []):
+        node, pts = _build_graphic_node(g, i)
+        graphic_nodes.append(node)
+        if g.get("layer", "F.Fab") in ("F.Fab", "B.Fab"):
+            body += [{"x_mm": x, "y_mm": y, "size_x_mm": 0, "size_y_mm": 0} for x, y in pts]
+    if courtyard_from == "body" and not body:
+        raise ValueError("courtyard_from='body' needs F.Fab / B.Fab graphics (the body outline)")
+    if any(g.get("layer") in ("F.CrtYd", "B.CrtYd") for g in graphics or []):
+        add_courtyard = False  # the caller drew its own
+    extent = pads + (body if courtyard_from == "body" else [])
+    courtyard = _build_courtyard_outline(extent) if (add_courtyard and extent) else []
 
     silk_outline: list[list] = []
     if add_silk_outline and pads:
@@ -469,6 +543,7 @@ def build_footprint_node(
         ],
         *courtyard,
         *silk_outline,
+        *graphic_nodes,
         *pad_nodes,
     ]
     return fp
@@ -484,6 +559,8 @@ def create_footprint(
     tags: str = "",
     add_courtyard: bool = True,
     add_silk_outline: bool = True,
+    graphics: list[dict] | None = None,
+    courtyard_from: str = "pads",
 ) -> dict:
     """Top-level: write a footprint to <project>/lib/<lib_name>.pretty/<footprint_name>.kicad_mod.
 
@@ -504,6 +581,7 @@ def create_footprint(
         description=description, tags=tags,
         add_courtyard=add_courtyard,
         add_silk_outline=add_silk_outline,
+        graphics=graphics, courtyard_from=courtyard_from,
     )
     safe_write.save_tree(target, node)
     table_path = vendor_import.update_fp_lib_table(project_dir, lib_name)

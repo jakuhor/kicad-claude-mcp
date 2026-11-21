@@ -415,6 +415,39 @@ def test_create_footprint_writes_kicad_mod(tmp_path: Path):
     state.clear_active()
 
 
+def test_create_footprint_body_graphics_and_courtyard(tmp_path: Path):
+    """OP-53: `graphics` draws the body; `courtyard_from="body"` wraps it,
+    not just the pads; copper layers are refused."""
+    state.clear_active()
+    write_blank_project(tmp_path / "p", "p")
+    pads = [{"number": "1", "type": "thru_hole", "shape": "circle",
+             "x_mm": 0, "y_mm": 0, "size_x_mm": 1.6, "size_y_mm": 1.6}]
+    body = [{"kind": "rect", "x1_mm": -5, "y1_mm": -3, "x2_mm": 20, "y2_mm": 3},
+            {"kind": "line", "layer": "F.SilkS", "x1_mm": -5.2, "y1_mm": -3.2,
+             "x2_mm": 20.2, "y2_mm": -3.2},
+            {"kind": "circle", "layer": "F.SilkS", "x_mm": -1.5, "y_mm": 0, "r_mm": 0.2,
+             "fill": True},
+            {"kind": "text", "text": "${REFERENCE}", "x_mm": 7, "y_mm": 0}]
+    res = lc.create_footprint(tmp_path / "p", lib_name="custom", footprint_name="BODY",
+                              pads=pads, graphics=body, courtyard_from="body")
+    data = sexpdata.loads(Path(res["kicad_mod_path"]).read_text())
+    rect = sch_io.find_child(data, "fp_rect")
+    assert sch_io.find_child(rect, "layer")[1] == "F.Fab"
+    assert str(sch_io.find_child(sch_io.find_child(data, "fp_circle"), "fill")[1]) == "yes"
+    assert sch_io.find_child(data, "fp_text")[2] == "${REFERENCE}"
+    crt = [n for n in sch_io.find_children(data, "fp_line")
+           if sch_io.find_child(n, "layer")[1] == "F.CrtYd"]
+    xs = [float(sch_io.find_child(n, k)[1]) for n in crt for k in ("start", "end")]
+    assert min(xs) == pytest.approx(-5.25) and max(xs) == pytest.approx(20.25)
+    with pytest.raises(ValueError, match="not a graphics layer"):
+        lc.create_footprint(tmp_path / "p", lib_name="custom", footprint_name="CU",
+                            pads=pads, graphics=[{**body[0], "layer": "F.Cu"}])
+    with pytest.raises(ValueError, match="needs F.Fab"):
+        lc.create_footprint(tmp_path / "p", lib_name="custom", footprint_name="NB",
+                            pads=pads, courtyard_from="body")
+    state.clear_active()
+
+
 def test_create_footprint_thru_hole_default_drill(tmp_path: Path):
     state.clear_active()
     write_blank_project(tmp_path / "p", "p")

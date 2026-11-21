@@ -20,14 +20,14 @@ from kicad_claude.adapters.sch_io import find_child, find_children
 from kicad_claude.tools.common import on_sheet
 from kicad_claude.tools.library import index as lib_tools
 from kicad_claude.tools.sch import schematic as sch
-from kicad_claude.utils.geometry import normalize_rotation
+from kicad_claude.utils.geometry import file_to_sch_xy, normalize_rotation
 
 logger = logging.getLogger("kicad-claude.tools.sch.batch")
 
 _DIR_TO_ORIENT = {(1, 0): "right", (-1, 0): "left", (0, -1): "up", (0, 1): "down"}
 OPS = ("symbol", "wire", "label", "power", "pwr_flag", "connect", "name_net", "no_connect",
        "junction", "text", "move", "move_region", "join_power", "place_chain", "remove",
-       "property", "field", "autoplace")
+       "property", "field", "autoplace", "hier_label", "sheet_pin")
 
 
 class OpError(ValueError):
@@ -274,7 +274,33 @@ def _op_wire(b: _Batch, op: dict) -> dict:
                for px, py in op["points"]]
     else:
         pts = [b.point(op, "1"), b.point(op, "2")]
+    existing = [_ends(n) for n in b.tree[1:] if g.is_wire(n)]
+    hits = {e for u, v in zip(pts, pts[1:]) for e in existing if _collinear_overlap(e, (u, v))}
+    for a, c in sorted(hits):
+        b.warnings.append(f"wire runs along the existing wire {list(a)}-{list(c)} "
+                          f"(collinear overlap; ERC sees one wire, a label on it "
+                          f"may touch both)")
     return {"segments": _add_path(b, pts)}
+
+
+def _ends(node: list) -> tuple:
+    xys = find_children(find_child(node, "pts"), "xy")
+    return (float(xys[0][1]), float(xys[0][2])), (float(xys[-1][1]), float(xys[-1][2]))
+
+
+def _collinear_overlap(s: tuple, t: tuple, tol: float = 1e-4) -> bool:
+    """Two segments on one line sharing more than a point."""
+    (ax, ay), (cx, cy) = s
+    dx, dy = cx - ax, cy - ay
+    length = math.hypot(dx, dy)
+    if length < tol:
+        return False
+    # Both ends of t on s's line ...
+    if any(abs(dx * (py - ay) - dy * (px - ax)) / length > tol for px, py in t):
+        return False
+    # ... and their projections overlap by more than a point.
+    proj = sorted(((px - ax) * dx + (py - ay) * dy) / length for px, py in t)
+    return min(proj[1], length) - max(proj[0], 0.0) > tol
 
 
 def _anchor(b: _Batch, op: dict) -> tuple[tuple[float, float], tuple[int, int] | None]:
@@ -291,6 +317,40 @@ def _op_label(b: _Batch, op: dict) -> dict:
         ed.add_global_label(b.tree, op["net"], x, y, orient, op.get("shape", "bidirectional"))
     else:
         ed.add_label(b.tree, op["net"], x, y, orient)
+    return {}
+
+
+def _op_hier_label(b: _Batch, op: dict) -> dict:
+    """A hierarchical label on a child sheet: the net it shares with the
+    parent's sheet pin of the same name."""
+    if state.get_active_sheet_filename() is None:
+        raise OpError("hierarchical labels belong on a child sheet; pass sheet=")
+    (x, y), out = _anchor(b, op)
+    orient = op.get("orientation") or (_DIR_TO_ORIENT.get(tuple(out)) if out else "right")
+    ed.add_hierarchical_label(b.tree, net_name=op["net"], x_mm=x, y_mm=y,
+                              shape=op.get("shape", "input"), orientation=orient)
+    return {}
+
+
+def _op_sheet_pin(b: _Batch, op: dict) -> dict:
+    """A pin on a sheet block of this sheet, on the block's edge; the side
+    gives the orientation unless one is passed."""
+    node = ed.find_sheet_by_name(b.tree, op["sheet"])
+    if node is None:
+        raise OpError(f"no sheet block named {op['sheet']!r} on this sheet")
+    at, size = find_child(node, "at"), find_child(node, "size")
+    x0, y0 = file_to_sch_xy(float(at[1]), float(at[2]))
+    w, h = float(size[1]), float(size[2])
+    x, y = b.point(op)
+    sides = {"left": abs(x - x0), "right": abs(x - x0 - w),
+             "up": abs(y - y0), "down": abs(y - y0 - h)}
+    side = min(sides, key=sides.get)
+    inside = x0 - 1e-3 <= x <= x0 + w + 1e-3 and y0 - 1e-3 <= y <= y0 + h + 1e-3
+    if sides[side] > 1e-3 or not inside:
+        raise OpError(f"sheet pin {op['name']!r} at {[x, y]} is not on the edge of "
+                      f"{op['sheet']!r} (box {[x0, y0]} + {[w, h]})")
+    ed.add_sheet_pin(node, pin_name=op["name"], shape=op.get("shape", "input"),
+                     x_mm=x, y_mm=y, orientation=op.get("orientation") or side)
     return {}
 
 
@@ -564,16 +624,28 @@ def _pin_nets(tree: list) -> dict[tuple[str, str], str]:
 
 
 def _merged_nets(before: dict, after: dict) -> list[list[str]]:
-    """Groups of connected nets (named, or 2+ pins) that a change joined."""
-    real = {}
+    """Groups of nets a change joined: two connected nets (named, or 2+
+    pins), or a lone unconnected pin (`C8.1`) that landed on a connected or
+    labelled net."""
+    real: dict[str, int] = {}
     for name in before.values():
         real[name] = real.get(name, 0) + 1
-    joined: dict[str, set[str]] = {}
+    joined: dict[str, tuple[set, set]] = {}
     for key, name in after.items():
         old = before.get(key)
-        if old is not None and (real[old] > 1 or not old.startswith("unconnected")):
-            joined.setdefault(name, set()).add(old)
-    return [sorted(s) for s in joined.values() if len(s) > 1]
+        if old is None:
+            continue
+        nets, lone = joined.setdefault(name, (set(), set()))
+        if real[old] == 1 and old.startswith("unconnected"):
+            lone.add(f"{key[0]}.{key[1]}")
+        else:
+            nets.add(old)
+    out = []
+    for name, (nets, lone) in joined.items():
+        labelled = not name.startswith(("unconnected-", "Net-("))
+        if len(nets) > 1 or (lone and (nets or labelled)):
+            out.append(sorted(nets) + sorted(lone) + ([name] if labelled and not nets else []))
+    return out
 
 
 def _op_move(b: _Batch, op: dict) -> dict:
@@ -947,8 +1019,9 @@ def register(mcp) -> None:
         """Many sheet edits in ONE write, all or nothing; prefer it to single
         add_* calls. Each op is a dict with "op": symbol, wire, label, power,
         pwr_flag, connect, no_connect, junction, text, move, remove, property,
-        field, autoplace. Pins are "REF.PIN": {"op":"connect","pins":["R1.1",
-        "C1.1"],"net":"VIN"} draws stubs + label / power port; {"op":"wire",
+        field, autoplace, hier_label, sheet_pin. Pins are "REF.PIN":
+        {"op":"connect","pins":["R1.1","C1.1"],"net":"VIN"} draws stubs +
+        label / power port; {"op":"wire",
         "from":"R1.2","to":"C1.2"} routes an L. `check=True` adds readability
         counts. help() lists every op's keys.
 
@@ -990,8 +1063,9 @@ def register(mcp) -> None:
                       grows upward from its anchor)
           move        ref | uuid, x_mm, y_mm, rotation, mirror (x / y / ""
                       clears), drag (default true: wires, labels, ports on
-                      the pins follow); a move that joins two nets is
-                      refused unless allow_merge: true; with mirror the
+                      the pins follow); a move that joins two nets, or
+                      drops a lone pin onto a net, is refused unless
+                      allow_merge: true; with mirror the
                       result lists `pins` {number: [x, y]}
           move_region x1_mm, y1_mm, x2_mm, y2_mm (the box), dx_mm, dy_mm
                       (snapped to 1.27): symbols whose origin is inside,
@@ -1020,6 +1094,13 @@ def register(mcp) -> None:
                       true) | label NET (+ x_mm, y_mm: only that one;
                       wires: also its stub, default true) |
                       uuid | uuids [...]
+          hier_label  net, pin | x_mm, y_mm, shape (input | output |
+                      bidirectional | tri_state | passive), orientation
+                      (default: away from the pin); child sheets only
+          sheet_pin   sheet (block name on this sheet), name, shape, x_mm,
+                      y_mm on the block's edge, orientation (default: the
+                      edge's side); pair each with a hier_label of the same
+                      name in the child
           property    ref, name, value, create
           field       ref, field, x_mm, y_mm, angle, visible, justify
                       left|right|center (as it reads on the sheet, flip of a
@@ -1044,7 +1125,9 @@ def register(mcp) -> None:
         one entry per op that produced anything), `warnings`, `backup`. An op that fails
         raises "op N (kind): ..." and nothing is written. `dry_run=True`
         applies in memory only. `check=True` runs
-        `check_schematic_readability` on the result and returns its counts.
+        `check_schematic_readability` on the result and returns its counts,
+        plus `dangling`: wire ends that touch nothing (positions; ERC's
+        `unconnected_wire_endpoint`) and the count of unconnected pins.
         """
         tree, path = sch._load_active_schematic()
         try:
@@ -1064,7 +1147,13 @@ def register(mcp) -> None:
         if warnings:
             out["warnings"] = warnings
         if check:
+            from kicad_claude.adapters import sch_netlist
+
             out["readability"] = layout.check_readability(tree, max_findings=0)["counts"]
+            dangling = sch_netlist.build_sheet_nets(tree, path).dangling
+            ends = [d["position_mm"] for d in dangling if d["kind"] == "wire_end"]
+            out["dangling"] = {"wire_ends": ends,
+                               "pins": sum(d["kind"] != "wire_end" for d in dangling)}
         if dry_run:
             out["dry_run"] = True
         else:

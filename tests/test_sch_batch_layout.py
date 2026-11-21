@@ -624,6 +624,45 @@ def test_move_that_merges_two_nets_is_refused(mcp):
     assert ["A", "B"] in res["results"][0]["nets_merged"]
 
 
+def test_move_of_a_lone_pin_onto_another_net_is_refused(mcp):
+    """OP-50: a pin with nothing on it that lands on another net's label is
+    a merge too, not only two named nets."""
+    _call(mcp, "edit_schematic", ops=TWO_R + [
+        {"op": "connect", "pin": "R1.1", "net": "A"},
+        {"op": "connect", "pin": "R1.2", "net": "A2"}])
+    a = next(lb for lb in sch_io.find_children(_tree(), "label") if lb[1] == "A")
+    at = sch_io.find_child(a, "at")
+    # R2's pin 1 sits 3.81 mm above its origin (Device:R, rotation 0).
+    move = {"op": "move", "ref": "R2", "x_mm": float(at[1]), "y_mm": float(at[2]) + 3.81}
+    # A free spot is no merge.
+    res = _call(mcp, "edit_schematic", ops=[
+        {"op": "move", "ref": "R2", "x_mm": 127, "y_mm": 101.6}])
+    assert "nets_merged" not in (res.get("results") or [{}])[0]
+    with pytest.raises(ValueError, match="merges nets.*R2.1"):
+        _call(mcp, "edit_schematic", ops=[move])
+    res = _call(mcp, "edit_schematic", ops=[{**move, "allow_merge": True}])
+    assert any("R2.1" in m for m in res["results"][0]["nets_merged"])
+
+
+def test_check_reports_dangling_wire_ends(mcp):
+    """OP-51: a wire drawn past its label leaves a free end ERC flags;
+    `check=True` names it."""
+    res = _call(mcp, "edit_schematic", check=True, ops=R1_ONLY + [
+        {"op": "wire", "x1_mm": 101.6, "y1_mm": 101.6, "x2_mm": 114.3, "y2_mm": 101.6},
+        {"op": "label", "net": "X", "x_mm": 101.6, "y_mm": 101.6}])
+    assert res["dangling"]["wire_ends"] == [[114.3, 101.6]]
+    assert res["dangling"]["pins"] == 2
+
+
+def test_wire_over_an_existing_wire_warns(mcp):
+    """OP-52: a new wire collinear over an old one is flagged."""
+    res = _call(mcp, "edit_schematic", ops=[
+        {"op": "wire", "x1_mm": 101.6, "y1_mm": 101.6, "x2_mm": 127, "y2_mm": 101.6},
+        {"op": "wire", "x1_mm": 114.3, "y1_mm": 101.6, "x2_mm": 139.7, "y2_mm": 101.6},
+        {"op": "wire", "x1_mm": 139.7, "y1_mm": 101.6, "x2_mm": 139.7, "y2_mm": 114.3}])
+    assert sum("collinear" in w for w in res["warnings"]) == 1
+
+
 def test_readability_sees_ports_flags_and_the_border_band(mcp):
     _call(mcp, "edit_schematic", ops=R1_ONLY + [
         {"op": "power", "net": "+5V", "x_mm": 101.6, "y_mm": 50.8, "rotation": 0},

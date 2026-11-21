@@ -664,12 +664,49 @@ def check_cap_voltage(nl: Netlist, findings: list, volts: dict, derating: float 
             "rating_field": field}
 
 
+_VALUE_KINDS = {"R", "C", "L", "FB", "RN", "CN", "F"}  # Value is a value or rating
+
+
+def _tokens(text: str) -> set[str]:
+    return {t.upper() for t in re.findall(r"[A-Za-z0-9]+", text or "") if len(t) >= 3}
+
+
+def check_part_fields(nl: Netlist, findings: list) -> dict:
+    """A part's MPN against its Value and footprint: when the Value names a
+    specific part (not the library symbol's own generic name) and neither it
+    nor the footprint shares a token with the MPN, the MPN (and the
+    Manufacturer with it) is probably left over from a part swap."""
+    from kicad_claude.adapters.power_review import parse_value
+
+    checked, stale = 0, []
+    for ref, comp in sorted(nl.components.items(), key=lambda kv: _nat(kv[0])):
+        mpn = (comp.get("fields") or {}).get("MPN", "").strip()
+        value = (comp.get("value") or "").strip()
+        if not mpn or kind(ref) in _VALUE_KINDS or parse_value(value) is not None:
+            continue
+        generic = comp.get("lib_id", "").split(":")[-1]
+        if not re.search(r"\d", value) or value == generic:
+            continue  # "LED", "Conn_01x04": no part named, nothing to compare
+        checked += 1
+        flat = re.sub(r"[^A-Za-z0-9]", "", mpn).upper()
+        fp = (comp.get("footprint") or "").split(":")[-1]
+        if any(t in flat for t in _tokens(value) | _tokens(fp)):
+            continue
+        stale.append(ref)
+        mfr = (comp.get("fields") or {}).get("Manufacturer", "")
+        findings.append(_f("warning", "CR-MPN-STALE", ref,
+                           f"MPN {mpn}{f' ({mfr})' if mfr else ''} shares nothing with Value "
+                           f"{value!r} or footprint {fp!r}: left over from a part swap? "
+                           f"Update MPN / Manufacturer, or the Value."))
+    return {"checked": checked, "stale": stale}
+
+
 def _nat(s: str) -> tuple:
     return tuple(int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s))
 
 
 CHECKS = ("power_pins", "decoupling", "open_drain", "i2c", "datasheet_pins", "pin_abs_max",
-          "cap_voltage")
+          "cap_voltage", "part_fields")
 
 
 def analyze(nl: Netlist, checks: tuple[str, ...] = CHECKS, specs: dict | None = None,
@@ -698,6 +735,8 @@ def analyze(nl: Netlist, checks: tuple[str, ...] = CHECKS, specs: dict | None = 
     if "cap_voltage" in checks:
         result["cap_voltage"] = check_cap_voltage(nl, findings, volts or {}, cap_derating,
                                                   specs=specs, profile=profile)
+    if "part_fields" in checks:
+        result["part_fields"] = check_part_fields(nl, findings)
     result["specs_used"] = sorted(f"{r}={s.get('mpn')}" for r, s in specs.items())
     order = {"error": 0, "warning": 1, "info": 2}
     findings.sort(key=lambda f: (order[f["severity"]], f["rule"], f["ref"]))

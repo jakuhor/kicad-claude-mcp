@@ -425,19 +425,24 @@ def register(mcp) -> None:
         kinds: list[Literal["wire", "bus", "junction", "no_connect", "label",
                             "global_label", "hierarchical_label", "bus_entry",
                             "text", "symbol"]] | None = None,
+        crossing: Literal["keep", "clip", "remove"] = "keep",
     ) -> dict:
-        """Remove every item fully inside a rectangle of the active sheet.
+        """Remove every item fully inside a rectangle of the active sheet
+        (opposite corners `x1,y1` / `x2,y2`). A wire crossing the box edge:
+        `crossing` keep / clip (cut at the edge) / remove.
 
-        `x1,y1` and `x2,y2` are opposite corners in KiCAD coords. A wire or bus
-        is removed only when BOTH endpoints are inside, so a segment crossing
-        the box survives.
+        Details:
+
+        A wire or bus is removed when BOTH endpoints are inside. Clipped ends
+        lie on the box edge; a segment passing through becomes two.
 
         `kinds` defaults to everything but symbols: wire, bus, junction,
         no_connect, label, global_label, hierarchical_label, bus_entry, text.
         Pass ["symbol"] explicitly to delete symbols by area.
         """
         tree, path = _load_active_schematic()
-        removed = ed.remove_items_in_box(tree, x1_mm, y1_mm, x2_mm, y2_mm, kinds=kinds)
+        removed = ed.remove_items_in_box(tree, x1_mm, y1_mm, x2_mm, y2_mm, kinds=kinds,
+                                         crossing=crossing)
         backup = _save_with_backup(tree, path)
         return {
             "removed": removed,
