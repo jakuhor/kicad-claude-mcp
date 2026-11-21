@@ -382,6 +382,25 @@ class TestCircuitReview:
         hp = r["opamps"]
         assert hp and hp[0]["ref"] == "U1"
 
+    @pytest.mark.parametrize("tvs_net, flagged", [("+5V", False), ("VBUS_IN", False),
+                                                  (None, True)])
+    def test_vbus_clamp_behind_series_ptc(self, tmp_path, tvs_net, flagged):
+        # Field report (MADI J1): VBUS -> PTC F1 -> +5V, TVS D1 on +5V.
+        comps = [_comp("J1", "USB", lib="Connector:USB_B_Micro"), _comp("F1", "PTC"),
+                 _comp("U1", "LOAD")]
+        tvs = {n: [("D1", "1", "K", "passive")] if n == tvs_net else [] for n in ("VBUS_IN", "+5V")}
+        nets = [_net(1, "VBUS_IN", ("J1", "1", "VBUS", "passive"), ("F1", "1", "", "passive"),
+                     *tvs["VBUS_IN"]),
+                _net(2, "+5V", ("F1", "2", "", "passive"), ("U1", "1", "VIN", "power_in"),
+                     *tvs["+5V"]),
+                _net(3, "GND", ("J1", "5", "GND", "passive"), ("U1", "2", "GND", "power_in"),
+                     *([("D1", "2", "A", "passive")] if tvs_net else []))]
+        if tvs_net:
+            comps.append(_comp("D1", "SMAJ5.0A", lib="Diode:SMAJ5.0A"))
+        nl = _nl(tmp_path, comps, nets)
+        r = circuit_review.analyze(nl, pr.analyze(nl, rail_voltages={"+5V": 5.0}), {})
+        assert (("PW-VBUS-TVS", "J1") in {(f["rule"], f["ref"]) for f in r["findings"]}) == flagged
+
     def test_highpass_corner(self, tmp_path):
         comps = [_comp("U1", "OPA"), _comp("C1", "100n"), _comp("R1", "10k"), _comp("J1", "IN")]
         nets = [_net(1, "IN", ("J1", "1", "", "passive"), ("C1", "1", "", "passive")),

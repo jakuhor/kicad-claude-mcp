@@ -294,6 +294,9 @@ def _outbound(nl: Netlist, net: str, board_sourced: set) -> bool:
     return False
 
 
+SERIES_ENTRY_KINDS = ("F", "FU", "FB")  # fuse / PTC, ferrite
+
+
 def check_supply_entry(nl: Netlist, findings: list, specs: dict,
                        board_sourced: set | None = None) -> list[dict]:
     """Supply pins of connectors: a clamp on the net, and a ground pin.
@@ -308,14 +311,21 @@ def check_supply_entry(nl: Netlist, findings: list, specs: dict,
         if not sup:
             continue
         gnd = [p for p in pins if is_ground(p.net)]
-        out.append({"ref": j, "supply_nets": sorted(sup), "ground_pins": len(gnd)})
+        rec = {"ref": j, "supply_nets": sorted(sup), "ground_pins": len(gnd)}
+        out.append(rec)
         if not gnd:
             findings.append(_f("warning", "PW-CONN-GND", j, "Connector brings in a supply but "
                                "has no ground pin: the return current takes another path."))
         for n in sorted(sup):
             if n in board_sourced or _outbound(nl, n, board_sourced):
                 continue
-            if not clamped(nl, n, specs):
+            # A clamp behind one series fuse / PTC or ferrite still clamps the
+            # entry (often on purpose: the PTC protects the TVS).
+            after = [(f"{','.join(c)} after {s}") for k in SERIES_ENTRY_KINDS
+                     for s, far in parts_on(nl, n, k) if (c := clamped(nl, far, specs))]
+            if after:
+                rec.setdefault("clamps", {})[n] = after[0]
+            elif not clamped(nl, n, specs):
                 findings.append(_f("warning", "PW-VBUS-TVS", j, f"Supply net {n} from {j} has "
                                    "no TVS / clamp: hot-plug and ESD transients reach the input."))
     return out

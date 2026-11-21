@@ -1859,7 +1859,7 @@ def check_thermal_emc(b: Board, findings: list, regulators: list[dict], rail_vol
                                "ceramic loses capacitance under DC bias (SRF moves up, PDN "
                                "gaps) - "
                                + (f"datasheet curve: {cb:.0%} of nominal remains." if cb is not None
-                                  else "read the MPN's DC-bias curve (not in the spec cache)."),
+                                  else "read the MPN's DC-bias curve (`fetch_cap_curves`, or extract it)."),
                                ref=ref))
     ferr = []
     sw_refs = {r["ref"] for r in regulators if r["topology"] == "switching"}

@@ -86,7 +86,8 @@ def datasheet_values(nl) -> dict:
                         ("abs_vout", absmax.get("VOUT")), ("rec_vout", rec_.get("VOUT")),
                         ("abs_en", absmax.get("EN")),
                         ("en_on", chan.get("en_threshold_rising") or r.get("en_threshold_rising")),
-                        ("dropout", chan.get("dropout") or r.get("dropout"))):
+                        ("dropout", chan.get("dropout") or r.get("dropout")),
+                        ("cout_min", chan.get("cout_min") or r.get("cout_min"))):
             if sv:
                 lim[key] = (sv.get("min"), sv.get("typ"), sv.get("max"), src(sv))
         if lim:
@@ -97,7 +98,9 @@ def datasheet_values(nl) -> dict:
 
 
 def specs_by_ref(nl) -> dict:
-    """{ref: spec record} for every part whose MPN has a fresh extraction."""
+    """{ref: spec record} for every part whose MPN has a fresh extraction,
+    with vendor capacitor curves (`fetch_cap_curves`) merged in."""
+    from kicad_claude.adapters import cap_curves
     from kicad_claude.adapters import datasheet_index as dsi
     from kicad_claude.adapters import datasheet_specs as dss
 
@@ -112,10 +115,11 @@ def specs_by_ref(nl) -> dict:
         if not mpn:
             continue
         if mpn not in cache:
-            cache[mpn] = dss.load(ds_dir, mpn)
-        rec = cache[mpn]
-        if rec and not rec.get("stale"):
-            out[ref] = rec
+            rec = dss.load(ds_dir, mpn)
+            cache[mpn] = cap_curves.merge(rec if rec and not rec.get("stale") else None,
+                                          cap_curves.load(ds_dir, mpn))
+        if cache[mpn]:
+            out[ref] = cache[mpn]
     return out
 
 

@@ -229,6 +229,7 @@ def register(mcp) -> None:
         from kicad_claude.adapters import connectivity_review, power_review, spice_auto
         from kicad_claude.adapters import spice_backends
         from kicad_claude.adapters import datasheet_index as dsi
+        from kicad_claude.adapters import cap_curves
         from kicad_claude.adapters import datasheet_specs as dss
         from kicad_claude.tools.common import datasheet_values, project_netlist
 
@@ -264,7 +265,9 @@ def register(mcp) -> None:
                 mpn = comp["fields"].get("MPN", "")
                 if mpn and kind_is_passive(ref) or (mpn and _re_ic(ref)):
                     rec = dss.load(ds_dir, mpn)
-                    if rec and not rec.get("stale"):
+                    rec = cap_curves.merge(rec if rec and not rec.get("stale") else None,
+                                           cap_curves.load(ds_dir, mpn))   # vendor C curves
+                    if rec:
                         specs[ref] = rec
         f_list = list(freqs or [])
         for f in (fsw or {}).values():

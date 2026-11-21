@@ -1,0 +1,172 @@
+{
+"seriesList": [
+{
+"points": null,
+"kemetPn": "",
+"refDes": null,
+"yLabel": "",
+"yUnit": "",
+"nets": null
+},
+{
+"points": [
+{
+"x": -55,
+"y": 0
+},
+{
+"x": -40.999985,
+"y": 0
+},
+{
+"x": -26.999969,
+"y": 0
+},
+{
+"x": -12.999959,
+"y": 0
+},
+{
+"x": 1.000039,
+"y": 0
+},
+{
+"x": 15.000036,
+"y": 0
+},
+{
+"x": 29.00005,
+"y": 0
+},
+{
+"x": 43.000065,
+"y": 0
+},
+{
+"x": 57.00008,
+"y": 0
+},
+{
+"x": 71.000053,
+"y": 0
+}
+],
+"kemetPn": "C0805C106K4PACTU",
+"refDes": null,
+"yLabel": "Capacitance Change",
+"yUnit": "%",
+"nets": null
+}
+],
+"request": {
+"calculated": "No",
+"combine": "No",
+"freqList": [
+1000
+],
+"highlight": 0,
+"ind": 0,
+"line": "50",
+"path": "Shunt",
+"parts": [
+{
+"id": 6851,
+"capDisplay": "10 uF",
+"capType": "Ceramic",
+"capValue": 10000000,
+"dielectric": "X5R",
+"kemetPn": "C0805C106K4PACTU",
+"basePn": "C0805C106K4PAC",
+"maxTemp": 85,
+"series": "General Purpose Surface Mount (4V \u0102\u02d8\u00e2\u201a\u00ac\u00e2\u20ac\u015b 10kV)",
+"appDef": "Commercial/Standard Chips",
+"spicePn": "",
+"voltageRating": 16,
+"hidden": false,
+"instances": 1,
+"param": {
+"qty": {
+"title": "Qty",
+"select": 1,
+"min": 1,
+"max": 1000,
+"step": 1,
+"disabled": false,
+"hidden": false,
+"width": 6
+},
+"bias": {
+"title": "Bias (VDC)",
+"select": 0,
+"min": 0,
+"max": 1000,
+"step": 0.1,
+"disabled": false,
+"hidden": false,
+"width": 6
+},
+"tempAmbient": {
+"title": "Amb (\u0102\u201a\u00c2\u00b0C)",
+"select": 25,
+"min": -55,
+"max": 155,
+"step": 1,
+"disabled": false,
+"hidden": false,
+"width": 6
+}
+},
+"tolerance": {
+"title": "Tolerance",
+"select": "K",
+"options": [
+{
+"label": "10%",
+"value": "K",
+"disabled": false
+},
+{
+"label": "20%",
+"value": "M",
+"disabled": false
+}
+],
+"disabled": false,
+"hidden": false
+},
+"ceProps": [],
+"filmProps": {
+"relativeTime": {
+"display": "",
+"label": "",
+"value": ""
+},
+"pitch": {
+"display": "",
+"label": "",
+"value": ""
+}
+},
+"seedProps": [],
+"tcc": "",
+"vcac": ""
+}
+],
+"plotType": "TCC",
+"res": 0,
+"spiceFreq": 1000,
+"spiceFileFormat": "CKT",
+"start": 100,
+"stop": 1000000000,
+"tempRise": 20,
+"session": "x"
+},
+"title": "Capacitance Change versus Temperature",
+"kemetPn": "",
+"xLabel": "Temperature in Degrees Celsius",
+"xUnit": "\u00c2\u00b0C",
+"note": "",
+"image": null,
+"date": "",
+"ver": ""
+}

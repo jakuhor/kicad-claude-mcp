@@ -38,17 +38,20 @@ def _others(tree: list, ref: str) -> dict:
     """What a symbol's fields must not land on: everything not its own."""
     items = _items(tree)
     return {"texts": [t["box"] for t in items["texts"] if t["owner"] != ref],
-            "bodies": [b["box"] for b in items["bodies"] if b["ref"] != ref],
+            "bodies": [(b["box"], b["parts"]) for b in items["bodies"] if b["ref"] != ref],
             "wires": items["wires"]}
 
 
 def _collisions(boxes: list, others: dict) -> int:
-    """Other texts, bodies (ports too) and wires that the field boxes touch."""
+    """Other texts, bodies (ports too) and wires that the field boxes touch.
+    A body counts on its box or on one of its lines (a capacitor plate), as
+    `check_readability` counts it: a spot clear here is clear there."""
     hits = 0
     for bx in boxes:
         inner = g.shrink(bx, 0.1)
         hits += sum(g.overlap_area(bx, t) > 0.15 for t in others["texts"])
-        hits += sum(g.overlap_area(inner, g.shrink(b, 0.1)) > 0 for b in others["bodies"])
+        hits += sum(g.overlap_area(inner, g.shrink(b, 0.1)) > 0 or _text_on_graphic(bx, parts)
+                    for b, parts in others["bodies"])
         hits += sum(g.segment_hits_box(a, c, inner) for a, c in others["wires"])
     return hits
 
@@ -264,7 +267,8 @@ def check_readability(tree: list, max_findings: int = 60,
         for body in bodies:
             if body["power"] and t["owner"] == body["ref"]:
                 continue
-            if g.overlap_area(tb, body["box"]) <= 0.3:
+            if g.overlap_area(tb, body["box"]) <= 0.3 and (
+                    t["owner"] == body["ref"] or not _text_on_graphic(t["box"], body["parts"])):
                 continue
             if t["kind"] == "field" and t["owner"] == body["ref"]:
                 if _inside(t["box"], body["box"]):
@@ -384,6 +388,21 @@ def check_readability(tree: list, max_findings: int = 60,
 
 def _inside(a, b) -> bool:
     return a[0] >= b[0] - 0.1 and a[1] >= b[1] - 0.1 and a[2] <= b[2] + 0.1 and a[3] <= b[3] + 0.1
+
+
+def _text_on_graphic(tb, parts) -> bool:
+    """Text struck through one of a body's graphics. A capacitor body is two
+    plates 1.5 mm apart: text across one has almost no area in the body box.
+    Lines only: a filled graphic is the box of a shape, the area test covers it."""
+    tb = g.inset(tb, 0.05)
+    for p in parts:
+        if min(p[2] - p[0], p[3] - p[1]) > 0.1:
+            continue
+        w = min(tb[2], p[2]) - max(tb[0], p[0])
+        h = min(tb[3], p[3]) - max(tb[1], p[1])
+        if w >= 0 and h >= 0 and w + h >= 0.5:
+            return True
+    return False
 
 
 def _crosses(a1, a2, b1, b2) -> bool:

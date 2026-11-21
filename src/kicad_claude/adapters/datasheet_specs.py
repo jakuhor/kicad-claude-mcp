@@ -22,6 +22,9 @@ Spec record (schema version 1):
                         (pin-strapped output: Vout = base + each listed pin
                         that is tied to ground; keys are pin NUMBERS),
                       "t_ss": SV (soft-start time, s),
+                      "cout_min": SV (F, minimum output capacitance for
+                        stability; checked against the DC-bias-derated
+                        output caps, PT-COUT-EFF),
                       "light_load": "fccm" | "pfm" | "dcm" | "auto" (forced
                         PWM keeps the inductor in CCM at any load),
                       "input_pin": "C2" (the pin the channel's power flows
@@ -59,7 +62,9 @@ holds at a fixed voltage (V, e.g. an internal LDO output). EN pull-up currents a
 
 Conventional keys the analyzers read (use these names):
   - capacitor: electrical.C, ESR, ESL, SRF; absolute_max.V (rated
-    voltage); curves.C_bias;
+    voltage); curves.C_bias; curves.C_temp (x "C" in °C, y "%" of the
+    25 °C value, 100 at 25 °C). `fetch_cap_curves` adds vendor curves
+    (cap_curves.py) and `C_bias_at` {temp °C: CURVE}, merged on load;
   - inductor / ferrite: electrical.L, DCR, Isat, Irms (or Irms_<n>C, the
     lowest-rise one is used), SRF; ferrite Z_100MHz;
   - common_mode_choke: electrical.Z_cm (at a stated frequency), DCR,
@@ -683,6 +688,45 @@ def c_bias_ratio(rec: dict | None, volts: float, nominal_f: float | None = None)
     if cv.get("y_unit") == "F" and nominal_f:
         return y / nominal_f
     return None
+
+
+def c_temp_ratio(rec: dict | None, temp_c: float) -> float | None:
+    """C(T) / C(25 °C) from `curves.C_temp` (y in "%", 100 at 25 °C)."""
+    cv = ((rec or {}).get("curves") or {}).get("C_temp")
+    if not cv or cv.get("y_unit") != "%":
+        return None
+    return curve_at(cv, temp_c) / 100.0
+
+
+def c_eff(rec: dict | None, volts: float, temp_c: float = 25.0,
+          nominal_f: float | None = None) -> dict | None:
+    """Remaining fraction of nominal at `volts` DC bias and `temp_c`:
+    {"ratio", "method"}. Methods: `bias` (25 °C), `bias_at_temp` (DC-bias
+    curves measured at bracketing temperatures, interpolated), `bias_x_temp`
+    (bias(V) x temp(T), approximate: the two effects are not independent),
+    `bias_only` (no temperature data: the 25 °C value). None without a
+    DC-bias curve."""
+    base = c_bias_ratio(rec, volts, nominal_f)
+    if base is None:
+        return None
+    if abs(temp_c - 25.0) < 0.5:
+        return {"ratio": base, "method": "bias"}
+    curves = (rec or {}).get("curves") or {}
+    table = {25.0: base}
+    for t, cv in (curves.get("C_bias_at") or {}).items():
+        if cv.get("y_unit") == "%":
+            table[float(t)] = curve_at(cv, abs(volts)) / 100.0
+    ts = sorted(table)
+    lo = max((t for t in ts if t <= temp_c), default=None)
+    hi = min((t for t in ts if t >= temp_c), default=None)
+    if lo is not None and hi is not None and len(ts) > 1:
+        r = table[lo] if hi == lo else (
+            table[lo] + (table[hi] - table[lo]) * (temp_c - lo) / (hi - lo))
+        return {"ratio": r, "method": "bias_at_temp"}
+    tr = c_temp_ratio(rec, temp_c)
+    if tr is not None:
+        return {"ratio": base * tr, "method": "bias_x_temp"}
+    return {"ratio": base, "method": "bias_only"}
 
 
 def rated(rec: dict | None, group: str, *keys: str, prefer: str = "max") -> tuple | None:

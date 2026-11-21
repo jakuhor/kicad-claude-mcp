@@ -757,7 +757,7 @@ def _op_join_power(b: _Batch, op: dict) -> dict:
 
 
 _DIRS = {"right": (1, 0), "left": (-1, 0), "down": (0, 1), "up": (0, -1)}
-SHUNT_PITCH_MM = 7.62  # between the shunts hung from one node
+SHUNT_PITCH_MM = 10.16  # between the shunts hung from one node: clears their fields
 
 
 def _step(pt, vec, d: float) -> tuple[float, float]:
@@ -930,7 +930,7 @@ def _op_autoplace(b: _Batch, op: dict) -> dict:
     out = {"placed": sum(1 for d in done if d["placed"])}
     crowded = {d["reference"]: d["collisions"] for d in done if d.get("collisions")}
     if crowded:
-        out["collisions"] = crowded  # no clear spot found for these
+        out["collisions"] = crowded  # no clear spot found for these: move them by hand
     return out
 
 
@@ -1086,7 +1086,7 @@ def register(mcp) -> None:
                       shunt_side, shunt_offset_mm (5.08): parts inline (the
                       rotation that lays in -> out along the chain), node k
                       is the wire before part k (0 input, len(parts)
-                      output), shunts hang from taps on it 7.62 apart and
+                      output), shunts hang from taps on it 10.16 apart and
                       their far pin goes to `to` as `connect` would; each
                       named node gets one label on its wire
           remove      ref | refs [...] | pattern ("#PWR*", fnmatch on

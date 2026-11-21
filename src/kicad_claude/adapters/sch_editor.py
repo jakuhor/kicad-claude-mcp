@@ -2067,7 +2067,22 @@ def replace_symbol(
     snapshot = copy.deepcopy(node)
 
     lib_entry_def = make_lib_symbol_entry(sym_def_node, qualified_lib_id)
-    inject_lib_symbol(tree, lib_entry_def)
+    cache_note = None
+    if lib_symbols_has(tree, qualified_lib_id):
+        # Already cached (same part, or another placement uses it): a change
+        # that moves no pin is safe for every placement and is taken; a pin
+        # move is left to refresh_lib_symbols, which reports what it strands.
+        d = diff_lib_symbol(tree, qualified_lib_id, lib_entry_def)
+        if d["changed"] and not (d["pins_added"] or d["pins_removed"] or d["pins_moved"]):
+            replace_lib_symbol(tree, lib_entry_def)
+            cache_note = {"lib_symbol_refreshed":
+                          (["pins"] if d["pins_changed"] else []) + d["other_changes"]}
+        elif d["changed"]:
+            cache_note = {"lib_symbol_stale": "the library moves, adds or removes pins; "
+                          "run refresh_lib_symbols (dry_run first)"}
+            lib_entry_def = find_lib_symbol_def(tree, qualified_lib_id)
+    else:
+        inject_lib_symbol(tree, lib_entry_def)
     new_pin_numbers = collect_pin_numbers(lib_entry_def)
 
     lib_id_node[1] = qualified_lib_id
@@ -2194,6 +2209,8 @@ def replace_symbol(
     }
     if diagonal:
         result["diagonal_wires"] = diagonal
+    if cache_note:
+        result.update(cache_note)
     warning = _footprint_warning(get_property(node, "Footprint") or "", lib_entry_def)
     if warning:
         result["footprint_warning"] = warning
@@ -2248,12 +2265,55 @@ def _pin_map_of(tree: list, s_node: list) -> dict[str, tuple[float, float]]:
     return {p["number"]: p["point"] for p in sch_netlist.pins_of_instance(tree, s_node)}
 
 
+# Top-level symbol flags at KiCAD's default: the sheet cache writes them out,
+# an older library file leaves them away. Neither is a change.
+_DEFAULT_FLAGS = {"(pin_numbers (hide no))", "(pin_names (hide no))", "(in_pos_files yes)",
+                  "(duplicate_pin_numbers_are_jumpers no)", "(embedded_fonts no)",
+                  "(exclude_from_sim no)", "(in_bom yes)", "(on_board yes)"}
+
+
+def _norm_hide(node: Any) -> Any:
+    """Older files write a bare `hide` token; KiCAD 10 writes `(hide yes)`."""
+    if not isinstance(node, list):
+        return node
+    return [[sexpdata.Symbol("hide"), sexpdata.Symbol("yes")]
+            if i and isinstance(x, sexpdata.Symbol) and str(x) == "hide" else _norm_hide(x)
+            for i, x in enumerate(node)]
+
+
+def _def_parts(def_node: list) -> tuple[dict, dict, list, set]:
+    """(properties, pins, graphics, flags) of a symbol definition, in a form
+    that compares equal across KiCAD's cache layout and a library file's:
+    properties by value and hidden state, pins and graphics by their
+    normalised text, flags without the defaults."""
+    props, pins, gfx, flags = {}, {}, [], set()
+    for ch in def_node[2:]:
+        h = head_of(ch)
+        if h == "property" and len(ch) >= 3:
+            props[ch[1]] = (ch[2], "(hide yes)" in sch_io.dumps_flat(_norm_hide(ch)))
+        elif h == "symbol":
+            for sub in ch[2:]:
+                text = sch_io.dumps_flat(_norm_hide(sub))
+                if head_of(sub) == "pin":
+                    number, _name = _pin_id(sub)
+                    pins.setdefault(number, []).append(text)
+                else:
+                    gfx.append(f"{ch[1]}|{text}")
+        else:
+            text = sch_io.dumps_flat(_norm_hide(ch))
+            if text not in _DEFAULT_FLAGS:
+                flags.add(text)
+    return props, pins, sorted(gfx), flags
+
+
 def diff_lib_symbol(tree: list, qualified_lib_id: str, fresh_def: list) -> dict:
     """What would change if the cached definition were replaced by `fresh_def`.
 
     Compares pin numbers and their library-local positions, and reports the
     placements affected — including, for each, the pins that currently carry
-    something and would move or disappear.
+    something and would move or disappear. Changes that move no pin count
+    too: `pins_changed` (a pin's flags, type, name or length, e.g. a pin now
+    hidden) and `other_changes` (`properties`, `graphics`, `flags`).
     """
     cached = find_lib_symbol_def(tree, qualified_lib_id)
     if cached is None:
@@ -2272,6 +2332,12 @@ def diff_lib_symbol(tree: list, qualified_lib_id: str, fresh_def: list) -> dict:
     moved = sorted(
         num for num in set(old_pins) & set(new_pins) if old_pins[num] != new_pins[num]
     )
+    (p_old, pin_old, g_old, f_old), (p_new, pin_new, g_new, f_new) = (
+        _def_parts(cached), _def_parts(fresh_def))
+    pins_changed = sorted(n for n in set(pin_old) & set(pin_new)
+                          if n not in moved and pin_old[n] != pin_new[n])
+    other = [name for name, a, b in (("properties", p_old, p_new), ("graphics", g_old, g_new),
+                                     ("flags", f_old, f_new)) if a != b]
 
     instances = []
     for s_node in iter_instance_symbols(tree):
@@ -2299,7 +2365,9 @@ def diff_lib_symbol(tree: list, qualified_lib_id: str, fresh_def: list) -> dict:
         "pins_added": added,
         "pins_removed": removed,
         "pins_moved": moved,
-        "changed": bool(added or removed or moved),
+        "pins_changed": pins_changed,
+        "other_changes": other,
+        "changed": bool(added or removed or moved or pins_changed or other),
         "instances": instances,
     }
 

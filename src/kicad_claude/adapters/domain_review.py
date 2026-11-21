@@ -691,6 +691,11 @@ def check_temperature_sensing(nl: Netlist, findings: list) -> list[dict]:
     return out
 
 
+# Not a bare "LED": constant-current LED drivers (STP16CP05) also have SDI / SDO.
+ALED_TEXT = re.compile(r"WS28\d\d|SK68\d\d|SK98\d\d|APA10[2-7]|HD10\d|TM1804|UCS1903|"
+                       r"NeoPixel|addressable|LED with integrated", re.I)
+
+
 def check_addressable_leds(nl: Netlist, findings: list, volts: dict) -> list[dict]:
     leds = []
     for ref, c in nl.components.items():
@@ -699,8 +704,10 @@ def check_addressable_leds(nl: Netlist, findings: list, volts: dict) -> list[dic
         names = _pins(nl, ref, with_nc=True)
         din = next((k for k in ("DIN", "DI", "SDI") if k in names), None)
         dout = next((k for k in ("DOUT", "DO", "SDO") if k in names), None)
-        ci = "CI" in names or "CKI" in names
-        if din and dout and (kind(ref) in ("D", "LED", "U") or ci) and any(
+        text = f"{c.get('lib_id', '')} {c.get('value', '')} {c.get('description', '')}"
+        # A `U` needs LED evidence: SDI / SDO is also a serial digital
+        # interface (LMH0074 / LMH0001 SMPTE cable drivers).
+        if din and dout and (kind(ref) in ("D", "LED") or ALED_TEXT.search(text)) and any(
                 k in names for k in ("VDD", "VCC", "V+", "VDD5")):
             leds.append((ref, names, din, dout))
     if not leds:

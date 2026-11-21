@@ -335,6 +335,20 @@ def test_power_tree_datasheet_vref_and_polarity(tmp_path):
     assert pr.is_negative_rail("/400/-20V") and not pr.is_negative_rail("+5V")
 
 
+def test_power_tree_caller_vref_is_checked_against_specs(tmp_path):
+    # Field report (MADI): AP62301 0.8 V vs AP62300T 0.763 V share a datasheet.
+    pr, nl = _pt(tmp_path)
+
+    def rules(**kw):
+        return {f["rule"] for f in pr.analyze(nl, vref={"U1": 0.8}, **kw)["findings"]
+                if f["ref"] == "U1"}
+    assert "PT-VREF-MISMATCH" in rules(datasheet={"U1": {"vref": (0.763, "ds p.5")}})
+    assert not {"PT-VREF-MISMATCH", "PT-VREF-CALLER"} & rules(
+        datasheet={"U1": {"vref": (0.8, "ds p.5")}})
+    got = rules()
+    assert "PT-VREF-CALLER" in got and "PT-VREF-MISMATCH" not in got
+
+
 def test_power_tree_limits(tmp_path):
     pr, nl = _pt(tmp_path)
     ds = {"U1": {"vref": (0.8, "ds")},

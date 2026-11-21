@@ -354,6 +354,7 @@ def test_write_file_leaves_no_temp_file_and_keeps_old_on_failure(tmp_path: Path,
 # Files allowed to write without `safe_write`: generated outputs, caches and
 # brand-new files — never a KiCAD document that already exists.
 RAW_WRITERS_ALLOWED = {
+    "adapters/cap_curves.py",         # vendor capacitor-curve cache
     "adapters/datasheet_fetch.py",    # downloaded PDFs
     "adapters/datasheet_index.py",    # datasheet manifest, PDF text cache
     "adapters/datasheet_specs.py",    # spec extraction cache

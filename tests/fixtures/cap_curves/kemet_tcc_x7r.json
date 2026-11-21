@@ -1,0 +1,233 @@
+{
+"seriesList": [
+{
+"points": null,
+"kemetPn": "",
+"refDes": null,
+"yLabel": "",
+"yUnit": "",
+"nets": null
+},
+{
+"points": [
+{
+"x": -55,
+"y": -2.411444
+},
+{
+"x": -47.999992,
+"y": -2.093825
+},
+{
+"x": -40.999985,
+"y": -1.930932
+},
+{
+"x": -33.999977,
+"y": -1.856683
+},
+{
+"x": -26.999969,
+"y": -1.814475
+},
+{
+"x": -19.999962,
+"y": -1.758969
+},
+{
+"x": -12.999959,
+"y": -1.657328
+},
+{
+"x": -5.999961,
+"y": -1.489898
+},
+{
+"x": 1.000039,
+"y": -1.25035
+},
+{
+"x": 8.000038,
+"y": -0.945271
+},
+{
+"x": 15.000036,
+"y": -0.5932
+},
+{
+"x": 22.000042,
+"y": -0.223123
+},
+{
+"x": 29.00005,
+"y": 0.127583
+},
+{
+"x": 36.000057,
+"y": 0.415756
+},
+{
+"x": 43.000065,
+"y": 0.595601
+},
+{
+"x": 50.000072,
+"y": 0.622396
+},
+{
+"x": 57.00008,
+"y": 0.456737
+},
+{
+"x": 64.000084,
+"y": 0.069346
+},
+{
+"x": 71.000053,
+"y": -0.553587
+},
+{
+"x": 78.000023,
+"y": -1.404507
+},
+{
+"x": 86.399986,
+"y": -2.674395
+},
+{
+"x": 100.399925,
+"y": -5.013002
+},
+{
+"x": 114.399864,
+"y": -6.521084
+},
+{
+"x": 124.199821,
+"y": -5.96374
+}
+],
+"kemetPn": "C0805C104K5RACTU",
+"refDes": null,
+"yLabel": "Capacitance Change",
+"yUnit": "%",
+"nets": null
+}
+],
+"request": {
+"calculated": "No",
+"combine": "No",
+"freqList": [
+1000
+],
+"highlight": 0,
+"ind": 0,
+"line": "50",
+"path": "Shunt",
+"parts": [
+{
+"id": 10238,
+"capDisplay": "100 nF",
+"capType": "Ceramic",
+"capValue": 100000,
+"dielectric": "X7R",
+"kemetPn": "C0805C104K5RACTU",
+"basePn": "C0805C104K5RAC",
+"maxTemp": 125,
+"series": "General Purpose Surface Mount (4V \u0102\u02d8\u00e2\u201a\u00ac\u00e2\u20ac\u015b 10kV)",
+"appDef": "Commercial/Standard Chips",
+"spicePn": "",
+"voltageRating": 50,
+"hidden": false,
+"instances": 1,
+"param": {
+"qty": {
+"title": "Qty",
+"select": 1,
+"min": 1,
+"max": 1000,
+"step": 1,
+"disabled": false,
+"hidden": false,
+"width": 6
+},
+"bias": {
+"title": "Bias (VDC)",
+"select": 0,
+"min": 0,
+"max": 1000,
+"step": 0.1,
+"disabled": false,
+"hidden": false,
+"width": 6
+},
+"tempAmbient": {
+"title": "Amb (\u0102\u201a\u00c2\u00b0C)",
+"select": 25,
+"min": -55,
+"max": 155,
+"step": 1,
+"disabled": false,
+"hidden": false,
+"width": 6
+}
+},
+"tolerance": {
+"title": "Tolerance",
+"select": "K",
+"options": [
+{
+"label": "5%",
+"value": "J",
+"disabled": false
+},
+{
+"label": "10%",
+"value": "K",
+"disabled": false
+},
+{
+"label": "20%",
+"value": "M",
+"disabled": false
+}
+],
+"disabled": false,
+"hidden": false
+},
+"ceProps": [],
+"filmProps": {
+"relativeTime": {
+"display": "",
+"label": "",
+"value": ""
+},
+"pitch": {
+"display": "",
+"label": "",
+"value": ""
+}
+},
+"seedProps": [],
+"tcc": "6.47668918356301E-12,5.72722027649247E-10,-2.12004936132087E-07,-5.41186436774519E-06,0.000696422911666462,0.0378310536014171,-1.28887372407408,0.992080544378085",
+"vcac": "-0.00151202821282,0.01363522403235,-0.0498609574148445,0.0952174062979207,-0.103576041759766,0.0923195781179408,-0.0462437492698238,0.999999588705021"
+}
+],
+"plotType": "TCC",
+"res": 0,
+"spiceFreq": 1000,
+"spiceFileFormat": "CKT",
+"start": 100,
+"stop": 1000000000,
+"tempRise": 20,
+"session": "x"
+},
+"title": "Capacitance Change versus Temperature",
+"kemetPn": "",
+"xLabel": "Temperature in Degrees Celsius",
+"xUnit": "\u00c2\u00b0C",
+"note": "",
+"image": null,
+"date": "",
+"ver": ""
+}

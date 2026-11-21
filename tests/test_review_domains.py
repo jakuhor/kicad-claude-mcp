@@ -96,6 +96,19 @@ def test_drives_and_sensing(tmp_path):
     assert len(r["addressable_leds"]) == 3        # 2 LEDs + chain summary
 
 
+def test_sdi_sdo_cable_driver_is_not_an_addressable_led(tmp_path):
+    # Field report (MADI): LMH0074 / LMH0001 SMPTE serial digital interface
+    # pins SDI / SDO are not a LED chain.
+    comps = [_comp("U1", "LMH0074", lib="Interface:LMH0074"),
+             _comp("U2", "LMH0001", lib="Interface:LMH0001")]
+    nets = [_net(1, "+3V3", ("U1", "1", "VCC", "power_in"), ("U2", "1", "VCC", "power_in")),
+            _net(2, "A", ("U1", "2", "SDI", "input")), _net(3, "B", ("U1", "3", "SDO", "output")),
+            _net(4, "C", ("U2", "2", "SDI", "input")), _net(5, "D", ("U2", "3", "SDO", "output"))]
+    r, got = _run(tmp_path, comps, nets, ("drives",), volts={"+3V3": 3.3})
+    assert not [rule for rule, _ in got if rule.startswith("ALED")]
+    assert not r.get("addressable_leds")
+
+
 def test_rf_and_certification(tmp_path):
     comps = [_comp("U1", "LNA"), _comp("J1", "SMA", lib="Connector:SMA"),
              _comp("L1", "3n3"), _comp("C1", "1p"), _comp("C2", "1p2")]

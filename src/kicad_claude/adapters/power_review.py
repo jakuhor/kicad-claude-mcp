@@ -15,10 +15,11 @@ What it finds, without any datasheet constant:
   - the rail tree: source rails → regulator → output rails, plus the number of
     power-input pins loading each rail.
 
-What it does NOT do: compute Vout, EN thresholds, dropout or anything else
-that needs a part constant. A Vout needs Vref from the datasheet; the caller
-can pass it (`vref={"U1": 0.8}`) and the result says it came from the caller.
-No value is taken from general knowledge (project rule).
+Part constants (Vref, SET current, EN thresholds, dropout, limits) come only
+from the extracted datasheet specs or from the caller (`vref={"U1": 0.8}`,
+which wins; the result names the source, and a caller Vref that differs from
+the specs is a warning). No value is taken from general knowledge (project
+rule).
 
 Pin-name sets and the non-regulator exclusions follow kicad-happy 3.0.1
 `signal_detectors.py` (MIT License, Copyright (c) 2025 Andrew Klofas).
@@ -521,6 +522,17 @@ def analyze(nl: Netlist, vref: dict | None = None,
             vout = {"value": round(float(vref[vkey]) * divider["ratio"], 4),
                     "vref": float(vref[vkey]),
                     "vref_source": vref_sources.get(vkey, "caller")}
+            # One datasheet often covers variants with different Vref
+            # (AP62301 0.8 V, AP62300T 0.763 V): check the caller's value.
+            cached = ds.get("vref_negative" if is_negative_rail(divider["sense_net"]) else "vref")
+            if cached and abs(cached[0] - vout["vref"]) > 0.01 * abs(cached[0]):
+                finding("warning", "PT-VREF-MISMATCH", name, f"Vref {vout['vref']:g} V from "
+                        f"the caller, but the extracted datasheet specs give {cached[0]:g} V "
+                        f"({cached[1]}); Vout uses the caller's value.")
+            elif not cached and vout["vref_source"] == "caller":
+                finding("info", "PT-VREF-CALLER", name, f"Vref {vout['vref']:g} V from the "
+                        f"caller only; no extracted datasheet spec for {comp['value']} backs it "
+                        "(extract the datasheet for this exact MPN).")
         elif divider and divider["ratio"] and (ds.get("vref") or ds.get("vref_negative")):
             neg = is_negative_rail(divider["sense_net"])
             pick = ds.get("vref_negative") if neg else ds.get("vref")
@@ -784,7 +796,7 @@ def analyze(nl: Netlist, vref: dict | None = None,
         check_volts = {**dc["volts"], **volts}
         for f in dc_model.findings(dc):
             finding(f["severity"], f["rule"], f["ref"], f["message"])
-    _datasheet_checks(nl, regs, check_volts, datasheet, finding)
+    _datasheet_checks(nl, regs, check_volts, datasheet, finding, specs or {})
 
     sequencing = [{"regulator": r["name"], "enabled_by": r["enable"]["by"]}
                   for r in regs if r["enable"] and r["enable"]["state"] == "driven"]
@@ -857,8 +869,25 @@ def _fmt(v: float) -> str:
     return f"{v:.4g} V"
 
 
+def _cout_eff(r: dict, vout: float, specs: dict) -> tuple[float, list[str]]:
+    """Output capacitance at `vout` DC bias (25 °C): nominal x the DC-bias
+    curve; caps without a curve count at nominal and are listed."""
+    from kicad_claude.adapters import datasheet_specs as dss
+
+    total, nominal_only = 0.0, []
+    for c in r["output_caps"]:
+        nom = None if c["dnp"] else parse_value(c["value"])
+        if not nom:
+            continue
+        e = dss.c_eff(specs.get(c["ref"]), vout, 25.0, nom)
+        total += nom * (e["ratio"] if e else 1.0)
+        if e is None:
+            nominal_only.append(c["ref"])
+    return total, nominal_only
+
+
 def _datasheet_checks(nl: Netlist, regs: list[dict], volts: dict,
-                      datasheet: dict, finding) -> None:
+                      datasheet: dict, finding, specs: dict | None = None) -> None:
     for r in regs:
         lim = (datasheet.get(r["name"]) or datasheet.get(r["ref"]) or {}).get("limits") or {}
         if not lim:
@@ -898,6 +927,17 @@ def _datasheet_checks(nl: Netlist, regs: list[dict], volts: dict,
                         f"Headroom {_fmt(head)} (|{_fmt(vin)}| - |{_fmt(vout)}|) vs dropout "
                         f"{_fmt(need)} ({'max' if hi is not None else 'typ'}, {src})"
                         + (": below dropout." if head < need else "."))
+        if "cout_min" in lim and vout is not None and r["output_caps"]:
+            lo, typ, _, src = lim["cout_min"]
+            need = lo if lo is not None else typ
+            c_eff, nominal_only = _cout_eff(r, abs(vout), specs or {})
+            if need and c_eff < need:
+                finding("warning", "PT-COUT-EFF", name,
+                        f"Output capacitance {c_eff * 1e6:.3g} uF at {_fmt(vout)} DC bias is "
+                        f"below the datasheet minimum {need * 1e6:.3g} uF ({src})"
+                        + (f"; {', '.join(nominal_only)} counted at nominal (no DC-bias curve: "
+                           "`fetch_cap_curves`)" if nominal_only else "") + ".",
+                        c_eff_f=float(f"{c_eff:.4g}"), cout_min_f=need)
         en = r["enable"]
         if en and en.get("net") and en["state"] not in ("floating", "tied_to_ground"):
             v_en = _net_voltage(nl, en["net"], volts)

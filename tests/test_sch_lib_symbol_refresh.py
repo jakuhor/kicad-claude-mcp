@@ -82,6 +82,14 @@ def _move_pin1(lib_dir: Path) -> None:
     lib.write_text(text.replace(PIN1_ORIGINAL, PIN1_MOVED, 1), encoding="utf-8")
 
 
+def _hide_pin1(lib_dir: Path) -> None:
+    lib = lib_dir / "MiniLib.kicad_sym"
+    text = lib.read_text(encoding="utf-8")
+    old = PIN1_ORIGINAL + "\n\t\t\t\t(length 1.27)"
+    assert old in text
+    lib.write_text(text.replace(old, old + "\n\t\t\t\t(hide yes)", 1), encoding="utf-8")
+
+
 def _place_r1(mcp, wired: bool = False) -> dict[str, list]:
     _call(mcp, "add_symbol", lib_id="MiniLib:Resistor", reference="R1",
           value="10k", x_mm=100.33, y_mm=100.33)
@@ -362,6 +370,53 @@ class TestAdapter:
         diff = ed.diff_lib_symbol(tree, "MiniLib:Resistor", fresh)
         assert diff["pins_added"] == ["3"]
         assert diff["changed"] is True
+
+    def test_a_hidden_pin_alone_is_a_change(self, project, mcp, lib_dir):
+        # Field report (MADI D1): only `hide` changed; pins did not move.
+        _place_r1(mcp)
+        _hide_pin1(lib_dir)
+        project["reindex"]()
+        dry = _call(mcp, "refresh_lib_symbols", lib_id="MiniLib:Resistor")["reports"][0]
+        assert dry["changed"] is True and dry["pins_changed"] == ["1"]
+        assert dry["pins_moved"] == [] and dry["other_changes"] == []
+        res = _call(mcp, "refresh_lib_symbols", lib_id="MiniLib:Resistor", dry_run=False)
+        assert res["changed"] == 1 and res["backups"]
+        cached = sch_io.dumps_flat(ed.find_lib_symbol_def(sch_io.parse_file(project["sch"]),
+                                                          "MiniLib:Resistor"))
+        assert "(hide yes)" in cached
+        assert _call(mcp, "list_lib_symbols")["symbols"][0]["stale"] is False
+
+    def test_replace_with_the_same_part_takes_a_pin_flag_change(self, project, mcp, lib_dir):
+        _place_r1(mcp)
+        _hide_pin1(lib_dir)
+        project["reindex"]()
+        res = _call(mcp, "replace_symbol", reference="R1", lib_id="MiniLib:Resistor")
+        assert res["lib_symbol_refreshed"] == ["pins"]
+        assert _call(mcp, "list_lib_symbols")["symbols"][0]["stale"] is False
+
+    def test_replace_with_the_same_part_leaves_a_pin_move_to_refresh(
+            self, project, mcp, lib_dir):
+        _place_r1(mcp)
+        _move_pin1(lib_dir)
+        project["reindex"]()
+        res = _call(mcp, "replace_symbol", reference="R1", lib_id="MiniLib:Resistor")
+        assert "refresh_lib_symbols" in res["lib_symbol_stale"]
+        assert _call(mcp, "list_lib_symbols")["symbols"][0]["stale"] is True
+
+    def test_layout_and_default_flags_are_not_changes(self):
+        lib = sch_io.sexpdata.loads(
+            '(symbol "X" (pin_names (offset 1.016) hide) (in_bom yes)'
+            ' (property "MPN" "A" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))'
+            ' (symbol "X_0_1" (pin passive line (at 0 0 0) (length 1) hide'
+            ' (name "~") (number "1"))))')
+        cache = sch_io.sexpdata.loads(
+            '(symbol "L:X" (pin_names (offset 1.016) (hide yes)) (exclude_from_sim no)'
+            ' (in_bom yes) (on_board yes) (in_pos_files yes) (embedded_fonts no)'
+            ' (property "MPN" "A" (at 1 1 0) (show_name no) (hide yes)'
+            ' (effects (font (size 1.27 1.27))))'
+            ' (symbol "X_0_1" (pin passive line (at 0 0 0) (length 1) (hide yes)'
+            ' (name "~") (number "1"))))')
+        assert ed._def_parts(lib) == ed._def_parts(cache)
 
     def test_instance_owned_fields_are_named_for_callers(self):
         assert "Reference" in ed.INSTANCE_OWNED_FIELDS

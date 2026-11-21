@@ -240,7 +240,11 @@ def register(mcp) -> None:
         dest_dir: str = "",
         netlist_path: str = "",
     ) -> dict:
-        """Everything needed to extract `mpn`'s datasheet into a spec record.
+        """Everything needed to extract `mpn`'s datasheet into a spec record:
+        PDF path (read it), the key pages' text (or `pages="3,5-7"`), the
+        schematic context and the schema. Then `save_datasheet_extraction`.
+
+        Details:
 
         Returns the absolute PDF path (read it — tables and graphs often do not
         survive text extraction), page count, the text of the pages most
@@ -345,6 +349,85 @@ def register(mcp) -> None:
         path = dss.save(ds_dir, mpn, extraction, pdf.name, sha, extracted_by)
         q = dss.quality({**extraction, "mpn": mpn}, _symbol_pins(e.get("refs", [])))
         return {"saved": True, "path": str(path), "warnings": warnings, "quality": q}
+
+    @mcp.tool()
+    def fetch_cap_curves(
+        parts: list[str] | None = None,
+        temps_c: list[float] | None = None,
+        refresh: bool = False,
+    ) -> dict:
+        """Capacitor DC-bias / temperature curves from Murata, Samsung, KEMET,
+        cached for the reviews. `parts`: refs or MPNs (default: every C with
+        an MPN).
+
+        Details:
+
+        Cached in `datasheets/curves/<MPN>.json` unless `refresh`. `temps_c`
+        (default 85, 105, 125): extra DC-bias curves measured at those
+        temperatures (Murata; skipped past the dielectric's limit). Sources:
+        Murata SimSurfing, Samsung Component Library, KEMET K-SIM. Sends only
+        the MPN. The vendor comes from the Manufacturer field, else
+        the MPN prefix (GRM/GCM/... Murata, CL.. Samsung, C0805C... KEMET);
+        others (TDK blocks automated clients) are `unsupported`: extract
+        `curves.C_bias` / `C_temp` from the datasheet instead. Status per
+        MPN: fetched, cached, no_curves, not_found, unsupported, error
+        (`format changed` when a vendor's response no longer parses: the
+        endpoints are the vendors' web-tool back ends, not public APIs).
+        Murata and Samsung curves are measured, KEMET's come from its model
+        (`method`). Stored y is the retained share: C_bias 100 % at 0 V,
+        C_temp 100 % at 25 °C, C_bias_at[T] DC bias measured at T °C.
+        `retained_pct` samples C_bias at 25 / 50 / 100 % of its voltage span.
+        Used by: PDN bank (`review_emc`), `simulate_*` DC-bias derating,
+        EM-TH-BIAS, TH-MLCC-HOT (at the estimated board temperature).
+        """
+        from kicad_claude.adapters import cap_curves
+
+        ds_dir = _ds_dir("")
+        nl = power_review.parse_netlist(project_netlist(""))
+        want = set(clean(parts))
+        wanted: dict[str, dict] = {}
+        for ref, comp in sorted(nl.components.items(), key=lambda kv: _natural(kv[0])):
+            mpn = (comp["fields"].get("MPN") or "").strip()
+            if (power_review.kind(ref) != "C" or not mpn or comp.get("dnp")
+                    or (want and not want & {ref, mpn})):
+                continue
+            w = wanted.setdefault(mpn, {"refs": [], "manufacturer":
+                                        comp["fields"].get("Manufacturer", "")})
+            w["refs"].append(ref)
+        for p in want - set(nl.components):   # an MPN not on the schematic
+            wanted.setdefault(p, {"refs": [], "manufacturer": ""})
+        temps = tuple(temps_c) if temps_c is not None else cap_curves.DEFAULT_TEMPS_C
+        http = None
+        out = {}
+        for mpn, w in wanted.items():
+            rec = None if refresh else cap_curves.load(ds_dir, mpn)
+            status = "cached" if rec else None
+            if rec is None:
+                http = http or cap_curves._Http()
+                rec = cap_curves.fetch(mpn, w["manufacturer"], temps, http)
+                status = rec["status"]
+                if status == "fetched":
+                    cap_curves.save(ds_dir, rec)
+            row = {"status": status, "refs": w["refs"], "vendor": rec.get("vendor")}
+            for k in ("vendor_pn", "source_url", "error", "hint", "fetched"):
+                if rec.get(k):
+                    row[k] = rec[k]
+            cv = rec.get("curves") or {}
+            if cv:
+                row["curves"] = sorted(k if k != "C_bias_at" else f"C_bias_at {sorted(v)} degC"
+                                       for k, v in cv.items())
+                row["method"] = next(iter(c.get("method") for c in cv.values() if "method" in c),
+                                     None)
+            if "C_bias" in cv:
+                span = cv["C_bias"]["points"][-1][0]
+                row["retained_pct"] = {f"{f * span:g} V": round(dss.curve_at(cv["C_bias"],
+                                                                              f * span), 1)
+                                       for f in (0.25, 0.5, 1.0)}
+            out[mpn] = row
+        counts: dict[str, int] = defaultdict(int)
+        for r in out.values():
+            counts[r["status"]] += 1
+        return {"counts": dict(counts), "parts": out, "folder": str(ds_dir / cap_curves.CURVES_DIR)}
 
     @mcp.tool()
     def get_datasheet_specs(mpn: str = "", dest_dir: str = "") -> dict:

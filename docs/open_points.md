@@ -104,3 +104,24 @@ producibility level B with Class 2 and Class 3 ring targets (e.g.
 section. No code: `DFM-RING` / `DFM-DRILL` and DRC enforce them. Description
 says "design margin", not acceptance. Values need the user's copy of the
 standard to verify before they ship.
+
+---
+
+Field report 2026-11-21: pre-layout review of `czechonetwo/MADI_coax_cat5`
+(its `docs/tooling_issues.md`). All its server items (OP-48 … OP-51) are done
+(README).
+
+## OP-52 — More vendors for `fetch_cap_curves`
+
+Murata, Samsung and KEMET are done (README, `fetch_cap_curves`). Still
+open: Taiyo Yuden (TY-COMPAS `graphRest`, parameters not mapped yet),
+Kyocera AVX SpiCAT, Würth REDEXPERT, Yageo, Vishay. TDK blocks automated
+clients, so its curves come from the datasheet, or from an import of a CSV
+the user downloads. Fetch over plain HTTP, no browser automation
+*(decided, 2026-11-21)*. Endpoints and design:
+[docs/plans/op-52.md](plans/op-52.md).
+
+---
+
+Field report 2026-11-21, part 2 (MADI `docs/tooling_issues.md` items 5 and 6):
+its server items (OP-53, OP-54) are done (README).

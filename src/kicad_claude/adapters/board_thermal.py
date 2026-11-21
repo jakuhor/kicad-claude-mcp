@@ -320,10 +320,17 @@ def analyze(tree: list, nl, specs: dict, ratings: dict, ambient_c: float,
                          "the board runs cooler, and without psi_jb in the spec cache it is "
                          "not estimated")
             if k == "mlcc":
+                t_c = ambient_c + board if board is not None else None
+                tr = dss.c_temp_ratio(specs.get(ref), t_c) if t_c is not None else None
+                if tr is not None:
+                    near[-1]["c_temp_pct"] = round(tr * 100, 1)
+                drift = (f"its temperature curve gives {tr:.0%} of the 25 °C value at "
+                         f"{t_c:.0f} °C (upper bound; DC bias comes on top)" if tr is not None
+                         else "X5R / X7R capacitance drifts with temperature - check the "
+                         "derated value (`fetch_cap_curves`)")
                 findings.append(_f("info", "TH-MLCC-HOT", ref,
                                    f"Class-II MLCC {ref} {dist:.1f} mm from {h['ref']} ({basis}): "
-                                   "X5R / X7R capacitance drifts with temperature - check the "
-                                   "derated value (C0G / NP0 where it is critical)."))
+                                   f"{drift} (C0G / NP0 where it is critical)."))
             else:
                 findings.append(_f("warning" if board is not None else "info", "TH-ELCO-HOT",
                                    ref, f"Electrolytic {ref} {dist:.1f} mm from {h['ref']} "

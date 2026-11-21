@@ -356,6 +356,42 @@ def test_readability_flags_label_running_into_a_body(mcp):
     assert res["counts"].get("SR-LABEL-INTO-BODY") == 1
 
 
+def test_readability_flags_text_struck_through_capacitor_plate(mcp):
+    # Field report (MADI R49 / C58): R1's fields cross C1's plates by
+    # 0.13 mm, almost no area inside the plates' box.
+    _call(mcp, "edit_schematic", ops=[
+        {"op": "symbol", "lib_id": "Device:R", "ref": "R1", "value": "100k",
+         "x_mm": 154.94, "y_mm": 40.64},
+        {"op": "symbol", "lib_id": "Device:C", "ref": "C1", "value": "10n",
+         "x_mm": 158.75, "y_mm": 40.64},
+        {"op": "field", "ref": "R1", "field": "Reference", "x_mm": 157.48, "y_mm": 39.37, "angle": 0,
+         "justify": "left"},
+        {"op": "field", "ref": "R1", "field": "Value", "x_mm": 157.48, "y_mm": 41.91, "angle": 0,
+         "justify": "left"},
+        {"op": "field", "ref": "C1", "field": "Reference", "x_mm": 162.56, "y_mm": 36.83},
+        {"op": "field", "ref": "C1", "field": "Value", "x_mm": 162.56, "y_mm": 44.45},
+    ])
+    res = _call(mcp, "check_schematic_readability")
+    hits = {tuple(f["items"]) for f in res["findings"] if f["rule"] == "SR-OVERLAP"}
+    assert ("R1.Reference", "C1") in hits and ("R1.Value", "C1") in hits
+
+
+def test_autoplace_clear_means_readability_clear(mcp):
+    # Field report (MADI C58 / C59 / C60): autoplace took a spot whose text
+    # crossed a neighbour's capacitor plate, check_readability then flagged it.
+    ops = [{"op": "symbol", "lib_id": "Device:R", "ref": "R1", "value": "31.6k",
+            "x_mm": 154.94, "y_mm": 40.64}]
+    ops += [{"op": "symbol", "lib_id": "Device:C", "ref": f"C{i}", "value": "10u",
+             "x_mm": 158.75 + 3.81 * i, "y_mm": 40.64} for i in range(1, 4)]
+    _call(mcp, "edit_schematic", ops=ops)
+    res = _call(mcp, "edit_schematic", ops=[{"op": "autoplace", "refs": "all",
+                                             "force": True}])
+    crowded = {r for x in res.get("results", []) for r in x.get("collisions", {})}
+    left = [f for f in _call(mcp, "check_schematic_readability")["findings"]
+            if f["rule"] == "SR-OVERLAP"]
+    assert all(f["items"][0].split(".")[0] in crowded for f in left), (left, crowded)
+
+
 def test_power_warning_comes_once_per_net(mcp):
     r = _call(mcp, "add_power_symbol", net="VIN", x_mm=50.8, y_mm=50.8)
     assert any("PWR_FLAG" in w for w in r["warnings"])

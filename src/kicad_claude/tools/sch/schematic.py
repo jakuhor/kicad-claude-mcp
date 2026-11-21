@@ -752,6 +752,8 @@ def register(mcp) -> None:
                     entry["pins_added"] = diff["pins_added"]
                     entry["pins_removed"] = diff["pins_removed"]
                     entry["pins_moved"] = diff["pins_moved"]
+                    entry["pins_changed"] = diff["pins_changed"]
+                    entry["other_changes"] = diff["other_changes"]
                 out.append(entry)
         return {"scope": scope, "count": len(out), "symbols": out}
 
