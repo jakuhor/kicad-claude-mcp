@@ -1,6 +1,6 @@
 [project]
 name = "kicad-claude-mcp"
-version = "2.0.0"
+version = "2.1.0"
 description = "MCP server that lets Claude Code design KiCAD PCBs by editing project files."
 readme = "README.md"
 requires-python = ">=3.10"

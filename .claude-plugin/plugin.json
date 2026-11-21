@@ -1,6 +1,6 @@
 {
   "name": "kicad-claude",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "MCP server that reads, edits and reviews KiCad 10 schematics and boards, with live part sourcing.",
   "license": "MIT",
   "userConfig": {
